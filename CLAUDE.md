@@ -966,6 +966,51 @@ errors on the reopen — which is why it's gone rather than fixed. The master ta
 needs invalidating (`SFCWEngine.invalidate_quick_tune_table()`) after an explicit
 `device_reset` from the panel; `sdr_server.py`'s `device_reset` handler calls it.
 
+**The table is the UNION of a 20 MHz and a 50 MHz grid (2026-08-31), not a single
+uniform grid.** 20 alone could not represent a 50 MHz step: `set_params` snapped
+50 -> 40 and the panel then described a sweep that was not the one running (61 steps
+and 1.0 m of range against the 76 steps and 1.37 m actually swept, with nothing on
+screen saying so). Cost against the 256 ceiling: 20 MHz -> 151 points, 50 MHz -> 61,
+overlap (multiples of 100) -> 31, **union 181, leaving 75 spare**. Adding a third
+family is not free -- check the union against the cap first.
+
+Two consequences that are easy to get wrong:
+
+- **A single sweep must stay inside ONE base family.** Mixing is not safe: starting
+  at 2020 (on the 20 grid) and stepping 50 visits 2070, which is on *neither*
+  family and is not in the table at all. `_snap_sweep()` therefore picks one base --
+  whichever represents the requested STEP most closely, ties to the finest -- and
+  snaps start, stop **and** step to multiples of it, which makes every visited
+  frequency a multiple of that base and so present by construction. Because the
+  base depends on the step, the three cannot be snapped independently;
+  `_apply_freq_grid()` re-snaps all three from the values that were *requested*
+  (`_req_start/_req_stop/_req_step`), so the result does not depend on the order
+  the panel sets them in and does not drift when re-snapped.
+- **`_build_sweep_grid` now looks up BY FREQUENCY, not by arithmetic.** It used to
+  compute `start_idx + i * (step / QT_MASTER_STEP)`, which is only valid on a
+  uniform table. Against the union grid that silently addresses the wrong
+  profiles -- retuning each step to some other frequency while reporting the one
+  asked for, the same class of failure the profile-cap check exists to prevent. It
+  is `np.searchsorted` plus an **exact-match assertion that raises**: a frequency
+  not in the table fails loudly rather than retuning to its neighbour.
+
+**Rounding is half-up on both sides, deliberately.** Python's `round()` is
+banker's and JavaScript's `Math.round` is half-up, so the two disagreed on exactly
+the `.5` cases (50/20 -> 2 on the Pi, 3 in the browser). `_round_half_up()` in
+`sfcw_engine.py` makes them identical; `master_grid_freqs()` and `_snap_sweep()`
+are pure and can be checked without hardware.
+
+**The groundstation mirrors all of this in `lib/sfcwGrid.js`.** The Pi never
+reports its parameters back -- the panel is the source of truth and pushes -- but
+`set_params` silently snaps, so `SfcwPanel` was computing R max, step count and
+sweep time from what was typed rather than what would run. It now snaps the whole
+triple on commit (`commitSweep`, mirroring `_apply_freq_grid`) so the field shows
+what will actually run, and derives every readout from the snapped values as a
+backstop. **Keep `sfcwGrid.js` in sync with `QT_MASTER_STEPS` / `_snap_sweep` /
+`_round_half_up`** -- verified by generating 2500 cases from the Python and
+asserting the JS reproduces all three outputs exactly, plus that every snapped
+sweep lands entirely on the union grid.
+
 **Hard ceiling: `MAX_QUICK_TUNE_PROFILES = 256`, do not exceed it.** The first version of
 this table tried 1–6 GHz at 10 MHz spacing (501 profiles) and it was broken: verified
 against libbladeRF's own source on the Pi
@@ -985,7 +1030,9 @@ now raises immediately if `len(freqs) > MAX_QUICK_TUNE_PROFILES` (compile-time c
 unchecked profile. 2–5 GHz at 20 MHz is 151 profiles, comfortably under 256.
 
 Consequence: the sweep range is hard-bounded to 2–5 GHz (panel Start/Stop min/max 2000/5000
-MHz) — anything requested outside that gets clamped, and step size floors at 20 MHz. Widening
+MHz) — anything requested outside that gets clamped, and step size floors at 20 MHz. Steps
+that are a multiple of 20 or of 50 MHz are exact; anything else snaps to the nearest of
+those (30→40, 45→40, 55→60, 90→100). Widening
 either means trading against the 256-profile ceiling (span_MHz / step_MHz + 1 ≤ 256) — there's
 no way to have both a wide range and fine resolution simultaneously on this hardware without a
 different strategy (e.g. a lazy per-frequency cache with a reset-triggered eviction, discussed

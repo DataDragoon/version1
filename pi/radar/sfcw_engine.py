@@ -8,6 +8,7 @@ phase reference (short cable loopback). Dividing signal by reference
 eliminates random PLL phase offsets between TX and RX synthesizers.
 """
 
+import math
 import threading
 import time
 import numpy as np
@@ -56,7 +57,48 @@ ADC_HOT_SWEEPS_TO_WARN = 8
 ADC_CLEAN_SWEEPS_TO_CLEAR = 30
 QT_MASTER_START_FREQ = 2_000_000_000
 QT_MASTER_STOP_FREQ = 5_000_000_000
-QT_MASTER_STEP = 20_000_000
+# Base grids the master table covers. The table is the UNION of these over
+# [QT_MASTER_START_FREQ, QT_MASTER_STOP_FREQ], so it is deliberately NOT uniformly
+# spaced -- 2000, 2020, 2040, 2050, 2060, 2080, 2100, ...
+#
+# 20 alone could not represent a 50 MHz step: set_params snapped 50 -> 40 and the
+# panel then described a sweep that was not the one running (61 steps and 1.0 m of
+# range against the 76 steps and 1.37 m actually swept). Adding the 50 MHz family
+# makes 50 exact.
+#
+# Cost, against the MAX_QUICK_TUNE_PROFILES = 256 hardware ceiling:
+#   20 MHz -> 151 points, 50 MHz -> 61, overlap (multiples of 100) -> 31
+#   union  -> 151 + 61 - 31 = 181 profiles, 75 under the cap.
+# Adding a third family is NOT free -- check the union size against the cap first,
+# _ensure_master_quick_tune_table() raises rather than silently storing garbage.
+QT_MASTER_STEPS = (20_000_000, 50_000_000)
+# The finest family. A sweep picks ONE family (see _snap_sweep) and every frequency
+# it visits is a multiple of that family's base, which is what guarantees each one
+# is in the union table.
+QT_MASTER_STEP = min(QT_MASTER_STEPS)
+
+
+def _round_half_up(x):
+    """Round halves AWAY from zero, unlike Python's round(), which rounds to even.
+
+    Both sides of the wire must agree on this: the groundstation mirrors the
+    snapping in lib/sfcwGrid.js so its step count, sweep time and R max describe
+    the sweep that will actually run, and JavaScript's Math.round is half-up. With
+    Python's banker's rounding the two disagreed exactly on the .5 cases -- 50/20
+    rounded to 2 here and 3 there.
+    """
+    return int(math.floor(float(x) + 0.5))
+
+
+def master_grid_freqs():
+    """The union grid, sorted. Pure function so it can be checked without hardware."""
+    pts = set()
+    for base in QT_MASTER_STEPS:
+        f = QT_MASTER_START_FREQ
+        while f <= QT_MASTER_STOP_FREQ:
+            pts.add(f)
+            f += base
+    return sorted(pts)
 
 
 class SFCWEngine:
@@ -143,6 +185,11 @@ class SFCWEngine:
         self._gains_dirty = False
         self._warm = False
         self._sweep_lock = threading.Lock()
+        # What the groundstation last asked for, before snapping. See
+        # _apply_freq_grid for why the raw request has to survive.
+        self._req_start = float(self.start_freq)
+        self._req_stop = float(self.stop_freq)
+        self._req_step = float(self.step_size)
         self._qt_master_freqs = None
         self._qt_master_rx = None
         self._qt_master_tx = None
@@ -173,24 +220,62 @@ class SFCWEngine:
         return SPEED_OF_LIGHT / (2 * self.step_size)
 
     @staticmethod
-    def _snap_freq(value):
-        """Round to the nearest 10 MHz grid point and clamp into the master table's range."""
-        snapped = round(float(value) / QT_MASTER_STEP) * QT_MASTER_STEP
+    def _snap_to_base(value, base):
+        snapped = _round_half_up(float(value) / base) * base
         return int(min(max(snapped, QT_MASTER_START_FREQ), QT_MASTER_STOP_FREQ))
 
     @staticmethod
-    def _snap_step(value):
-        snapped = round(float(value) / QT_MASTER_STEP) * QT_MASTER_STEP
-        return int(max(snapped, QT_MASTER_STEP))
+    def _snap_sweep(start, stop, step):
+        """Snap a requested sweep onto ONE of the master table's base grids.
+
+        The table is the union of several bases, but a single sweep must stay
+        inside one of them: mixing is not safe. Starting at 2020 (on the 20 grid)
+        and stepping 50 visits 2070, which is on NEITHER family and so is not in
+        the table at all. Picking one base and snapping start, stop AND step to
+        multiples of it makes every visited frequency a multiple of that base,
+        hence present by construction.
+
+        The base chosen is whichever one can represent the requested STEP most
+        closely; ties go to the finest, which gives the finer start/stop grid.
+        Returns (start, stop, step), all snapped.
+        """
+        best = None
+        for base in QT_MASTER_STEPS:
+            snapped = max(base, _round_half_up(float(step) / base) * base)
+            cand = (abs(snapped - float(step)), base, snapped)
+            if best is None or cand[:2] < best[:2]:
+                best = cand
+        _, base, snapped_step = best
+        return (SFCWEngine._snap_to_base(start, base),
+                SFCWEngine._snap_to_base(stop, base),
+                int(snapped_step))
+
+    def _apply_freq_grid(self):
+        """Re-snap all three from the values that were REQUESTED, not from the
+        previously snapped ones.
+
+        The base grid depends on the step, so changing the step can change which
+        grid start/stop belong to -- and re-snapping an already-snapped value
+        loses a little more each time. Keeping the raw request means the snap is
+        idempotent no matter what order the panel sets things in.
+        """
+        self.start_freq, self.stop_freq, self.step_size = self._snap_sweep(
+            self._req_start, self._req_stop, self._req_step)
 
     def set_params(self, **kwargs):
         with self._lock:
+            grid_changed = False
             if 'start_freq' in kwargs:
-                self.start_freq = self._snap_freq(kwargs['start_freq'])
+                self._req_start = float(kwargs['start_freq'])
+                grid_changed = True
             if 'stop_freq' in kwargs:
-                self.stop_freq = self._snap_freq(kwargs['stop_freq'])
+                self._req_stop = float(kwargs['stop_freq'])
+                grid_changed = True
             if 'step_size' in kwargs:
-                self.step_size = self._snap_step(kwargs['step_size'])
+                self._req_step = float(kwargs['step_size'])
+                grid_changed = True
+            if grid_changed:
+                self._apply_freq_grid()
             if 'num_buffers' in kwargs:
                 self.num_buffers = max(1, int(kwargs['num_buffers']))
             if 'settle_count' in kwargs:
@@ -452,14 +537,13 @@ class SFCWEngine:
         if self._qt_master_freqs is not None:
             return
 
-        freqs = np.arange(QT_MASTER_START_FREQ, QT_MASTER_STOP_FREQ + QT_MASTER_STEP,
-                           QT_MASTER_STEP, dtype=np.int64)
+        freqs = np.array(master_grid_freqs(), dtype=np.int64)
         if len(freqs) > MAX_QUICK_TUNE_PROFILES:
             raise RuntimeError(
                 f"Master quick-tune table needs {len(freqs)} profiles but the bladeRF2 "
                 f"firmware caps BBP fastlock profiles at {MAX_QUICK_TUNE_PROFILES} per "
-                f"direction. Narrow QT_MASTER_STOP_FREQ - QT_MASTER_START_FREQ or widen "
-                f"QT_MASTER_STEP in sfcw_engine.py."
+                f"direction. Narrow QT_MASTER_STOP_FREQ - QT_MASTER_START_FREQ, drop a "
+                f"family from QT_MASTER_STEPS, or widen one, in sfcw_engine.py."
             )
 
         dev_ptr = self.driver.device.dev[0]
@@ -488,9 +572,10 @@ class SFCWEngine:
         self._qt_master_freqs = freqs
         self._qt_master_rx = qt_rx
         self._qt_master_tx = qt_tx
+        bases = "/".join(f"{b/1e6:.0f}" for b in QT_MASTER_STEPS)
         print(f"[sfcw] Generated master quick_tune table: {len(freqs)} profiles "
               f"({QT_MASTER_START_FREQ/1e9:.2f}-{QT_MASTER_STOP_FREQ/1e9:.2f} GHz, "
-              f"{QT_MASTER_STEP/1e6:.0f} MHz spacing)")
+              f"union of {bases} MHz grids, cap {MAX_QUICK_TUNE_PROFILES})")
 
     def invalidate_quick_tune_table(self):
         """Drop the cached master table so it regenerates on next use.
@@ -503,24 +588,41 @@ class SFCWEngine:
         self._qt_master_tx = None
 
     def _build_sweep_grid(self, start, stop, step):
-        """Compute this sweep's frequencies and, if available, their quick_tune profiles
-        by indexing straight into the master table — no regeneration needed regardless
-        of what start/stop/step are, as long as they're on the master's 10 MHz grid
-        within its range (set_params() guarantees this via _snap_freq/_snap_step).
+        """This sweep's frequencies and, if available, their quick_tune profiles,
+        looked up in the master table — no regeneration needed regardless of what
+        start/stop/step are, as long as every frequency is ON the table
+        (set_params guarantees this via _snap_sweep).
+
+        Looked up BY FREQUENCY. The master table used to be a uniform 20 MHz grid,
+        so an index could be computed arithmetically as
+        `start_idx + i * (step / QT_MASTER_STEP)`. It is now the union of several
+        base grids and is deliberately NOT uniformly spaced, so that arithmetic
+        would silently address the wrong profiles — retuning each step to some
+        other frequency while reporting the one that was asked for, which is
+        exactly the failure mode the MAX_QUICK_TUNE_PROFILES check exists to
+        prevent. searchsorted plus an exact-match assertion instead: if a
+        frequency is not in the table, fail loudly rather than retune to its
+        neighbour.
         """
         num_steps = int((stop - start) / step) + 1
+        freqs = (start + np.arange(num_steps) * step).astype(np.int64)
 
         if self._use_quick_tune and self._qt_master_freqs is not None:
-            n_master = len(self._qt_master_freqs)
-            start_idx = int(round((start - QT_MASTER_START_FREQ) / QT_MASTER_STEP))
-            step_idx = max(1, int(round(step / QT_MASTER_STEP)))
-            idxs = np.clip(start_idx + np.arange(num_steps) * step_idx, 0, n_master - 1)
-            freqs = self._qt_master_freqs[idxs]
+            master = self._qt_master_freqs
+            idxs = np.clip(np.searchsorted(master, freqs), 0, len(master) - 1)
+            if not np.array_equal(master[idxs], freqs):
+                bad = freqs[master[idxs] != freqs]
+                raise RuntimeError(
+                    f"Sweep frequencies are not on the master quick-tune grid: "
+                    f"{[int(b) for b in bad[:5]]} Hz (of {len(bad)}). start={start} "
+                    f"stop={stop} step={step}. set_params()/_snap_sweep should make "
+                    f"this impossible — the sweep was not snapped, or QT_MASTER_STEPS "
+                    f"changed without the table being invalidated."
+                )
             qt_rx = [self._qt_master_rx[k] for k in idxs]
             qt_tx = [self._qt_master_tx[k] for k in idxs]
-            return freqs, qt_rx, qt_tx
+            return master[idxs], qt_rx, qt_tx
 
-        freqs = (start + np.arange(num_steps) * step).astype(np.int64)
         return freqs, None, None
 
     def _configure_hardware(self):

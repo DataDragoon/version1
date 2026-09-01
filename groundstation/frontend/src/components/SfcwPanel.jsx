@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { cn } from '@/lib/utils';
 import { Section, InfoTile, ToggleButton } from './Sidebar';
+import { snapSweep, masterGridMhz, QT_MASTER_STEPS_MHZ, MAX_QUICK_TUNE_PROFILES } from '@/lib/sfcwGrid';
 
 
 const LIDAR_AVG_WINDOW = 20;
@@ -109,6 +110,23 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
 
   const canActivate = isConnected && sdrConnected;
 
+  // Commit a change to start/stop/step by snapping the whole triple at once. The
+  // base grid depends on the step, so changing the step can move which grid
+  // start/stop belong to -- they cannot be snapped independently. This mirrors
+  // SFCWEngine._apply_freq_grid exactly, so what the field shows is what runs.
+  const commitSweep = (patch) => {
+    const next = snapSweep(
+      patch.startFreq ?? startFreq,
+      patch.stopFreq ?? stopFreq,
+      patch.stepSize ?? stepSize,
+    );
+    onParamsChange({
+      ...params,
+      startFreq: next.startFreq, stopFreq: next.stopFreq, stepSize: next.stepSize,
+    });
+    sendParams({ startFreq: next.startFreq, stopFreq: next.stopFreq, stepSize: next.stepSize });
+  };
+
   const sendParams = (overrides = {}) => {
     sendSdr({
       cmd: 'sfcw_set_params',
@@ -141,10 +159,21 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
     return { dynamic: false, min: live.min, max: live.max, isDb: live.isDb !== false };
   };
 
-  const numSteps = Math.floor((stopFreq - startFreq) / stepSize) + 1;
-  const bandwidth = (stopFreq - startFreq) * 1e6;
+  // Every derived number below describes the sweep the Pi will ACTUALLY run, not
+  // the one that was typed. SFCWEngine.set_params snaps start/stop/step onto the
+  // quick-tune master grid and never reports back, so before this the panel could
+  // claim 61 steps and 1.0 m of range while the hardware swept 76 steps to 1.37 m.
+  // The fields snap on commit too, so in practice these agree with what is shown —
+  // this is the backstop for anything that sets params without going through them.
+  const snapped = snapSweep(startFreq, stopFreq, stepSize);
+  const gridAdjusted = snapped.startFreq !== startFreq
+    || snapped.stopFreq !== stopFreq || snapped.stepSize !== stepSize;
+
+  const numSteps = Math.floor((snapped.stopFreq - snapped.startFreq) / snapped.stepSize) + 1;
+  const bandwidth = (snapped.stopFreq - snapped.startFreq) * 1e6;
   const rangeRes = bandwidth > 0 ? (299792458 / (2 * bandwidth)) : Infinity;
-  const maxRange = stepSize > 0 ? (299792458 / (4 * stepSize * 1e6) - rangeOffset) : Infinity;
+  const maxRange = snapped.stepSize > 0
+    ? (299792458 / (4 * snapped.stepSize * 1e6) - rangeOffset) : Infinity;
   // "0-3m" display mode never shows past the sweep's actual unambiguous range
   // (matches sfcw_engine.py _process_h_cal's displayed_range_max) — no point
   // sizing the axis past where real data can ever land.
@@ -164,7 +193,7 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
             label="Start"
             value={startFreq}
             unit="MHz"
-            onChange={(v) => { update('startFreq', v); sendParams({ startFreq: v }); }}
+            onChange={(v) => commitSweep({ startFreq: v })}
             min={2000}
             max={5000}
           />
@@ -172,7 +201,7 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
             label="Stop"
             value={stopFreq}
             unit="MHz"
-            onChange={(v) => { update('stopFreq', v); sendParams({ stopFreq: v }); }}
+            onChange={(v) => commitSweep({ stopFreq: v })}
             min={2000}
             max={5000}
           />
@@ -186,10 +215,21 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
             label="Step Size"
             value={stepSize}
             unit="MHz"
-            onChange={(v) => { update('stepSize', v); sendParams({ stepSize: v }); }}
+            onChange={(v) => commitSweep({ stepSize: v })}
             min={20}
             max={500}
           />
+        </div>
+        {/* The quick-tune master table is generated once per device connection and
+            every sweep frequency has to be one of its points, so the step is not
+            continuous. Snapping happens on commit, so the field always shows what
+            will run -- this line explains why it may have moved. */}
+        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
+          Steps snap to a multiple of {QT_MASTER_STEPS_MHZ.join(' or ')} MHz — the quick-tune
+          master table only holds those frequencies ({masterGridMhz().length} of a
+          {' '}{MAX_QUICK_TUNE_PROFILES}-profile hardware limit), and start/stop snap to the
+          same family.
+          {gridAdjusted && ' Your last entry was moved onto the grid.'}
         </div>
         <div className="flex flex-col gap-1">
           <div className="grid grid-cols-2 gap-2">
