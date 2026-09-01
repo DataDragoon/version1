@@ -173,10 +173,10 @@ export function buildCscanGrid(scanData, params) {
 // images shown side by side, and clicking to another row silently re-scaled the
 // one on the right. Now a colour means one dB everywhere.
 //
-// The population is every bin the B-scan pane actually draws -- 0 to maxDepth,
-// over all valid cells -- so the two panes are literally scaled to the same
-// pixels. Gated cell values are aggregates over a subset of those bins, so they
-// land inside the same range by construction.
+// The population is every bin the B-scan pane actually draws -- the whole
+// profile, over all valid cells -- so the two panes are literally scaled to the
+// same pixels. Gated cell values are aggregates over a subset of those bins, so
+// they land inside the same range by construction.
 //
 // Limits are PERCENTILES, not min/max. A range profile has deep interference
 // nulls; after background subtraction it has more of them, and a single bin at
@@ -186,8 +186,7 @@ export function buildCscanGrid(scanData, params) {
 const SCALE_P_LO = 0.01;
 const SCALE_P_HI = 0.999;
 
-export function computeSharedScale(scanData, params) {
-  const maxDepthM = (params.maxDepth != null ? params.maxDepth : 70) / 100;
+export function computeSharedScale(scanData) {
   const vals = [];
 
   for (const pos of scanData) {
@@ -196,7 +195,6 @@ export function computeSharedScale(scanData, params) {
     const mags = pos.magnitudes;
     const dists = pos.distances;
     for (let i = 0; i < mags.length && i < dists.length; i++) {
-      if (dists[i] > maxDepthM) break;
       const v = mags[i];
       if (isFinite(v)) vals.push(v);
     }

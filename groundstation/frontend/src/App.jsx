@@ -8,7 +8,7 @@ import { useBgModelWorker } from './hooks/useBgModelWorker';
 import { inferBgModel } from './lib/bgModelInfer';
 import { computeCaptureStats } from './lib/bgCaptureStats';
 import { computeRangeProfile } from './lib/rangeProfile';
-import { applyBscanBg, bgForStandoff } from './lib/bscanBg';
+import { applyBscanBg, bgForStandoff, coherentMean } from './lib/bscanBg';
 import { computeSharedScale, bgDiagnostics } from './lib/cscanGrid';
 import { cellForIndex } from './lib/cscanGrid';
 import { useRoverScan } from './hooks/useRoverScan';
@@ -370,7 +370,6 @@ export default function App() {
     hStep: 5,
     vCount: 1,
     vStep: 5,
-    maxDepth: 70,
     gateStart: 2,
     gateEnd: 70,
     metric: 'peak',
@@ -409,6 +408,28 @@ export default function App() {
   // sources. Held as a lookup keyed "ix,iy" so a new scan in a different capture
   // ORDER (manual snakes up, the rover snakes down) still lines up.
   const [bscanSuperFit, setBscanSuperFit] = useState(null);
+  // Sweeps banked toward the current cell, so a multi-sweep capture is not a
+  // silent pause. Null when nothing is mid-capture.
+  const [bscanCaptureProgress, setBscanCaptureProgress] = useState(null);
+
+  // Processing params for the whole C-scan pipeline, driven by the controls bar
+  // on the viewport's Live Sweep pane. `windowType`/`kaiserBeta` are pure
+  // display -- they re-window every stored cell on change, so they can be moved
+  // freely over already-captured data. `avgCount` is a CAPTURE parameter: it is
+  // how many sweeps are taken at each grid cell, so it cannot change part-way
+  // through a raster. `avgMode` is display again: every sweep is stored, so
+  // coherent/incoherent can be flipped after the fact and the grid re-derives.
+  // The bar is locked as a whole while a session runs, which keeps every cell in
+  // one grid processed identically.
+  const [bscanProcParams, setBscanProcParams] = useState({
+    windowType: 'rectangular',
+    kaiserBeta: 3,
+    avgCount: 1,
+    // Coherent by default here, unlike the SFCW panel's own live display:
+    // incoherent averaging converges to |signal + noise| and so cannot say
+    // whether anything is in a null, which is exactly what a C-scan cell asks.
+    avgMode: 'coherent',
+  });
 
   const bscanBgSource = useMemo(
     () => ({ bgRef: bscanBgRef, bgModel: bscanBgModel, superFit: bscanSuperFit }),
@@ -521,8 +542,8 @@ export default function App() {
   // This is the COMPLEX-mode result, and it is what SAR and the 2D Map read --
   // SAR reconstructs from h_cal, which a magnitude difference cannot express.
   const processedBscanData = useMemo(
-    () => applyBscanBg(bscanData, { enabled: bgApplied, ...bscanBgSource, mode: 'complex' }, sfcwParams),
-    [bscanData, bscanBgSource, bgApplied, sfcwParams],
+    () => applyBscanBg(bscanData, { enabled: bgApplied, ...bscanBgSource, mode: 'complex', ...bscanProcParams }, sfcwParams),
+    [bscanData, bscanBgSource, bgApplied, sfcwParams, bscanProcParams],
   );
 
   // What the C-scan and B-scan panes draw. Identical to the above in complex
@@ -530,17 +551,17 @@ export default function App() {
   // magnitude mode.
   const cscanProcessedData = useMemo(
     () => (bscanBgSubMode === 'magnitude'
-      ? applyBscanBg(bscanData, { enabled: bgApplied, ...bscanBgSource, mode: 'magnitude' }, sfcwParams)
+      ? applyBscanBg(bscanData, { enabled: bgApplied, ...bscanBgSource, mode: 'magnitude', ...bscanProcParams }, sfcwParams)
       : processedBscanData),
-    [bscanBgSubMode, bscanData, bscanBgSource, bgApplied, sfcwParams, processedBscanData],
+    [bscanBgSubMode, bscanData, bscanBgSource, bgApplied, sfcwParams, processedBscanData, bscanProcParams],
   );
 
   // ONE colour scale for both panes, computed over the whole grid. See
   // computeSharedScale for why this is percentile-based and why it replaced the
   // per-grid / per-row limits the two displays used to compute independently.
   const cscanSharedScale = useMemo(
-    () => computeSharedScale(cscanProcessedData, bscanParams),
-    [cscanProcessedData, bscanParams],
+    () => computeSharedScale(cscanProcessedData),
+    [cscanProcessedData],
   );
 
   const cscanBgDiag = useMemo(() => bgDiagnostics(cscanProcessedData), [cscanProcessedData]);
@@ -565,6 +586,12 @@ export default function App() {
   const [sarAperture, setSarAperture] = useState(1);
   const [sarCoherent, setSarCoherent] = useState(true);
   const [sarDynRange, setSarDynRange] = useState(20);
+  // How deep to reconstruct. This was `bscanParams.maxDepth`, edited from the
+  // C-scan panel, where it did two unrelated jobs -- clipping the B-scan pane's
+  // display (removed; that pane now draws the whole profile) and bounding SAR's
+  // output grid. Only the second is a real parameter, and it belongs here: it
+  // sets the extent and the cost of the reconstruction, not what a display shows.
+  const [sarMaxDepth, setSarMaxDepth] = useState(70);
 
   const sarProcessedData = useMemo(
     () => applyBscanBg(bscanData, { enabled: sarBgEnabled, ...bscanBgSource }, sfcwParams),
@@ -578,7 +605,7 @@ export default function App() {
 
   // SAR and the 2D Map are one-dimensional: they read the horizontal step as the
   // aperture spacing and treat the capture sequence as a line.
-  const sarParams = useMemo(() => ({ ...bscanParams, stepSize: bscanParams.hStep, aperture: sarAperture, coherent: sarCoherent, startFreq: sfcwParams.startFreq, svdEnabled: sarSvdEnabled, svdK: sarSvdK, svdStrength: sarSvdStrength }), [bscanParams, sarAperture, sarCoherent, sfcwParams.startFreq, sarSvdEnabled, sarSvdK, sarSvdStrength]);
+  const sarParams = useMemo(() => ({ ...bscanParams, maxDepth: sarMaxDepth, stepSize: bscanParams.hStep, aperture: sarAperture, coherent: sarCoherent, startFreq: sfcwParams.startFreq, svdEnabled: sarSvdEnabled, svdK: sarSvdK, svdStrength: sarSvdStrength }), [bscanParams, sarMaxDepth, sarAperture, sarCoherent, sfcwParams.startFreq, sarSvdEnabled, sarSvdK, sarSvdStrength]);
   const { sarResult, sarProgress } = useSarWorker(sarBscanInput, sarParams);
 
   // 2D Map uses the same processed B-scan as the main B-scan panel, optionally with its own SVD
@@ -833,19 +860,60 @@ export default function App() {
         // do keep STARTED after the settle window closed.
         if (tag.skip > 0) {
           tag.skip -= 1;
+        } else if (tag.got.length + 1 < tag.need) {
+          // Still filling this cell's Avg budget. Every sweep is kept, not just
+          // the running mean: the coherent/incoherent choice is a DISPLAY
+          // control, so it has to stay changeable against recorded data, and
+          // that is only possible if the individual looks survive.
+          tag.got.push({
+            h_cal_real: msg.h_cal_real ? [...msg.h_cal_real] : null,
+            h_cal_imag: msg.h_cal_imag ? [...msg.h_cal_imag] : null,
+            timestamp: msg.timestamp,
+            ...provenance,
+          });
+          setBscanCaptureProgress({ got: tag.got.length, need: tag.need });
         } else {
           const grid = bscanParamsRef.current;
+          const sweeps = [...tag.got, {
+            h_cal_real: msg.h_cal_real ? [...msg.h_cal_real] : null,
+            h_cal_imag: msg.h_cal_imag ? [...msg.h_cal_imag] : null,
+            timestamp: msg.timestamp,
+            ...provenance,
+          }];
+          // Cell-level provenance is pooled over the sweeps actually taken, so a
+          // multi-sweep cell reports the standoff it was really measured at
+          // rather than whichever sweep happened to land last. The BG model is
+          // evaluated at this number, so it matters.
+          const meanSweep = coherentMean(sweeps, msg.num_steps);
+          const stand = sweeps.map(w => w.lidar_standoff_mm).filter(v => v != null);
+          const pooled = {
+            ...provenance,
+            lidar_standoff_mm: stand.length ? stand.reduce((a, b) => a + b, 0) / stand.length : null,
+            lidar_n: sweeps.reduce((a, w) => a + (w.lidar_n || 0), 0),
+            lidar_std: stand.length > 1
+              ? Math.sqrt(stand.reduce((a, v) => a + (v - stand.reduce((x, y) => x + y, 0) / stand.length) ** 2, 0) / stand.length)
+              : provenance.lidar_std,
+          };
           setBscanData(prev => {
             const cell = tag.cell || cellForIndex(prev.length, grid.hCount);
             return [...prev, {
+              // The Pi's own profile, kept for the export record. Nothing on
+              // screen reads it -- every display recomputes from h_cal with the
+              // panel's window -- but it is the only Hanning/nfft-204 version
+              // that exists and it costs nothing to keep.
               magnitudes: [...msg.magnitudes],
               distances: [...msg.distances],
-              h_cal_real: msg.h_cal_real ? [...msg.h_cal_real] : null,
-              h_cal_imag: msg.h_cal_imag ? [...msg.h_cal_imag] : null,
+              sweeps,
+              // The coherent mean, NOT the last sweep. Everything that reads
+              // h_cal without knowing about `sweeps` -- SAR, the BG-model
+              // trainer, Super Fit, svdFilter, the export -- then sees the
+              // averaged cell, which is the whole point of having taken N.
+              h_cal_real: meanSweep.re,
+              h_cal_imag: meanSweep.im,
               num_steps: msg.num_steps,
               step_size: msg.step_size,
               range_offset: msg.range_offset,
-              ...provenance,
+              ...pooled,
               grid_ix: cell.ix,
               grid_iy: cell.iy,
               x_cm: cell.ix * grid.hStep,
@@ -862,6 +930,7 @@ export default function App() {
           });
           bscanCaptureRef.current = null;
           setBscanCapturing(false);
+          setBscanCaptureProgress(null);
         }
       }
 
@@ -1010,9 +1079,12 @@ export default function App() {
   // Tags the sweep after next as this cell -- `skip: 1` drops the one already
   // in flight, which began while the rover was still settling.
   const requestRoverCapture = useCallback((cell, rover, target) => {
-    bscanCaptureRef.current = { cell, rover, target, skip: 1 };
+    bscanCaptureRef.current = {
+      cell, rover, target, skip: 1,
+      need: Math.max(1, bscanProcParams.avgCount), got: [],
+    };
     setBscanCapturing(true);
-  }, []);
+  }, [bscanProcParams.avgCount]);
 
   const roverScan = useRoverScan({
     params: bscanParams,
@@ -1024,6 +1096,9 @@ export default function App() {
     onStopSweep: stopSfcwSweep,
     capturedCount: bscanData.length,
     onRequestCapture: requestRoverCapture,
+    // A cell now takes avgCount sweeps, so the capture watchdog has to scale
+    // with it or a high Avg would trip the timeout before the cell completes.
+    sweepsPerCell: Math.max(1, bscanProcParams.avgCount),
   });
 
   // A raster that ends -- completed, stopped or failed -- must not leave a tag
@@ -1066,14 +1141,20 @@ export default function App() {
       // The Pi has no notion of a B-scan; the next sweep it sends is the capture.
       // No cell: the manual raster resolves it from the capture index.
       setBscanCapturing(true);
-      bscanCaptureRef.current = { cell: null, rover: null, target: null, skip: 0 };
+      bscanCaptureRef.current = {
+        cell: null, rover: null, target: null, skip: 0,
+        need: Math.max(1, bscanProcParams.avgCount), got: [],
+      };
     } else if (action === 'new') {
       setBscanData([]);
     } else if (action === 'undo') {
       setBscanData(prev => prev.slice(0, -1));
     } else if (action === 'export') {
       const exportData = {
-        version: 6,
+        // v7 adds per-position `sweeps` (every look taken at that cell, so the
+        // coherent/incoherent choice stays live after import) and `procParams`.
+        version: 7,
+        procParams: bscanProcParams,
         timestamp: new Date().toISOString(),
         params: bscanParams,
         sfcwParams: sfcwParams,
@@ -1102,6 +1183,21 @@ export default function App() {
             const imported = JSON.parse(ev.target.result);
             if (imported.data && Array.isArray(imported.data)) {
               setBscanData(imported.data);
+              // Window and averaging MODE are display choices and are restored so
+              // the import opens on the image it was exported as. avgCount is a
+              // CAPTURE parameter -- the sweeps are already in the file and the
+              // number of them is whatever was taken, so it is read back from
+              // the data rather than trusted from the header.
+              if (imported.procParams) {
+                const got = imported.data.find(d => Array.isArray(d.sweeps) && d.sweeps.length);
+                setBscanProcParams(prev => ({
+                  ...prev,
+                  ...(imported.procParams.windowType && { windowType: imported.procParams.windowType }),
+                  ...(imported.procParams.kaiserBeta != null && { kaiserBeta: imported.procParams.kaiserBeta }),
+                  ...(imported.procParams.avgMode && { avgMode: imported.procParams.avgMode }),
+                  avgCount: got ? got.sweeps.length : 1,
+                }));
+              }
               if (imported.bgRef) {
                 setBscanBgModel(null);
                 setBscanBgRef(imported.bgRef);
@@ -1114,10 +1210,13 @@ export default function App() {
                   stepSize, numPositions, maxDepth, wallThickness,
                   hCount, hStep, vCount, vStep, gateStart, gateEnd, metric,
                 } = imported.params;
+                // v3 and earlier called it wallThickness. It is no longer a
+                // C-scan parameter at all -- it only ever bounded SAR's
+                // reconstruction -- so it is restored there instead.
                 const depth = maxDepth != null ? maxDepth : wallThickness;
+                if (depth != null) setSarMaxDepth(depth);
                 setBscanParams(prev => ({
                   ...prev,
-                  ...(depth != null && { maxDepth: depth }),
                   ...(stepSize != null && { hStep: stepSize }),
                   ...(numPositions != null && { hCount: numPositions, vCount: 1 }),
                   ...(hCount != null && { hCount }),
@@ -1383,6 +1482,8 @@ export default function App() {
         onClearSuperFit={handleBscanClearSuperFit}
         cscanSharedScale={cscanSharedScale}
         cscanBgDiag={cscanBgDiag}
+        bscanProcParams={bscanProcParams}
+        bscanCaptureProgress={bscanCaptureProgress}
         sarBscanData={sarBscanInput}
         sarResult={sarResult}
         sarProgress={sarProgress}
@@ -1402,6 +1503,8 @@ export default function App() {
         onSarCoherentChange={setSarCoherent}
         sarDynRange={sarDynRange}
         onSarDynRangeChange={setSarDynRange}
+        sarMaxDepth={sarMaxDepth}
+        onSarMaxDepthChange={setSarMaxDepth}
         mapBscanData={mapBscanData}
         mapGateStart={mapGateStart}
         mapGateEnd={mapGateEnd}
@@ -1469,6 +1572,9 @@ export default function App() {
         bscanBgDisplay={bscanBgDisplay}
         bscanBgSubMode={bscanBgSubMode}
         cscanSharedScale={cscanSharedScale}
+        bscanProcParams={bscanProcParams}
+        onBscanProcParamsChange={setBscanProcParams}
+        bscanProcLocked={sfcwRunning || !!roverScan.active}
         bscanParams={bscanParams}
         bscanCapturing={bscanCapturing}
         roverScan={roverScan}

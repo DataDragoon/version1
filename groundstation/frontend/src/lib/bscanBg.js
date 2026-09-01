@@ -25,7 +25,8 @@
 // keep reading the unmodified wire values.
 
 import { inferBgModel } from './bgModelInfer';
-import { computeRangeProfile } from './rangeProfile';
+import { computeRangeAmplitude, ampToDb } from './rangeProfile';
+import { windowFn } from './imagingEffects';
 import { BG_STATUS } from './cscanGrid';
 
 // Background spectrum to subtract at one position.
@@ -121,14 +122,48 @@ export function freqGrid(startFreqMhz, stopFreqMhz, numSteps) {
   return freqs;
 }
 
+// Per-cell sweeps. A cell captured with Avg > 1 holds every sweep it took, not
+// just the average -- so the coherent/incoherent choice stays live after the
+// scan and can be flipped against recorded data. Older records (and v6 imports)
+// carry only the one spectrum, which is the same thing with N = 1.
+export function cellSweeps(pos) {
+  if (Array.isArray(pos.sweeps) && pos.sweeps.length > 0) return pos.sweeps;
+  return [{ h_cal_real: pos.h_cal_real, h_cal_imag: pos.h_cal_imag }];
+}
+
+// Coherent mean of the complex spectra. This is what h_cal on the record means
+// for a multi-sweep cell, and it is what SAR and the BG-model trainer read --
+// both are inherently coherent, so neither has an incoherent variant to pick.
+export function coherentMean(sweeps, numSteps) {
+  if (sweeps.length === 1) return { re: sweeps[0].h_cal_real, im: sweeps[0].h_cal_imag };
+  const re = new Array(numSteps).fill(0);
+  const im = new Array(numSteps).fill(0);
+  for (const s of sweeps) {
+    for (let i = 0; i < numSteps; i++) { re[i] += s.h_cal_real[i]; im[i] += s.h_cal_imag[i]; }
+  }
+  for (let i = 0; i < numSteps; i++) { re[i] /= sweeps.length; im[i] /= sweeps.length; }
+  return { re, im };
+}
+
 // Subtract the selected background from every position and recompute range
 // profiles. Returns the input untouched when no background is selected.
 //
-// mode:
-//   'complex'   (default) vector difference of h_cal, then one IFFT. This is
-//               what removes the wall/coupling return so a target 16.6 dB
-//               beneath it is not buried. Sensitive to standoff error: 1 mm is
-//               12 degrees at 5 GHz.
+// opts:
+//   mode        'complex' (default) | 'magnitude'  -- see below
+//   windowType  'rectangular' (default) | 'hanning' | 'kaiser'
+//   kaiserBeta  beta for the kaiser window
+//   avgMode     'coherent' (default) | 'incoherent' -- how a multi-sweep cell
+//               is combined. Both cut the visible wobble by sqrt(N), but only
+//               coherent removes the noise's contribution to the MEAN;
+//               incoherent converges to |signal + noise|, which in a deep null
+//               is dominated by the noise and can never say whether anything is
+//               there. The two are indistinguishable more than ~10 dB above the
+//               floor, so the difference is entirely a null-depth question.
+//
+// Subtraction mode:
+//   'complex'   vector difference of h_cal, then one IFFT. This is what removes
+//               the wall/coupling return so a target 16.6 dB beneath it is not
+//               buried. Sensitive to standoff error: 1 mm is 12 degrees at 5 GHz.
 //   'magnitude' transform BOTH spectra and difference the dB profiles. This is
 //               the DETECTION statistic -- the 2026-08-28 A/B found the target
 //               as +4.4 dB at 21.2 cm against a 0.23 dB target-free control,
@@ -136,26 +171,68 @@ export function freqGrid(startFreqMhz, stopFreqMhz, numSteps) {
 //               is a small fraction of a 9.76 mm range bin.
 //
 // Neither is a better version of the other: complex is for seeing, magnitude is
-// for deciding. In magnitude mode h_cal_real/imag are left RAW, because a dB
-// difference cannot be expressed as a modified h_cal -- so SAR, which reads
-// h_cal, must stay on complex.
-export function applyBscanBg(bscanData, { enabled, bgRef, bgModel, superFit, mode }, sfcwParams) {
+// for deciding. In magnitude mode h_cal_real/imag are left at the coherent mean,
+// because a dB difference cannot be expressed as a modified h_cal -- so SAR,
+// which reads h_cal, must stay on complex.
+//
+// ORDER OF OPERATIONS matters and is deliberate: the background is subtracted
+// from EACH SWEEP, before averaging, not from the average. For coherent
+// averaging the two are identical (both are linear), but for incoherent they
+// are not -- averaging |signal| first and subtracting a complex background
+// afterwards is not a defined operation, whereas subtracting per sweep and then
+// averaging the resulting magnitudes is exactly "N independent looks at the
+// residual".
+export function applyBscanBg(bscanData, opts, sfcwParams) {
   if (bscanData.length === 0) return bscanData;
+  const { enabled, bgRef, bgModel, superFit, mode } = opts;
   const sources = { bgRef, bgModel, superFit };
   const active = enabled && (bgModel || bgRef || superFit);
   const magnitudeMode = mode === 'magnitude';
+  const incoherent = opts.avgMode === 'incoherent';
+  const makeWin = windowFn(opts.windowType || 'rectangular', opts.kaiserBeta != null ? opts.kaiserBeta : 3);
 
   return bscanData.map((pos) => {
     if (!pos.h_cal_real || !pos.h_cal_imag) return pos;
     const numSteps = pos.h_cal_real.length;
     const freqs = freqGrid(sfcwParams.startFreq, sfcwParams.stopFreq, numSteps);
+    const win = makeWin(numSteps);
+    const sweeps = cellSweeps(pos);
+    const mean = coherentMean(sweeps, numSteps);
+    const prof = (re, im) => computeRangeAmplitude(re, im, numSteps, pos.step_size, pos.range_offset, win);
+
+    // Mean of the LINEAR amplitude profiles of each sweep. Averaging dB instead
+    // would be a geometric mean, which is not what incoherent integration is.
+    const incoherentAmp = (offRe, offIm) => {
+      let acc = null;
+      let dists = null;
+      for (const s of sweeps) {
+        let re = s.h_cal_real, im = s.h_cal_imag;
+        if (offRe) {
+          re = new Array(numSteps); im = new Array(numSteps);
+          for (let i = 0; i < numSteps; i++) {
+            re[i] = s.h_cal_real[i] - offRe[i];
+            im[i] = s.h_cal_imag[i] - offIm[i];
+          }
+        }
+        const r = prof(re, im);
+        if (acc === null) { acc = r.amplitudes.slice(); dists = r.distances; }
+        else for (let i = 0; i < acc.length; i++) acc[i] += r.amplitudes[i];
+      }
+      for (let i = 0; i < acc.length; i++) acc[i] /= sweeps.length;
+      return { amplitudes: acc, distances: dists };
+    };
+
+    const base = {
+      ...pos, freqs, num_sweeps: sweeps.length,
+      avg_mode: sweeps.length > 1 ? (incoherent ? 'incoherent' : 'coherent') : null,
+    };
 
     if (!active) {
-      const rp = computeRangeProfile(pos.h_cal_real, pos.h_cal_imag, numSteps, pos.step_size, pos.range_offset);
+      const r = (incoherent && sweeps.length > 1) ? incoherentAmp(null, null) : prof(mean.re, mean.im);
       return {
-        ...pos, magnitudes: rp.magnitudes, distances: rp.distances,
-        h_cal_real: pos.h_cal_real, h_cal_imag: pos.h_cal_imag,
-        freqs, bg_status: BG_STATUS.OFF, bg_sub_mode: null,
+        ...base, magnitudes: ampToDb(r.amplitudes), distances: r.distances,
+        h_cal_real: mean.re, h_cal_imag: mean.im,
+        bg_status: BG_STATUS.OFF, bg_sub_mode: null,
       };
     }
 
@@ -165,41 +242,46 @@ export function applyBscanBg(bscanData, { enabled, bgRef, bgModel, superFit, mod
       // not destroyed, but the status marks it invalid and every scale and
       // every colour downstream excludes it -- an un-subtracted cell sitting in
       // a subtracted grid reads as a target and sets the colour limits.
-      const rp = computeRangeProfile(pos.h_cal_real, pos.h_cal_imag, numSteps, pos.step_size, pos.range_offset);
+      const r = (incoherent && sweeps.length > 1) ? incoherentAmp(null, null) : prof(mean.re, mean.im);
       return {
-        ...pos, magnitudes: rp.magnitudes, distances: rp.distances,
-        freqs, bg_status: bg.status, bg_sub_mode: mode || 'complex',
+        ...base, magnitudes: ampToDb(r.amplitudes), distances: r.distances,
+        h_cal_real: mean.re, h_cal_imag: mean.im,
+        bg_status: bg.status, bg_sub_mode: mode || 'complex',
       };
     }
 
     if (magnitudeMode) {
-      const sig = computeRangeProfile(pos.h_cal_real, pos.h_cal_imag, numSteps, pos.step_size, pos.range_offset);
-      const ref = computeRangeProfile(bg.bgReal, bg.bgImag, numSteps, pos.step_size, pos.range_offset);
-      const n = Math.min(sig.magnitudes.length, ref.magnitudes.length);
+      const sig = (incoherent && sweeps.length > 1) ? incoherentAmp(null, null) : prof(mean.re, mean.im);
+      const ref = prof(bg.bgReal, bg.bgImag);
+      const sigDb = ampToDb(sig.amplitudes);
+      const refDb = ampToDb(ref.amplitudes);
+      const n = Math.min(sigDb.length, refDb.length);
       const diff = new Array(n);
-      for (let i = 0; i < n; i++) diff[i] = sig.magnitudes[i] - ref.magnitudes[i];
+      for (let i = 0; i < n; i++) diff[i] = sigDb[i] - refDb[i];
       return {
-        ...pos,
+        ...base,
         magnitudes: diff,
         distances: sig.distances.slice(0, n),
-        // h_cal stays raw: the difference is not a spectrum.
-        h_cal_real: pos.h_cal_real, h_cal_imag: pos.h_cal_imag,
-        bg_magnitudes: ref.magnitudes,
-        freqs, bg_status: bg.status, bg_sub_mode: 'magnitude',
+        // h_cal stays the coherent mean: the difference is not a spectrum.
+        h_cal_real: mean.re, h_cal_imag: mean.im,
+        bg_magnitudes: refDb,
+        bg_status: bg.status, bg_sub_mode: 'magnitude',
       };
     }
 
     const real = new Array(numSteps);
     const imag = new Array(numSteps);
     for (let i = 0; i < numSteps; i++) {
-      real[i] = pos.h_cal_real[i] - bg.bgReal[i];
-      imag[i] = pos.h_cal_imag[i] - bg.bgImag[i];
+      real[i] = mean.re[i] - bg.bgReal[i];
+      imag[i] = mean.im[i] - bg.bgImag[i];
     }
-    const rp = computeRangeProfile(real, imag, numSteps, pos.step_size, pos.range_offset);
+    const r = (incoherent && sweeps.length > 1)
+      ? incoherentAmp(bg.bgReal, bg.bgImag)
+      : prof(real, imag);
     return {
-      ...pos, magnitudes: rp.magnitudes, distances: rp.distances,
+      ...base, magnitudes: ampToDb(r.amplitudes), distances: r.distances,
       h_cal_real: real, h_cal_imag: imag,
-      freqs, bg_status: bg.status, bg_sub_mode: 'complex',
+      bg_status: bg.status, bg_sub_mode: 'complex',
     };
   });
 }

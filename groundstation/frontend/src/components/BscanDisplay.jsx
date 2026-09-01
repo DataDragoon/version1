@@ -41,8 +41,7 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
 
   const numPos = scanData.length;
   const allDistances = scanData[0].distances;
-  const { hStep, maxDepth } = params;
-  const maxDepthM = maxDepth / 100;
+  const { hStep } = params;
 
   // Row label: a C-scan cell carries its own grid coordinates; fall back to the
   // capture index times the horizontal step for data imported from a linear scan.
@@ -52,11 +51,13 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
     return (scanIdx * (hStep || 1)).toFixed(0);
   };
 
+  // The whole profile, always. There used to be a Max Depth field clipping this
+  // to 70 cm against a displayed range of ~74 cm, which bought nothing and meant
+  // the pane could silently hide the far end of the record. Depth SELECTION is
+  // the Depth Slice gate's job, and that only governs the C-scan grid's colour;
+  // this pane exists to show where things actually are before you gate.
   const startBin = 0;
-  let endBin = allDistances.length - 1;
-  for (let i = allDistances.length - 1; i >= 0; i--) {
-    if (allDistances[i] <= maxDepthM) { endBin = i; break; }
-  }
+  const endBin = allDistances.length - 1;
 
   const numBins = endBin - startBin + 1;
   const distances = allDistances.slice(startBin, endBin + 1);

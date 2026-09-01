@@ -365,9 +365,12 @@ only `magnitudes`/`distances` gets silently discarded. `applyBscanBg` does this.
 keep their own; `lib/svd.js` stays) and the Wall section. Wall standoff / thickness /
 permittivity were never doing refraction work in practice — εr defaulted to 1, so the
 distance correction was the identity and the only live effect was capping display depth
-at the wall thickness. That is now a single `maxDepth` field (cm, default 30) under
-Display, used by both `BscanDisplay` and `sar.worker.js`. Export is v6 (see the C-scan
-section); import still reads v3 and maps the old `wallThickness` onto `maxDepth`.
+at the wall thickness. That became a single `maxDepth` field under Display, used by both
+`BscanDisplay` and `sar.worker.js` — and was split apart again on 2026-08-31, because those
+two uses had nothing to do with each other: the display clipping is gone and the
+reconstruction depth moved to the SAR panel. See the C-scan imaging section below. Export is
+v6 (see the C-scan section); import still reads v3 and maps the old `wallThickness` onto
+SAR's depth.
 Pi-side architecture: bladerf_driver.py (HAL) → sfcw_engine.py (sweep logic) → sdr_server.py (WebSocket).
 
 **SFCW params are pushed groundstation → Pi, never read back.** The engine carries its
@@ -999,8 +1002,8 @@ replace it. Panel id is `cscan` (was `bscan`). App-level state keeps its `bscan*
 (`bscanData`, `bscanParams`, …) because the underlying record is still one B-scan trace
 per position — only the panel and its geometry changed.
 
-**Grid.** `bscanParams` is now `{ hCount, hStep, vCount, vStep, maxDepth, gateStart,
-gateEnd, metric }`. `stepSize` / `numPositions` are gone; SAR and the 2D Map are 1D and
+**Grid.** `bscanParams` is now `{ hCount, hStep, vCount, vStep, gateStart, gateEnd,
+metric }` (it carried a `maxDepth` until 2026-08-31; see the C-scan imaging section). `stepSize` / `numPositions` are gone; SAR and the 2D Map are 1D and
 read `stepSize: hStep` (injected in `sarParams` / `mapStepSize`) with the position count
 taken from the data length as before. The Scan Grid section sits between Session and
 Capture so the rectangle is described before any sweep is tagged.
@@ -2265,10 +2268,11 @@ now-unused `SPEED_OF_LIGHT` came out of that file with it.
 
 **2. Gate/depth defaults raised to 70 cm** (`App.jsx` `bscanParams`): `gateEnd` 15 -> 70 and
 `maxDepth` 30 -> **70**. `maxDepth` was raised deliberately alongside it, not incidentally --
-the Max Depth field's own `onChange` clamps `gateEnd` to `maxDepth`, so leaving it at 30
+the Max Depth field's own `onChange` clamped `gateEnd` to `maxDepth`, so leaving it at 30
 would have silently snapped the new 70 cm gate back to 30 the first time anyone touched that
-field. They need to move together. Note `maxDepth` also sets the B-scan display depth and is
-read by `sar.worker.js`, so SAR now reconstructs to 70 cm by default.
+field. **SUPERSEDED 2026-08-31: `maxDepth` no longer exists in `bscanParams`** -- see the
+C-scan imaging section below. The coupling it describes is gone with it; SAR's depth is now
+`sarMaxDepth` on the SAR panel.
 
 **3. Rover session is now ARM then SCAN, two presses** (`hooks/useRoverScan.js`,
 `CscanPanel.jsx`, `App.jsx` `handleBscanAction`). Start Session starts the sweep and drives
@@ -2323,9 +2327,8 @@ above every residual) set `dbMax` on its own and crushed the actual data into th
 bottom few percent of the colormap -- a **working subtraction looked empty**.
 
 `computeSharedScale()` (`lib/cscanGrid.js`) now computes **one** pair of limits
-from every bin of every valid cell within `maxDepth` -- exactly the pixels the
-B-scan pane draws -- and both displays use it. The BG row is still drawn but no
-longer votes.
+from every bin of every valid cell -- exactly the pixels the B-scan pane draws --
+and both displays use it. The BG row is still drawn but no longer votes.
 
 **Limits are percentiles (p1 / p99.9), not min/max.** A range profile has deep
 interference nulls and a subtracted one has more; a single bin at -140 dB would
@@ -2420,6 +2423,95 @@ and 10 mm per row, one target 22 dB below the wall face in one cell):
 | corner captured reference | -23.2 dB | **-13.2 dB** (target is not the brightest) |
 | **Super Fit** | -40.0 dB | **-101.7 dB** (61 dB of contrast) |
 
+### The Live Sweep controls bar now drives the C-scan (2026-08-31)
+
+The bar on top of the C-scan viewport used to affect only that pane -- its Window
+and Avg settings never reached the grid, so the panel showed a range profile
+processed differently from the two images under it. It is now the C-scan's
+processing surface. `SfcwDisplay` gained optional `procParams` /
+`onProcParamsChange` (controlled `{windowType, kaiserBeta, avgCount, avgMode}`),
+`procLocked`, and `hideRangeComp` / `hideFloor` / `hideCfar` / `hideYMode`. Omit
+them all and the component behaves exactly as before, which is what the SFCW
+panel's own instance does.
+
+**Four controls were removed from the C-scan's instance**, each because it could
+only disagree with the image beside it:
+- **R^n** applies the same gain to every cell and to the background alike, so it
+  cancels out of every comparison a C-scan makes.
+- **FLOOR** is estimated from this pane's own rolling sweep history, which
+  describes the live sweep, not the recorded cell being drawn.
+- **CFAR** is a per-trace detector nothing in the grid pipeline reads.
+- **Y session/frame**: 'session' extremes accumulated over a whole raster would
+  leave the axis set by whichever cell was loudest. Pinned to 'frame'.
+
+Hidden controls are forced OFF rather than merely not rendered, so a stale
+default cannot keep applying itself.
+
+**The bar locks while a session runs** (`sfcwRunning || roverScan.active`).
+`avgCount` genuinely cannot change part-way through a raster -- different cells
+would hold different numbers of sweeps -- and the window is locked with it so
+every cell in one grid is processed identically. Everything unlocks when the
+session stops and then re-derives the whole grid live.
+
+### Windowing is a display parameter; Avg is a capture parameter
+
+- **Window / Kaiser beta** re-window every stored cell on change, so they can be
+  moved freely over already-captured or imported data. `rangeProfile.js`
+  `computeRangeProfile` takes an optional taper (from `imagingEffects.js`
+  `windowFn`, the same one the SFCW display and Imaging Bench use). Measured on a
+  single synthetic echo: sidelobes rel. peak **rect -18.0 dB, Kaiser beta 3 -29.1,
+  Hanning -31.5**, with -3 dB mainlobes of **5 / 5 / 7 bins**. Rectangular stays
+  the default -- Hanning's wider mainlobe would swallow a target 7 cm from the
+  wall face, which is exactly the case here.
+- **Avg** is how many sweeps are taken at each grid cell, so it only affects
+  captures made after it is set.
+
+### Every sweep of a cell is stored, so coh/inc stays live
+
+A cell captured with Avg > 1 keeps **all** its sweeps in `pos.sweeps`, not just
+the average, because coherent-vs-incoherent is a *display* choice and has to
+remain flippable against recorded data. `pos.h_cal_real/imag` is the **coherent
+mean** (not the last sweep -- that was a bug in the first draft), so everything
+that reads `h_cal` without knowing about `sweeps` -- SAR, the BG-model trainer,
+Super Fit, `svdFilter`, the export -- sees the averaged cell. `cellSweeps()`
+falls back to the single spectrum, so a pre-v7 record is exactly an N=1 cell;
+verified byte-identical output.
+
+**Order of operations is deliberate: the background is subtracted from each
+SWEEP, before averaging, not from the average.** For coherent averaging the two
+are identical (both linear); for incoherent they are not -- averaging `|signal|`
+first and subtracting a complex background afterwards is not a defined
+operation, whereas subtracting per sweep and then averaging magnitudes is
+exactly "N independent looks at the residual".
+
+Measured (synthetic, 16 looks): coherent averaging lowers the residual peak by
+**-13.7 dB against an ideal -12.0**. At a bin far above the noise floor coherent
+and incoherent agree to **0.1 dB**, and at a null sitting at the floor incoherent
+reads **1.6 dB high** -- the noise bias, and the entire difference between the
+two modes. Note the SIZE of that gap is bounded by how far the null sits below
+the single-look floor, and more looks do NOT widen it (checked at N=64): once
+coherent has driven its own floor below the null, what remains is fixed by the
+incoherent floor. The direction is the invariant, not the magnitude.
+
+Cell-level provenance is pooled over the sweeps actually taken (mean standoff,
+summed `lidar_n`), so a multi-sweep cell reports the standoff it was really
+measured at rather than whichever sweep landed last -- the BG model is evaluated
+at that number.
+
+**SAR is forced to `avgMode: 'coherent'`** regardless of the toggle: it
+back-projects complex data, so an incoherently averaged magnitude profile is not
+an input it can use. It does follow the window.
+
+**The rover capture watchdog scales with Avg.** `useRoverScan`'s flat
+`CAPTURE_TIMEOUT_MS = 20000` was plenty at one sweep per cell and would have
+tripped part-way through an Avg of 16; it is now
+`20 s + 2 s * (sweepsPerCell - 1)`.
+
+**Export is v7** (`sweeps` + `procParams`). Import restores `windowType`,
+`kaiserBeta` and `avgMode`, but reads `avgCount` back from the data rather than
+the header -- the sweeps are in the file and their number is whatever was
+actually taken.
+
 ### Also fixed: Manual scaling seeded from the wrong data
 
 `seedManualRange()` rebuilt the grid from `scanData`, which the Sidebar passes as
@@ -2444,6 +2536,18 @@ with.
 - **The Live Sweep pane at the top of the C-scan viewport uses the SFCW panel's
   background** (`sfcwBgModel`/`sfcwBgRef`), not the C-scan's. The two can
   disagree silently.
+- **`maxDepth` is gone from the C-scan panel (2026-08-31).** It did two unrelated
+  jobs: clipping the B-scan pane's display, and bounding SAR's reconstruction
+  grid. The first was pointless -- the default clipped 70 cm off a ~74 cm record,
+  so it hid the far end of the data and bought nothing, while looking like a
+  depth control next to the Depth Slice gate, which is the actual one. The B-scan
+  pane and the shared scale now cover the whole profile unconditionally. The
+  second is a real parameter and moved to the **SAR panel** as `sarMaxDepth`
+  (same 70 cm default), since it sets the extent and cost of the reconstruction
+  rather than what a display shows. The Depth Slice gate's upper bound is now
+  derived from the record itself (`c/(2*step)/2 - range_offset`, read off a
+  captured profile) instead of tracking a second field. Import still reads a v3
+  `wallThickness` / v4+ `maxDepth` and restores it into `sarMaxDepth`.
 - Default gate is 2-70 cm with `metric: 'peak'`. With the wall at 13-14 cm,
   `max()` over that gate picks the wall in every cell -- the plan view is then a
   wall-strength map, which is precisely the gradient the rover scans showed.

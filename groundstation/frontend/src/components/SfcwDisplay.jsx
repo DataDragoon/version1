@@ -14,6 +14,7 @@ const CFAR_COLOR = 'rgba(78, 205, 196, 0.6)';
 const CFAR_FILL = 'rgba(78, 205, 196, 0.06)';
 const NOISE_FILL = 'rgba(255, 255, 255, 0.02)';
 const LINEAR_TRACE = '#6B9BD2';
+const LOCK_HINT = 'Locked while a C-scan session is running — stop the session to change it';
 
 function jet(t) {
   t = Math.max(0, Math.min(1, t));
@@ -184,7 +185,17 @@ function computeRangeProfile(hCalReal, hCalImag, windowFn, zeroPadFactor) {
   return { magnitudeDb, nfft };
 }
 
-export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, rangeScale, hideWaterfall, defaultScaleMode, onRangeScaleToggle, scaleRange, onScaleRangeChange, onDynamicScale }) {
+// procParams / onProcParamsChange make the window + averaging controls CONTROLLED,
+// so the C-scan panel can drive its whole pipeline from this bar: the same window
+// this pane draws with is the one every cell's profile is recomputed with, and the
+// same Avg is the number of sweeps captured per grid cell. Omit them and the
+// controls stay local, which is what the SFCW panel's own instance does.
+//
+// procLocked greys them out. avgCount cannot change part-way through a raster or
+// different cells would hold different numbers of sweeps, and the window is locked
+// with it so every cell in one grid is processed identically.
+export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, rangeScale, hideWaterfall, defaultScaleMode, onRangeScaleToggle, scaleRange, onScaleRangeChange, onDynamicScale,
+  procParams, onProcParamsChange, procLocked, hideRangeComp, hideFloor, hideCfar, hideYMode }) {
   const rangeCanvasRef = useRef(null);
   const waterfallCanvasRef = useRef(null);
   const animRef = useRef(null);
@@ -196,16 +207,16 @@ export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, ran
   const [scaleMode, setScaleMode] = useState(defaultScaleMode || 'db');
 
   // Windowing state
-  const [windowType, setWindowType] = useState('rectangular');
-  const [kaiserBeta, setKaiserBeta] = useState(3);
+  const [windowTypeLocal, setWindowTypeLocal] = useState('rectangular');
+  const [kaiserBetaLocal, setKaiserBetaLocal] = useState(3);
   const hCalRef = useRef(null);
 
   // Range compensation state
-  const [rangeComp, setRangeComp] = useState(0); // exponent: 0=off, 2=R², 4=R⁴
+  const [rangeCompLocal, setRangeComp] = useState(0); // exponent: 0=off, 2=R², 4=R⁴
 
   // Averaging state
   const avgBuffer = useRef([]);
-  const [avgCount, setAvgCount] = useState(1);
+  const [avgCountLocal, setAvgCountLocal] = useState(1);
   const [averaged, setAveraged] = useState(null);
   // Measured noise floor: the sweep-to-sweep scatter of each range bin, which is what
   // actually decides whether a feature is readable. A bin's dB wobble is
@@ -218,7 +229,7 @@ export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, ran
   // cancel the signal (-> -inf dB) but can at most double it (-> +6 dB).
   const floorBuffer = useRef([]);
   const [noiseFloor, setNoiseFloor] = useState(null);
-  const [showFloor, setShowFloor] = useState(false);
+  const [showFloorLocal, setShowFloor] = useState(false);
   // Averaging mode. 'incoherent' averages the MAGNITUDE profiles (what this display has
   // always done); 'coherent' averages the complex h_cal and transforms once. Both reduce
   // the visible wobble by sqrt(N), but only coherent removes the noise's contribution to
@@ -228,7 +239,7 @@ export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, ran
   // why this had gone unnoticed; the difference is entirely a null-depth question.
   const hCalBuffer = useRef([]);
   const lastPushedTs = useRef(null);
-  const [avgMode, setAvgMode] = useState('incoherent');
+  const [avgModeLocal, setAvgModeLocal] = useState('incoherent');
 
   // Waterfall history buffer
   const waterfallHistory = useRef([]);
@@ -272,7 +283,7 @@ export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, ran
   const [cfarGuard, setCfarGuard] = useState(CFAR_GUARD);
   const [cfarTrain, setCfarTrain] = useState(CFAR_TRAIN);
   const [cfarAlpha, setCfarAlpha] = useState(CFAR_ALPHA);
-  const [cfarEnabled, setCfarEnabled] = useState(true);
+  const [cfarEnabledLocal, setCfarEnabled] = useState(true);
   // CA is the historical variant. GO holds the threshold up on the far side of
   // a strong return; SO is the one that survives an EXTENDED target, which is
   // what a real return looks like here (~50 mm range resolution plus sidelobes
@@ -292,7 +303,30 @@ export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, ran
   const [applyModeToTrace, setApplyModeToTrace] = useState(true);
   // 'session' never shrinks, so one early transient permanently squashes the
   // axis; 'frame' tracks the current sweep only.
-  const [yMode, setYMode] = useState('session');
+  const [yModeLocal, setYMode] = useState('session');
+
+  // ── Controlled processing params ────────────────────────────────────────
+  // When procParams is supplied it replaces the four local states above; the
+  // setters below write back through onProcParamsChange instead. Everything
+  // downstream reads these names, so the two modes are indistinguishable to the
+  // rest of the component.
+  const controlled = !!procParams;
+  const setProc = (patch) => onProcParamsChange && onProcParamsChange({ ...procParams, ...patch });
+  const windowType = controlled ? procParams.windowType : windowTypeLocal;
+  const setWindowType = controlled ? (v) => setProc({ windowType: v }) : setWindowTypeLocal;
+  const kaiserBeta = controlled ? procParams.kaiserBeta : kaiserBetaLocal;
+  const setKaiserBeta = controlled ? (v) => setProc({ kaiserBeta: v }) : setKaiserBetaLocal;
+  const avgCount = controlled ? procParams.avgCount : avgCountLocal;
+  const setAvgCount = controlled ? (v) => setProc({ avgCount: v }) : setAvgCountLocal;
+  const avgMode = controlled ? procParams.avgMode : avgModeLocal;
+  const setAvgMode = controlled ? (v) => setProc({ avgMode: v }) : setAvgModeLocal;
+
+  // Hidden controls are forced off rather than merely not rendered, so a hidden
+  // R^n / CFAR / FLOOR cannot keep applying itself from a stale default.
+  const rangeComp = hideRangeComp ? 0 : rangeCompLocal;
+  const showFloor = hideFloor ? false : showFloorLocal;
+  const cfarEnabled = hideCfar ? false : cfarEnabledLocal;
+  const yMode = hideYMode ? 'frame' : yModeLocal;
 
   // dREF reference row (dB). Held in a ref so capturing one does not re-render
   // at sweep rate; refVersion exists only to trigger the recompute effect.
@@ -1367,7 +1401,10 @@ export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, ran
           <select
             value={windowType}
             onChange={(e) => setWindowType(e.target.value)}
-            className="bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[10px] text-white/70 outline-none"
+            disabled={procLocked}
+            title={procLocked ? LOCK_HINT : undefined}
+            className={cn('bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[10px] outline-none',
+              procLocked ? 'text-white/20 cursor-not-allowed' : 'text-white/70')}
           >
             <option value="rectangular">Rectangular</option>
             <option value="kaiser">Kaiser</option>
@@ -1385,28 +1422,35 @@ export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, ran
               step={0.5}
               value={kaiserBeta}
               onChange={(e) => setKaiserBeta(Number(e.target.value))}
-              className="w-20 h-1 accent-primary cursor-pointer"
+              disabled={procLocked}
+              title={procLocked ? LOCK_HINT : undefined}
+              className={cn('w-20 h-1 accent-primary', procLocked ? 'cursor-not-allowed opacity-30' : 'cursor-pointer')}
             />
             <span className="text-[10px] text-white/60 font-mono w-6">{kaiserBeta.toFixed(1)}</span>
           </div>
         )}
 
-        <div className="w-px h-3 bg-white/10" />
-
-        {/* Range compensation */}
-        <div className="flex items-center gap-1.5">
-          <span className="text-[9px] text-white/40 uppercase tracking-wider">R^n</span>
-          <select
-            value={rangeComp}
-            onChange={(e) => setRangeComp(Number(e.target.value))}
-            className="bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[10px] text-white/70 outline-none"
-          >
-            <option value={0}>Off</option>
-            <option value={2}>R²</option>
-            <option value={3}>R³</option>
-            <option value={4}>R⁴</option>
-          </select>
-        </div>
+        {/* Range compensation. Hidden in the C-scan, where it would apply the same
+            gain to every cell and to the background alike -- it cannot change any
+            comparison between cells, which is the only thing that panel asks. */}
+        {!hideRangeComp && (
+          <>
+            <div className="w-px h-3 bg-white/10" />
+            <div className="flex items-center gap-1.5">
+              <span className="text-[9px] text-white/40 uppercase tracking-wider">R^n</span>
+              <select
+                value={rangeComp}
+                onChange={(e) => setRangeComp(Number(e.target.value))}
+                className="bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[10px] text-white/70 outline-none"
+              >
+                <option value={0}>Off</option>
+                <option value={2}>R²</option>
+                <option value={3}>R³</option>
+                <option value={4}>R⁴</option>
+              </select>
+            </div>
+          </>
+        )}
 
         <div className="w-px h-3 bg-white/10" />
 
@@ -1416,7 +1460,10 @@ export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, ran
           <select
             value={avgCount}
             onChange={(e) => { setAvgCount(Number(e.target.value)); avgBuffer.current = []; }}
-            className="bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[10px] text-white/70 outline-none"
+            disabled={procLocked}
+            title={procLocked ? LOCK_HINT : undefined}
+            className={cn('bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[10px] outline-none',
+              procLocked ? 'text-white/20 cursor-not-allowed' : 'text-white/70')}
           >
             {[1, 2, 4, 8, 16, 32].map(v => (
               <option key={v} value={v}>{v === 1 ? 'Off' : `${v}x`}</option>
@@ -1425,13 +1472,13 @@ export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, ran
           {/* Coherent vs incoherent. Disabled at Avg=Off, where the two are identical. */}
           <button
             onClick={() => setAvgMode(avgMode === 'coherent' ? 'incoherent' : 'coherent')}
-            disabled={avgCount === 1}
-            title={avgCount === 1
+            disabled={avgCount === 1 || procLocked}
+            title={procLocked ? LOCK_HINT : avgCount === 1
               ? 'Set Avg above 1 to compare averaging modes'
               : 'COH averages complex h_cal (removes the noise bias in nulls); INC averages magnitudes'}
             className={cn(
               'px-1.5 py-0.5 rounded text-[9px] uppercase tracking-wider font-medium transition-all border',
-              avgCount === 1
+              (avgCount === 1 || procLocked)
                 ? 'bg-white/5 text-white/20 border-white/10 cursor-not-allowed'
                 : avgMode === 'coherent'
                   ? 'bg-[#4ecdc4]/20 text-[#4ecdc4] border-[#4ecdc4]/30'
@@ -1442,33 +1489,43 @@ export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, ran
           </button>
         </div>
 
-        <div className="w-px h-3 bg-white/10" />
-
         {/* Measured noise floor. Off by default: it is a diagnostic overlay, and it only
-            means anything once FLOOR_MIN_SWEEPS have accumulated. */}
-        <button
-          onClick={() => setShowFloor(!showFloor)}
-          title="Overlay the measured sweep-to-sweep noise floor. Bins near it are not measurements."
-          className={cn(
-            'px-2 py-0.5 rounded text-[9px] uppercase tracking-wider font-medium transition-all',
-            showFloor ? 'bg-[#e8a33d]/20 text-[#e8a33d] border border-[#e8a33d]/30' : 'bg-white/5 text-white/30 border border-white/10'
-          )}
-        >
-          Floor
-        </button>
+            means anything once FLOOR_MIN_SWEEPS have accumulated. Hidden in the
+            C-scan: it is estimated from this pane's own rolling sweep history,
+            which describes the live sweep, not the recorded cell being drawn. */}
+        {!hideFloor && (
+          <>
+            <div className="w-px h-3 bg-white/10" />
+            <button
+              onClick={() => setShowFloor(!showFloor)}
+              title="Overlay the measured sweep-to-sweep noise floor. Bins near it are not measurements."
+              className={cn(
+                'px-2 py-0.5 rounded text-[9px] uppercase tracking-wider font-medium transition-all',
+                showFloor ? 'bg-[#e8a33d]/20 text-[#e8a33d] border border-[#e8a33d]/30' : 'bg-white/5 text-white/30 border border-white/10'
+              )}
+            >
+              Floor
+            </button>
+          </>
+        )}
 
-        <div className="w-px h-3 bg-white/10" />
-
-        {/* CFAR toggle */}
-        <button
-          onClick={() => setCfarEnabled(!cfarEnabled)}
-          className={cn(
-            'px-2 py-0.5 rounded text-[9px] uppercase tracking-wider font-medium transition-all',
-            cfarEnabled ? 'bg-[#4ecdc4]/20 text-[#4ecdc4] border border-[#4ecdc4]/30' : 'bg-white/5 text-white/30 border border-white/10'
-          )}
-        >
-          CFAR
-        </button>
+        {/* CFAR. Hidden in the C-scan: it is a per-trace detector on the live
+            sweep and nothing in the grid pipeline reads it, so leaving it on
+            would only disagree with the image beside it. */}
+        {!hideCfar && (
+          <>
+            <div className="w-px h-3 bg-white/10" />
+            <button
+              onClick={() => setCfarEnabled(!cfarEnabled)}
+              className={cn(
+                'px-2 py-0.5 rounded text-[9px] uppercase tracking-wider font-medium transition-all',
+                cfarEnabled ? 'bg-[#4ecdc4]/20 text-[#4ecdc4] border border-[#4ecdc4]/30' : 'bg-white/5 text-white/30 border border-white/10'
+              )}
+            >
+              CFAR
+            </button>
+          </>
+        )}
 
         {cfarEnabled && (
           <>
@@ -1601,18 +1658,24 @@ export default function SfcwDisplay({ sfcwResult, sfcwProgress, sfcwRunning, ran
           </>
         )}
 
-        <div className="w-px h-3 bg-white/10" />
-
-        {/* Y-axis tracking */}
-        <div className="flex items-center gap-1">
-          <span className="text-[9px] text-white/40 uppercase tracking-wider">Y</span>
-          <select value={yMode} onChange={e => { setYMode(e.target.value); sessionY.current = { min: Infinity, max: -Infinity }; }}
-            className="bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[10px] text-white/70 outline-none"
-            title="Session extremes never shrink, so one transient permanently squashes the axis">
-            <option value="session">Session</option>
-            <option value="frame">Frame</option>
-          </select>
-        </div>
+        {/* Y-axis tracking. Hidden in the C-scan, where 'session' extremes
+            accumulated across a whole raster would leave the live pane's axis
+            set by whichever cell happened to be loudest. It is pinned to
+            'frame' there. */}
+        {!hideYMode && (
+          <>
+            <div className="w-px h-3 bg-white/10" />
+            <div className="flex items-center gap-1">
+              <span className="text-[9px] text-white/40 uppercase tracking-wider">Y</span>
+              <select value={yMode} onChange={e => { setYMode(e.target.value); sessionY.current = { min: Infinity, max: -Infinity }; }}
+                className="bg-white/5 border border-white/10 rounded px-1.5 py-0.5 text-[10px] text-white/70 outline-none"
+                title="Session extremes never shrink, so one transient permanently squashes the axis">
+                <option value="session">Session</option>
+                <option value="frame">Frame</option>
+              </select>
+            </div>
+          </>
+        )}
 
         <div className="flex-1" />
 

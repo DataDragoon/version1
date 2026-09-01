@@ -86,6 +86,8 @@ export default function Sidebar({
   onClearSuperFit,
   cscanSharedScale,
   cscanBgDiag,
+  bscanProcParams,
+  bscanCaptureProgress,
   onBgAppliedChange,
   bscanParams,
   onBscanParamsChange,
@@ -116,6 +118,8 @@ export default function Sidebar({
   onSarCoherentChange,
   sarDynRange,
   onSarDynRangeChange,
+  sarMaxDepth,
+  onSarMaxDepthChange,
   mapBscanData,
   mapGateStart,
   mapGateEnd,
@@ -360,6 +364,8 @@ export default function Sidebar({
                   onClearSuperFit={onClearSuperFit}
                   sharedScale={cscanSharedScale}
                   bgDiag={cscanBgDiag}
+                  procParams={bscanProcParams}
+                  captureProgress={bscanCaptureProgress}
                   onBgAppliedChange={onBgAppliedChange}
                   onScanAction={onBscanAction}
                   roverConnected={roverConnected}
@@ -413,6 +419,8 @@ export default function Sidebar({
                   onCoherentChange={onSarCoherentChange}
                   dynRange={sarDynRange}
                   onDynRangeChange={onSarDynRangeChange}
+                  maxDepth={sarMaxDepth}
+                  onMaxDepthChange={onSarMaxDepthChange}
                 />
               )}
               {activePanel === 'map' && (

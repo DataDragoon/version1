@@ -45,6 +45,9 @@ export default function Viewport({
   bscanBgDisplay,
   bscanBgSubMode,
   cscanSharedScale,
+  bscanProcParams,
+  onBscanProcParamsChange,
+  bscanProcLocked,
   bscanParams,
   bscanCapturing,
   roverScan,
@@ -382,6 +385,12 @@ export default function Viewport({
           <div className="relative flex flex-col border-b border-white/5" style={{ flex: '0 0 32%' }}>
             <PaneHeader icon={Radar} label="Live Sweep" active={sfcwRunning} color="orange" />
             <div className="flex-1 min-h-0 relative overflow-hidden">
+              {/* The controls on this bar drive the WHOLE C-scan pipeline, not
+                  just this pane: the window it draws with is the window every
+                  stored cell's profile is recomputed with, and Avg is the number
+                  of sweeps taken at each grid cell. R^n, FLOOR, CFAR and the Y
+                  session/frame selector are hidden -- none of them feed the grid,
+                  so they could only disagree with the image below. */}
               <SfcwDisplay
                 sfcwResult={sfcwResult}
                 sfcwProgress={sfcwProgress}
@@ -389,6 +398,13 @@ export default function Viewport({
                 rangeScale={bscanLiveRange}
                 hideWaterfall
                 defaultScaleMode="linear"
+                procParams={bscanProcParams}
+                onProcParamsChange={onBscanProcParamsChange}
+                procLocked={bscanProcLocked}
+                hideRangeComp
+                hideFloor
+                hideCfar
+                hideYMode
                 onRangeScaleToggle={() => setBscanLiveRange(prev =>
                   prev.max <= 0.5 ? { min: 0, max: 3 } : { min: 0, max: 0.3 }
                 )}

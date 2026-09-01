@@ -21,11 +21,11 @@ export default function CscanPanel({
   onCaptureBg, onLoadBgModel, onClearBg,
   bgSubMode, onBgSubModeChange,
   superFit, onCaptureSuperFit, onClearSuperFit,
-  sharedScale, bgDiag,
+  sharedScale, bgDiag, procParams, captureProgress,
   roverConnected, roverStatus, sendRover, roverScan,
 }) {
   const {
-    hStep, hCount, vStep, vCount, maxDepth, gateStart, gateEnd, metric,
+    hStep, hCount, vStep, vCount, gateStart, gateEnd, metric,
     scanMode, roverOriginRightMm, roverOriginBelowMm, roverSettleMs,
   } = params;
 
@@ -150,6 +150,15 @@ export default function CscanPanel({
     superFit.grid.hCount === hCount && superFit.grid.vCount === vCount
     && superFit.grid.hStep === hStep && superFit.grid.vStep === vStep
   );
+  // How deep the record actually goes -- c/(2*step)/2 - range_offset, read off a
+  // captured profile rather than configured. This is what bounds the gate; there
+  // is no separate Max Depth to keep in sync with it any more.
+  const depthLimitCm = (() => {
+    const p0 = scanData.find(p => p && p.distances && p.distances.length);
+    if (!p0) return 100;
+    return Math.ceil(p0.distances[p0.distances.length - 1] * 100);
+  })();
+
   const isDiff = bgSubMode === 'magnitude';
   const scaleSliderMin = isDiff ? -40 : -140;
   const scaleSliderMax = isDiff ? 40 : 0;
@@ -628,6 +637,26 @@ export default function CscanPanel({
         </div>
       </Section>
 
+      {/* Banking N sweeps into one cell is otherwise a silent pause. */}
+      {captureProgress && captureProgress.need > 1 && (
+        <Section label="Capturing Cell">
+          <div className="flex items-center justify-between px-1">
+            <span className="text-[10px] uppercase tracking-wider text-[#555555] font-medium">
+              Sweep {captureProgress.got + 1} / {captureProgress.need}
+            </span>
+            <span className="text-[10px] font-mono text-[#22d3ee]">
+              {Math.round((captureProgress.got / captureProgress.need) * 100)}%
+            </span>
+          </div>
+          <div className="h-1 rounded-full bg-white/10 overflow-hidden">
+            <div
+              className="h-full bg-gradient-to-r from-[#22d3ee] to-[#67e8f9] transition-all duration-200"
+              style={{ width: `${(captureProgress.got / captureProgress.need) * 100}%` }}
+            />
+          </div>
+        </Section>
+      )}
+
       {/* Depth slice — the C-scan collapses the depth axis over this gate */}
       <Section label="Depth Slice">
         <SliderRow
@@ -645,7 +674,7 @@ export default function CscanPanel({
           value={gateEnd}
           unit="cm"
           min={Math.min(gateStart + 0.5, gateEnd)}
-          max={Math.max(maxDepth, gateEnd)}
+          max={Math.max(depthLimitCm, gateEnd)}
           step={0.5}
           accent="cyan"
           onChange={(v) => update('gateEnd', v)}
@@ -683,19 +712,40 @@ export default function CscanPanel({
             {displayMode === 'color' ? 'Color' : 'Profile'}
           </button>
         </div>
-        <EditableField
-          label="Max Depth"
-          value={maxDepth}
-          unit="cm"
-          onChange={(v) => onParamsChange({
-            ...params,
-            maxDepth: v,
-            gateEnd: Math.min(gateEnd, v),
-            gateStart: Math.min(gateStart, Math.max(0, v - 0.5)),
-          })}
-          min={1}
-          max={500}
-        />
+        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
+          The B-scan pane draws the whole record — {depthLimitCm} cm at the current
+          step size. Use the Depth Slice gate above to choose what the plan view
+          colours by; it does not hide anything on the right.
+        </div>
+
+        {/* Mirrors the Live Sweep pane's controls bar, which is where they are
+            set. Window and averaging MODE re-derive the whole grid on change;
+            Avg is how many sweeps each cell takes and only applies to captures
+            made after it is set. The bar locks while a session runs. */}
+        {procParams && (
+          <>
+            <div className="grid grid-cols-2 gap-2">
+              <InfoTile
+                label="Window"
+                value={procParams.windowType === 'kaiser'
+                  ? `Kaiser β${procParams.kaiserBeta}`
+                  : procParams.windowType === 'hanning' ? 'Hanning' : 'Rect'}
+              />
+              <InfoTile
+                label="Avg / cell"
+                value={procParams.avgCount > 1
+                  ? `${procParams.avgCount}× ${procParams.avgMode === 'coherent' ? 'coh' : 'inc'}`
+                  : 'Off'}
+              />
+            </div>
+            <div className="px-2 text-[9px] text-white/40 leading-relaxed">
+              Set on the Live Sweep pane's controls bar, and locked while a session
+              runs. Window and coh/inc re-derive every stored cell immediately —
+              each cell keeps all its sweeps, so the averaging mode stays a live
+              choice. Avg only affects cells captured after it is changed.
+            </div>
+          </>
+        )}
       </Section>
 
       {/* Colour scaling — dynamic tracks the data, manual pins both ends live */}

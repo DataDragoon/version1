@@ -33,7 +33,12 @@ const POS_GRACE_MS = 3000;
 const MOVE_TIMEOUT_FLOOR_MS = 6000;
 
 // Sweeps free-run at 3-6 Hz, so anything approaching this means the sweep died.
+// Budget for one cell's capture. A cell takes `sweepsPerCell` sweeps at roughly
+// 3 Hz, plus the one discarded to the settle window, so the allowance has to
+// scale -- a flat 20 s used to be plenty at one sweep per cell and would trip
+// part-way through an Avg of 16.
 const CAPTURE_TIMEOUT_MS = 20000;
+const CAPTURE_MS_PER_SWEEP = 2000;
 
 const IDLE = {
   active: false, phase: 'idle', index: 0, total: 0,
@@ -59,14 +64,14 @@ function clampTarget(target, cfg) {
 export function useRoverScan({
   params, roverStatus, roverConnected, sendRover,
   sfcwRunning, onStartSweep, onStopSweep,
-  capturedCount, onRequestCapture,
+  capturedCount, onRequestCapture, sweepsPerCell,
 }) {
   // Everything the tick reads, refreshed every render. The interval closes over
   // this ref, never over the props themselves.
   const optsRef = useRef(null);
   optsRef.current = {
     params, roverStatus, roverConnected, sendRover,
-    sfcwRunning, onStartSweep, onStopSweep, capturedCount, onRequestCapture,
+    sfcwRunning, onStartSweep, onStopSweep, capturedCount, onRequestCapture, sweepsPerCell,
   };
 
   const [ui, setUi] = useState(IDLE);
@@ -230,7 +235,8 @@ export function useRoverScan({
           finish('error', null, 'Sweep stopped before the cell was captured.', false);
           return;
         }
-        if (now - st.captureIssuedAt > CAPTURE_TIMEOUT_MS) {
+        const captureBudget = CAPTURE_TIMEOUT_MS + CAPTURE_MS_PER_SWEEP * Math.max(0, (o.sweepsPerCell || 1) - 1);
+        if (now - st.captureIssuedAt > captureBudget) {
           finish('error', null, 'No sweep arrived — is the SDR still sweeping?', false);
         }
         return;

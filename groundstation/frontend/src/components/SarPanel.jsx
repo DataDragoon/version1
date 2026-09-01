@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { cn } from '@/lib/utils';
 import { Section, InfoTile } from './Sidebar';
 
-export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled, onBgEnabledChange, svdEnabled, svdK, svdStrength, onSvdEnabledChange, onSvdKChange, onSvdStrengthChange, scaleMode, onScaleModeChange, aperture, onApertureChange, coherent, onCoherentChange, dynRange, onDynRangeChange }) {
+export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled, onBgEnabledChange, svdEnabled, svdK, svdStrength, onSvdEnabledChange, onSvdKChange, onSvdStrengthChange, scaleMode, onScaleModeChange, aperture, onApertureChange, coherent, onCoherentChange, dynRange, onDynRangeChange, maxDepth, onMaxDepthChange }) {
   const numPositions = bscanData ? bscanData.length : 0;
 
   return (
@@ -111,6 +111,18 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
       </Section>
 
       <Section label="Display">
+        {/* Reconstruction depth. Sets the extent -- and the cost -- of the
+            output grid. It used to live in the C-scan panel as
+            bscanParams.maxDepth, where it also clipped the B-scan pane's
+            display; that second job is gone and this is the only real one. */}
+        <EditableField
+          label="Max Depth"
+          value={maxDepth}
+          unit="cm"
+          onChange={onMaxDepthChange}
+          min={1}
+          max={500}
+        />
         <div className="flex gap-2">
           <button
             onClick={() => onScaleModeChange('db')}
