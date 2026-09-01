@@ -1,4 +1,5 @@
 import { useRef, useEffect, useState } from 'react';
+import { BG_STATUS, BG_STATUS_TEXT, bgFailed } from '@/lib/cscanGrid';
 
 const BG = '#000000';
 const GRID_COLOR = '#1a1a1a';
@@ -12,7 +13,7 @@ function jet(t) {
   ];
 }
 
-function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, bgDisplay, scaleRange) {
+function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, bgDisplay, scaleRange, sharedScale, subMode) {
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
   const rect = canvas.getBoundingClientRect();
@@ -67,21 +68,32 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
   const bgLabel = hasBg && bgDisplay.isModel ? 'BG MODEL' : 'BG REF';
   const totalRows = numPos + (hasBg ? 1 : 0);
 
-  // Dynamic scaling: compute min/max dB from visible data (include BG in scaling)
+  // Colour limits.
+  //
+  // Dynamic comes from the SHARED scale, computed once over EVERY cell of the
+  // whole C-scan grid, not from this row. Two things were wrong before:
+  //
+  //   1. Limits were per-row, so the same colour meant a different dB in the
+  //      grid on the left and in this pane on the right, and clicking to a
+  //      different row silently re-scaled the image.
+  //   2. The BG reference row was included. It is the UNSUBTRACTED background,
+  //      20-30 dB above every subtracted residual row, so it set dbMax on its
+  //      own and crushed the actual data into the bottom few percent of the
+  //      colormap -- a working subtraction looked empty.
+  //
+  // The BG row is still DRAWN (it is the visual sanity check on the reference),
+  // it just no longer votes on the limits. Invalid rows do not vote either.
   let dbMin = Infinity;
   let dbMax = -Infinity;
-  for (let posIdx = 0; posIdx < numPos; posIdx++) {
-    const mags = scanData[posIdx].magnitudes;
-    for (let binIdx = 0; binIdx < numBins; binIdx++) {
-      const db = mags[startBin + binIdx];
-      if (db < dbMin) dbMin = db;
-      if (db > dbMax) dbMax = db;
-    }
-  }
-  if (hasBg) {
-    for (let binIdx = 0; binIdx < numBins; binIdx++) {
-      if (startBin + binIdx < bgDisplay.magnitudes.length) {
-        const db = bgDisplay.magnitudes[startBin + binIdx];
+  if (sharedScale && isFinite(sharedScale.min) && isFinite(sharedScale.max)) {
+    dbMin = sharedScale.min;
+    dbMax = sharedScale.max;
+  } else {
+    for (let posIdx = 0; posIdx < numPos; posIdx++) {
+      if (bgFailed(scanData[posIdx].bg_status)) continue;
+      const mags = scanData[posIdx].magnitudes;
+      for (let binIdx = 0; binIdx < numBins; binIdx++) {
+        const db = mags[startBin + binIdx];
         if (db < dbMin) dbMin = db;
         if (db > dbMax) dbMax = db;
       }
@@ -95,6 +107,11 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
     dbMax = scaleRange.max;
   }
   if (dbMax - dbMin < 1) { dbMin -= 0.5; dbMax += 0.5; }
+
+  // A magnitude difference is a dB ratio centred on zero; the linear warp maps
+  // an amplitude and is meaningless on it.
+  const isDiff = subMode === 'magnitude';
+  const useLinear = isLinear && !isDiff;
 
   const linMin = Math.pow(10, dbMin / 20);
   const linMax = Math.pow(10, dbMax / 20);
@@ -119,10 +136,27 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
   if (displayMode === 'color') {
     for (let rowIdx = 0; rowIdx < totalRows; rowIdx++) {
       const mags = getMagsForRow(rowIdx);
+      const rowPos = (hasBg && rowIdx === 0) ? null : scanData[hasBg ? rowIdx - 1 : rowIdx];
+      // A row whose background could not be resolved is not drawn as data --
+      // its profile is un-subtracted and would read as the strongest return in
+      // the image.
+      if (rowPos && bgFailed(rowPos.bg_status)) {
+        ctx.fillStyle = '#2a0a10';
+        ctx.fillRect(pad.left, pad.top + rowIdx * cellH, plotW, Math.ceil(cellH) + 1);
+        ctx.strokeStyle = '#ff4d6d';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        for (let x = pad.left; x < pad.left + plotW; x += 10) {
+          ctx.moveTo(x, pad.top + rowIdx * cellH);
+          ctx.lineTo(x + cellH, pad.top + (rowIdx + 1) * cellH);
+        }
+        ctx.stroke();
+        continue;
+      }
       for (let binIdx = 0; binIdx < numBins; binIdx++) {
         const db = (startBin + binIdx < mags.length) ? mags[startBin + binIdx] : dbMin;
         let t;
-        if (isLinear) {
+        if (useLinear) {
           const lin = Math.pow(10, db / 20);
           t = (lin - linMin) / (linMax - linMin);
         } else {
@@ -178,7 +212,7 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
       for (let binIdx = 0; binIdx < numBins; binIdx++) {
         const db = (startBin + binIdx < mags.length) ? mags[startBin + binIdx] : dbMin;
         let normalized;
-        if (isLinear) {
+        if (useLinear) {
           const lin = Math.pow(10, db / 20);
           normalized = (lin - linMin) / (linMax - linMin);
         } else {
@@ -278,7 +312,7 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
   ctx.restore();
 
   // Title
-  const scaleLabel = isLinear ? 'LINEAR' : 'dB';
+  const scaleLabel = isDiff ? 'Δ MAG dB' : useLinear ? 'LINEAR' : 'dB';
   const modeLabel = displayMode === 'color' ? 'COLOR' : 'PROFILE';
   ctx.fillStyle = '#6B9BD2';
   ctx.font = 'bold 10px monospace';
@@ -305,9 +339,12 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
     ctx.fillStyle = '#555555';
     ctx.font = '8px monospace';
     ctx.textAlign = 'left';
-    if (isLinear) {
+    if (useLinear) {
       ctx.fillText(linMax.toExponential(1), barX, barY - 4);
       ctx.fillText(linMin.toExponential(1), barX, barY + barH + 10);
+    } else if (isDiff) {
+      ctx.fillText(`${dbMax >= 0 ? '+' : ''}${dbMax.toFixed(1)} dB`, barX, barY - 4);
+      ctx.fillText(`${dbMin >= 0 ? '+' : ''}${dbMin.toFixed(1)} dB`, barX, barY + barH + 10);
     } else {
       ctx.fillText(`${dbMax.toFixed(0)} dB`, barX, barY - 4);
       ctx.fillText(`${dbMin.toFixed(0)} dB`, barX, barY + barH + 10);
@@ -342,18 +379,23 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
       ctx.fillStyle = '#ffffff';
       ctx.font = '10px monospace';
       ctx.textAlign = 'left';
-      const valLabel = isLinear
+      const valLabel = useLinear
         ? Math.pow(10, db / 20).toExponential(2)
+        : isDiff ? `${db >= 0 ? '+' : ''}${db.toFixed(2)}dB`
         : `${db.toFixed(1)}dB`;
       const posLabel = isBgRow ? bgLabel : `pos ${rowLabelFor(hasBg ? rowIdx - 1 : rowIdx)}cm`;
-      const label = `${posLabel} | ${dist.toFixed(2)}m | ${valLabel}`;
+      const rowPos = isBgRow ? null : scanData[hasBg ? rowIdx - 1 : rowIdx];
+      const rowFlag = rowPos && rowPos.bg_status && rowPos.bg_status !== BG_STATUS.OK
+        && rowPos.bg_status !== BG_STATUS.OFF
+        ? ` | ${BG_STATUS_TEXT[rowPos.bg_status] || rowPos.bg_status}` : '';
+      const label = `${posLabel} | ${dist.toFixed(2)}m | ${valLabel}${rowFlag}`;
       const labelX = crosshair.x + 10 > w - 220 ? crosshair.x - 220 : crosshair.x + 10;
       ctx.fillText(label, labelX, crosshair.y - 8);
     }
   }
 }
 
-export default function BscanDisplay({ scanData, bgDisplay, params, capturing, sfcwProgress, scaleMode, displayMode, scaleRange }) {
+export default function BscanDisplay({ scanData, bgDisplay, params, capturing, sfcwProgress, scaleMode, displayMode, scaleRange, sharedScale, subMode }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
   const [crosshair, setCrosshair] = useState(null);
@@ -369,12 +411,12 @@ export default function BscanDisplay({ scanData, bgDisplay, params, capturing, s
   // whole path was removed (2026-08-30).
   useEffect(() => {
     const render = () => {
-      drawBscan(canvasRef.current, scanData, params, crosshair, isLinear, mode, bgDisplay, scaleRange);
+      drawBscan(canvasRef.current, scanData, params, crosshair, isLinear, mode, bgDisplay, scaleRange, sharedScale, subMode);
       animRef.current = requestAnimationFrame(render);
     };
     animRef.current = requestAnimationFrame(render);
     return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
-  }, [scanData, params, crosshair, isLinear, mode, bgDisplay, scaleRange]);
+  }, [scanData, params, crosshair, isLinear, mode, bgDisplay, scaleRange, sharedScale, subMode]);
 
   return (
     <div className="flex flex-col w-full h-full">

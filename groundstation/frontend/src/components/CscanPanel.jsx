@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { cn } from '@/lib/utils';
 import { Section, InfoTile } from './Sidebar';
-import { orderedCellForIndex, gridStats, buildCscanGrid, gridRoverExtent } from '@/lib/cscanGrid';
+import { orderedCellForIndex, gridStats, gridRoverExtent, BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
 
 const LIDAR_AVG_WINDOW = 20;
 
@@ -19,6 +19,9 @@ export default function CscanPanel({
   onScanAction, params, onParamsChange, scaleMode, onScaleModeChange, displayMode, onDisplayModeChange,
   scaleRange, onScaleRangeChange, lidarMm, lidarOffsetMm, bgRef, bgModel, bgCapturing,
   onCaptureBg, onLoadBgModel, onClearBg,
+  bgSubMode, onBgSubModeChange,
+  superFit, onCaptureSuperFit, onClearSuperFit,
+  sharedScale, bgDiag,
   roverConnected, roverStatus, sendRover, roverScan,
 }) {
   const {
@@ -123,11 +126,33 @@ export default function CscanPanel({
 
   // Handing over from dynamic to manual should not jump the colours, so the
   // sliders start wherever the dynamic limits currently sit.
+  //
+  // This used to rebuild the grid from `scanData` -- which is the RAW capture
+  // list, before background subtraction and computed by the Pi with a Hanning
+  // window at nfft 204, where the display uses a rectangular window at nfft 256.
+  // The seeded limits were therefore wrong by the full suppression (tens of dB)
+  // plus ~4 dB of window/nfft difference, and the colours jumped hard on every
+  // switch to manual, which is the exact thing the comment above promises they
+  // do not. It now reads the same shared scale the displays draw with.
   const seedManualRange = () => {
-    const grid = buildCscanGrid(scanData, params);
-    if (!isFinite(grid.min) || !isFinite(grid.max)) return { min: scaleRange.min, max: scaleRange.max };
-    return { min: Math.round(grid.min), max: Math.max(Math.round(grid.max), Math.round(grid.min) + 1) };
+    if (!sharedScale || !isFinite(sharedScale.min) || !isFinite(sharedScale.max)) {
+      return { min: scaleRange.min, max: scaleRange.max };
+    }
+    const lo = Math.floor(sharedScale.min);
+    return { min: lo, max: Math.max(Math.ceil(sharedScale.max), lo + 1) };
   };
+
+  // Grid geometry is locked while a Super Fit is loaded: the reference is keyed
+  // by (ix, iy), so changing the counts or steps would silently re-key every
+  // cell and subtract each new capture against the wrong patch of wall.
+  const gridLocked = !!superFit;
+  const superFitGridMatches = !superFit || (
+    superFit.grid.hCount === hCount && superFit.grid.vCount === vCount
+    && superFit.grid.hStep === hStep && superFit.grid.vStep === vStep
+  );
+  const isDiff = bgSubMode === 'magnitude';
+  const scaleSliderMin = isDiff ? -40 : -140;
+  const scaleSliderMax = isDiff ? 40 : 0;
 
   const startDisabled = !canActivate || (roverMode && (!roverLinked || roverEstopped || !fitsLimits));
 
@@ -168,6 +193,12 @@ export default function CscanPanel({
 
       {/* Scan grid — describes the rectangle to raster before any capture starts */}
       <Section label="Scan Grid">
+        {gridLocked && (
+          <div className="px-2 py-1.5 rounded-lg bg-[#a78bfa]/5 border border-[#a78bfa]/30 text-[9px] text-[#a78bfa] leading-relaxed">
+            Locked by Super Fit — the reference is keyed by cell, so the geometry has
+            to match the grid it was captured on. Clear Super Fit to edit.
+          </div>
+        )}
         <div className="px-1 text-[9px] font-medium uppercase tracking-wider text-[#555555]">Horizontal</div>
         <div className="grid grid-cols-2 gap-2">
           <EditableField
@@ -177,6 +208,7 @@ export default function CscanPanel({
             onChange={(v) => update('hCount', Math.round(v))}
             min={1}
             max={200}
+            locked={gridLocked}
           />
           <EditableField
             label="H Step"
@@ -185,6 +217,7 @@ export default function CscanPanel({
             onChange={(v) => update('hStep', v)}
             min={0.5}
             max={50}
+            locked={gridLocked}
           />
         </div>
         <div className="px-1 pt-1 text-[9px] font-medium uppercase tracking-wider text-[#555555]">Vertical</div>
@@ -196,6 +229,7 @@ export default function CscanPanel({
             onChange={(v) => update('vCount', Math.round(v))}
             min={1}
             max={200}
+            locked={gridLocked}
           />
           <EditableField
             label="V Step"
@@ -204,6 +238,7 @@ export default function CscanPanel({
             onChange={(v) => update('vStep', v)}
             min={0.5}
             max={50}
+            locked={gridLocked}
           />
         </div>
 
@@ -682,8 +717,8 @@ export default function CscanPanel({
           label="Min"
           value={scaleRange.min}
           unit="dB"
-          min={-140}
-          max={0}
+          min={scaleSliderMin}
+          max={scaleSliderMax}
           step={1}
           accent="amber"
           disabled={scaleRange.dynamic}
@@ -693,22 +728,60 @@ export default function CscanPanel({
           label="Max"
           value={scaleRange.max}
           unit="dB"
-          min={-140}
-          max={0}
+          min={scaleSliderMin}
+          max={scaleSliderMax}
           step={1}
           accent="amber"
           disabled={scaleRange.dynamic}
           onChange={(v) => onScaleRangeChange({ ...scaleRange, max: Math.max(v, scaleRange.min + 1) })}
         />
+        {sharedScale && scaleRange.dynamic && (
+          <div className="grid grid-cols-2 gap-2">
+            <InfoTile label="Scale low" value={`${sharedScale.min.toFixed(1)} dB`} />
+            <InfoTile label="Scale high" value={`${sharedScale.max.toFixed(1)} dB`} />
+          </div>
+        )}
         <div className="px-2 text-[9px] text-white/40 leading-relaxed">
           {scaleRange.dynamic
-            ? 'Colour limits track the captured cells. Turn off to pin them.'
+            ? 'One scale for both panes, from every bin of every valid cell in the grid (1st–99.9th percentile, so a single interference null cannot flatten the image). A colour means the same dB in the plan view and in the B-scan.'
             : 'Colour limits pinned — both the C-scan and B-scan panes update live.'}
         </div>
+        {sharedScale && sharedScale.degenerate && scaleRange.dynamic && (
+          <div className="px-2 py-1.5 rounded-lg bg-[#f59e0b]/5 border border-[#f59e0b]/30 text-[9px] text-[#f59e0b] leading-relaxed">
+            Every bin has the same value — there is nothing to scale. Expected right
+            after a Super Fit capture, where the grid is being subtracted from itself.
+          </div>
+        )}
       </Section>
 
-      {/* Background — same two mutually exclusive sources as the SFCW panel */}
+      {/* Background — mutually exclusive sources, plus how the subtraction is done */}
       <Section label="Background">
+        {/* Complex vs magnitude. Not two views of one thing: complex is for
+            SEEING (it removes the wall so a target 16.6 dB beneath it is not
+            buried) and magnitude is for DECIDING (the 2026-08-28 A/B found the
+            target as +4.4 dB against a 0.23 dB control, and it survives ~1 mm of
+            standoff error, which the complex difference does not). */}
+        <div className="flex gap-2">
+          {[
+            { id: 'complex', label: 'Complex', hint: 'Vector — removes the wall' },
+            { id: 'magnitude', label: 'Magnitude', hint: 'Δ dB — the detector' },
+          ].map((m) => (
+            <button
+              key={m.id}
+              onClick={() => onBgSubModeChange(m.id)}
+              className={cn(
+                'flex-1 flex flex-col gap-0.5 px-3 py-2 rounded-lg border text-left transition-all',
+                bgSubMode === m.id
+                  ? 'bg-[#22d3ee]/10 border-[#22d3ee]/30 text-[#22d3ee]'
+                  : 'bg-white/5 border-white/10 text-white/50 hover:text-white/80',
+              )}
+            >
+              <span className="text-xs font-semibold">{m.label}</span>
+              <span className="text-[9px] leading-tight opacity-70">{m.hint}</span>
+            </button>
+          ))}
+        </div>
+
         <div className="grid grid-cols-2 gap-2">
           <button
             onClick={onCaptureBg}
@@ -781,7 +854,7 @@ export default function CscanPanel({
           </div>
         )}
 
-        {(bgRef || bgModel) && (
+        {(bgRef || bgModel || superFit) && (
           <button
             onClick={() => onBgAppliedChange(!bgApplied)}
             className={cn(
@@ -794,13 +867,108 @@ export default function CscanPanel({
             {bgApplied ? '● BG Applied' : 'BG Not Applied'}
           </button>
         )}
+        {/* Per-cell diagnostics. "A background is loaded" and "the background was
+            applied to this cell" are different statements, and only the second
+            one matters — a cell the background could not be resolved for is
+            drawn as an explicit error, never given a colour. */}
+        {bgDiag && bgDiag.total > 0 && (bgRef || bgModel || superFit) && (
+          <>
+            <div className="grid grid-cols-3 gap-2">
+              <InfoTile label="Applied" value={`${bgDiag.applied}/${bgDiag.total}`} />
+              <InfoTile label="Clamped" value={`${bgDiag.clamped}`} />
+              <InfoTile label="Invalid" value={`${bgDiag.invalid}`} />
+            </div>
+            {bgDiag.invalid > 0 && (
+              <div className="px-2 py-1.5 rounded-lg bg-red-500/5 border border-red-500/30 text-[9px] text-red-400 leading-relaxed">
+                {bgDiag.invalid} cell{bgDiag.invalid === 1 ? '' : 's'} could not be subtracted and
+                are marked with a red cross in the grid. They are excluded from the colour
+                scale — an un-subtracted cell sits 20–30 dB above its neighbours and would
+                otherwise read as the strongest target in the scan.
+                {Object.entries(bgDiag.counts)
+                  .filter(([k]) => k !== BG_STATUS.OK && k !== BG_STATUS.OFF && k !== BG_STATUS.CLAMPED)
+                  .map(([k, n]) => ` · ${n}× ${BG_STATUS_TEXT[k] || k}`)}
+              </div>
+            )}
+            {bgDiag.clamped > 0 && (
+              <div className="px-2 py-1.5 rounded-lg bg-[#f59e0b]/5 border border-[#f59e0b]/30 text-[9px] text-[#f59e0b] leading-relaxed">
+                {bgDiag.clamped} cell{bgDiag.clamped === 1 ? '' : 's'} sit outside the model's
+                captured standoff span and were clamped to its nearest end (amber corner in
+                the grid). Measured cost: 19 dB at 5 mm outside, and past ~10 mm the
+                subtraction adds more energy than it removes.
+              </div>
+            )}
+          </>
+        )}
         <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          {bgModel
-            ? 'Model background, inferred per cell from that cell’s own lidar standoff.'
-            : bgRef
-              ? 'Reference sweep, subtracted exactly as captured. It only holds near the standoff and position it was taken at — recapture if either moves.'
-              : 'Capture a reference sweep or load a model to subtract the background.'}
+          {superFit
+            ? 'Super Fit: each cell is subtracted from the reference captured at that same cell.'
+            : bgModel
+              ? 'Model background, inferred per cell from that cell’s own lidar standoff.'
+              : bgRef
+                ? 'Reference sweep, subtracted exactly as captured. It only holds near the standoff and position it was taken at — recapture if either moves. On a grid whose standoff varies, use Super Fit instead.'
+                : 'Capture a reference sweep, load a model, or Super Fit a reference grid.'}
         </div>
+      </Section>
+
+      {/* Super Fit — a whole reference GRID, matched cell for cell.
+          A single captured reference is only right at one position: on the rover
+          scans of 2026-08-30 the wall return swung 6.3 dB across the grid because
+          the rig is not parallel to the wall (17 mm of standoff over one
+          700x150 mm grid), and a corner reference scored only 14-18 dB against
+          that. Super Fit subtracts each cell from the reference taken at that
+          same cell, so a standoff that varies across the grid is matched rather
+          than extrapolated. */}
+      <Section label="Super Fit">
+        {!superFit ? (
+          <>
+            <button
+              onClick={onCaptureSuperFit}
+              disabled={!gridFull}
+              className={cn(
+                'w-full px-3 py-2.5 rounded-lg text-xs font-medium transition-all border',
+                gridFull
+                  ? 'bg-[#a78bfa]/10 border-[#a78bfa]/30 text-[#a78bfa] hover:bg-[#a78bfa]/20'
+                  : 'bg-white/2 border-white/5 text-white/20 cursor-not-allowed',
+              )}
+            >
+              Super Fit This Grid
+            </button>
+            <div className="px-2 text-[9px] text-white/40 leading-relaxed">
+              {gridFull
+                ? 'Stores every cell of the current grid as a per-cell background. Then clear the grid and rescan the same wall from the same origin — each new cell is subtracted from the reference at its own cell.'
+                : `Needs a full grid — ${captured} of ${stats.total} cells captured. Scan or import a complete sweep of the bare wall first.`}
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="grid grid-cols-2 gap-2">
+              <InfoTile label="Reference cells" value={`${superFit.count}`} />
+              <InfoTile label="Grid" value={`${superFit.grid.hCount} × ${superFit.grid.vCount}`} />
+            </div>
+            <button
+              onClick={onClearSuperFit}
+              className="w-full px-3 py-2.5 rounded-lg text-xs font-medium transition-all border bg-[#a78bfa]/10 border-[#a78bfa]/30 text-[#a78bfa] hover:bg-[#a78bfa]/20"
+            >
+              Clear Super Fit
+            </button>
+            {!superFitGridMatches && (
+              <div className="px-2 py-1.5 rounded-lg bg-red-500/5 border border-red-500/30 text-[9px] text-red-400 leading-relaxed">
+                The grid no longer matches the one this Super Fit was captured on
+                ({superFit.grid.hCount} × {superFit.grid.vCount} at {superFit.grid.hStep} × {superFit.grid.vStep} cm).
+                Cells are matched by index, so the subtraction is against the wrong
+                patch of wall. Clear Super Fit or restore the grid.
+              </div>
+            )}
+            {captured > 0 && (
+              <div className="px-2 py-1.5 rounded-lg bg-[#0a0a0a]/60 border border-white/5 text-[9px] text-white/40 leading-relaxed">
+                {captured} cell{captured === 1 ? '' : 's'} still on screen. If this is the grid
+                the reference was taken from it now subtracts from itself and reads as
+                exactly zero everywhere — clear it below and rescan the same wall from the
+                same origin.
+              </div>
+            )}
+          </>
+        )}
       </Section>
 
       <Section label="Data">
@@ -857,11 +1025,12 @@ function SliderRow({ label, value, unit, min, max, step, onChange, disabled, acc
   );
 }
 
-function EditableField({ label, value, unit, onChange, min, max }) {
+function EditableField({ label, value, unit, onChange, min, max, locked }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
 
   const startEdit = () => {
+    if (locked) return;
     setDraft(String(value));
     setEditing(true);
   };
@@ -880,9 +1049,11 @@ function EditableField({ label, value, unit, onChange, min, max }) {
       className={cn(
         'relative flex flex-col gap-0.5 p-3 rounded-xl border',
         'transition-all duration-300',
-        editing
-          ? 'border-[#6B9BD2]/40 bg-[#6B9BD2]/5 cursor-text'
-          : 'border-white/8 bg-[#0a0a0a]/60 cursor-pointer hover:border-white/20 hover:bg-white/[0.02]',
+        locked
+          ? 'border-white/5 bg-[#0a0a0a]/40 opacity-40 cursor-not-allowed'
+          : editing
+            ? 'border-[#6B9BD2]/40 bg-[#6B9BD2]/5 cursor-text'
+            : 'border-white/8 bg-[#0a0a0a]/60 cursor-pointer hover:border-white/20 hover:bg-white/[0.02]',
       )}
     >
       <span className="text-[10px] font-medium uppercase tracking-wider text-[#555555]">{label}</span>

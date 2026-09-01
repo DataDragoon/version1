@@ -2309,6 +2309,161 @@ abort and stop the sweep.
 - **`metric: 'energy'` is a mean, not a sum** (`cscanGrid.js` `gatedIntensity` returns
   `10*log10(sumLin/count)`), so it does not scale with gate width the way the name implies.
 
+## C-scan imaging: one shared scale, per-cell BG status, magnitude mode, Super Fit (2026-08-31)
+
+### The two panes were scaled to different things
+
+Audit finding, now fixed. The C-scan grid took dynamic colour limits from the
+**min/max of the gated cell values over the whole grid**; the B-scan pane took
+them from **min/max of every bin in the SELECTED ROW ONLY** -- and included the
+unsubtracted BG reference row in that. Consequences: the same colour meant a
+different dB in two images shown side by side, clicking to another row silently
+re-scaled the right-hand one, and with a background loaded the BG row (20-30 dB
+above every residual) set `dbMax` on its own and crushed the actual data into the
+bottom few percent of the colormap -- a **working subtraction looked empty**.
+
+`computeSharedScale()` (`lib/cscanGrid.js`) now computes **one** pair of limits
+from every bin of every valid cell within `maxDepth` -- exactly the pixels the
+B-scan pane draws -- and both displays use it. The BG row is still drawn but no
+longer votes.
+
+**Limits are percentiles (p1 / p99.9), not min/max.** A range profile has deep
+interference nulls and a subtracted one has more; a single bin at -140 dB would
+otherwise set the bottom of the scale and flatten everything above it. A full
+min/max stretch of a flat residual field is exactly the mechanism that
+manufactures rainbow structure out of noise (see the display hypothesis in the
+target A/B section above). There is a degenerate guard: subtracting a Super Fit
+reference from the grid it was taken from gives exactly zero in every bin, which
+is a useful "same data" signal, not an error.
+
+### A cell whose background fails is INVALID, not zero
+
+`applyBscanBg` used to fall through silently when `bgForStandoff` returned null
+(no lidar standoff, `numSteps` mismatch), leaving that cell **un-subtracted in a
+subtracted grid** -- 20-30 dB above its neighbours, so it both read as the
+strongest target in the scan and single-handedly set the dynamic colour limits.
+There was no diagnostic anywhere in the C-scan path; the SFCW panel got
+`sfcwProcessed.diag` in Phase 0 and this never did. Recall the `3row*` scans had
+`lidar_n: 0` on all 36 cells, so a model background would have failed on every
+one of them.
+
+Every position now carries a `bg_status` (`BG_STATUS` in `cscanGrid.js`):
+`off` / `ok` / `clamped` / `no_standoff` / `no_ref` / `size_mismatch` /
+`no_superfit_cell`. Invalid cells draw as a red cross on a dark red ground (a
+colour no colormap produces), are excluded from every scale, and are counted in
+an Applied / Clamped / Invalid readout in the panel.
+
+**`clamped` is new information too.** `inferInterpModel` clamps to the nearest
+knot and returns a confident-looking spectrum; the model span was previously
+only checked against the *live* lidar, never against what a cell was actually
+captured at. Clamped cells are drawn but carry an amber corner.
+
+### Complex vs magnitude, in the C-scan
+
+The toggle the SFCW panel already had. Complex is for **seeing** (removes the
+wall so a target 16.6 dB beneath it is not buried); magnitude is for
+**deciding** (+4.4 dB at 21.2 cm against a 0.23 dB control in the target A/B,
+and it survives ~1 mm of standoff error, which the complex difference does not).
+Neither is a better version of the other -- do not delete one again.
+
+- Magnitude mode transforms BOTH spectra and differences the dB profiles.
+  `h_cal_real/imag` are left **raw**, because a dB difference is not a spectrum
+   -- so **SAR must stay on complex**, and it does: `processedBscanData` is
+  complex-only and feeds SAR and the 2D Map, while `cscanProcessedData` carries
+  the mode and feeds only the two C-scan panes (it aliases the complex result
+  when the mode is complex, so nothing is computed twice).
+- `gatedIntensity` needed **no change**: `lin*lin` with `lin = 10^(db/20)` is
+  exactly `10^(db/10)`, so the same expression is a mean power in absolute mode
+  and a mean **power ratio** in difference mode.
+- The linear colour warp is bypassed in difference mode (it maps an amplitude;
+  a dB ratio has none) and the colour bar gets a zero line and signed labels.
+- Measured on a synthetic two-echo scene: **the largest |Δ| does not land
+  bin-exactly on the target and is often NEGATIVE.** A target on the skirt of a
+  much larger wall return interferes with it, so the peak lands where that
+  interference is strongest -- 0.330 m for a target at 0.300 m, within the
+  50 mm range resolution. Read |Δ| against a threshold, not the sign, and do not
+  expect ranging from it.
+
+### Super Fit: a whole reference GRID, matched cell for cell
+
+A single captured reference is only right at one position. The 2026-08-30 rover
+diagnosis measured a **17 mm standoff span over one 700x150 mm grid** (the rig is
+not parallel to the wall), a 6.3 dB position-dependent swing at exactly the wall
+range, and only 14-18 dB from a corner reference. Super Fit stores every cell of
+a completed grid and subtracts each new capture from **the reference at its own
+(grid_ix, grid_iy)**, so a standoff that varies across the grid is matched rather
+than extrapolated.
+
+Workflow: scan (or import) the bare wall, press **Super Fit This Grid**, clear
+the grid, rescan the same wall from the same origin.
+
+- **Keyed by cell index, never by capture order.** Manual snakes up from the
+  bottom-left and the rover snakes down from the top-left, so the two orders
+  visit the same cells in different sequences; matching on order would subtract
+  every cell against the wrong patch of wall. Verified both orders produce an
+  identical grid.
+- **Grid geometry is locked while a Super Fit is loaded**, for the same reason --
+  changing a count or a step silently re-keys every cell. The panel also warns if
+  the geometry no longer matches what was captured.
+- Mutually exclusive with the captured reference and the model, like they are
+  with each other. `bscanBgDisplay` is deliberately **null** under Super Fit:
+  its reference is a different spectrum per cell, so no single BG row represents
+  it.
+- Requires a **full** grid. A partial reference would leave cells with no
+  background, and those are now refused rather than passed through raw.
+
+Measured on a synthetic tilted wall (3x2 grid, wall face walking 4 mm per column
+and 10 mm per row, one target 22 dB below the wall face in one cell):
+
+| background | target cell | brightest other cell |
+|---|---|---|
+| corner captured reference | -23.2 dB | **-13.2 dB** (target is not the brightest) |
+| **Super Fit** | -40.0 dB | **-101.7 dB** (61 dB of contrast) |
+
+### Also fixed: Manual scaling seeded from the wrong data
+
+`seedManualRange()` rebuilt the grid from `scanData`, which the Sidebar passes as
+the **raw** capture list -- before background subtraction, and computed by the Pi
+with a **Hanning window at nfft 204** where the display uses a **rectangular
+window at nfft 256** (~4 dB apart for a single tone, on a different bin grid).
+The seeded limits were wrong by the full suppression plus that offset, so the
+colours jumped hard on every switch to manual -- the exact thing the comment
+above it promised they would not. It now reads the shared scale the displays draw
+with.
+
+### Still true, and still worth knowing
+
+- **The C-scan recomputes its own range profiles and throws the Pi's away**,
+  rectangular / 4x zero-pad / no range compensation / no averaging, even when
+  subtraction is off. The SFCW panel's Window / Kaiser / R^n / Avg / CFAR / FLOOR
+  controls are `SfcwDisplay` local state and do **not** exist here. Note the
+  window trade is not obvious: rectangular has -13 dB sidelobes but a ~9.8 cm
+  null-to-null mainlobe, Hanning gets -31 dB sidelobes for a ~19.5 cm mainlobe --
+  which would swallow a target 7 cm from the wall. Expose and A/B it against a
+  target in/out capture; do not assume Hanning is the upgrade.
+- **The Live Sweep pane at the top of the C-scan viewport uses the SFCW panel's
+  background** (`sfcwBgModel`/`sfcwBgRef`), not the C-scan's. The two can
+  disagree silently.
+- Default gate is 2-70 cm with `metric: 'peak'`. With the wall at 13-14 cm,
+  `max()` over that gate picks the wall in every cell -- the plan view is then a
+  wall-strength map, which is precisely the gradient the rover scans showed.
+  Narrow the gate around the expected target depth and prefer `energy`.
+- `metric: 'energy'` is a mean, not a sum, so it does not scale with gate width.
+
+### Verification
+
+`lib/cscanGrid.js` and `lib/bscanBg.js` are pure and were exercised head-first
+from node (21 checks: Super Fit self-subtraction exact-zero, target isolation
+against a tilted wall, capture-order independence, magnitude-mode difference and
+range, all six `bg_status` paths, invalid-cell exclusion from the shared scale,
+percentile clipping, degenerate guard). There is no test runner in this repo, so
+those were throwaway scripts -- worth rebuilding as real tests if this grows.
+
+**Fixture trap worth remembering:** synthetic echoes must be placed at
+`depth + range_offset` (0.5 m by default). Placing them at the intended display
+depth puts them at negative distance, where `computeRangeProfile` drops them, and
+every subsequent measurement is of sidelobes only -- which still looks plausible.
+
 ### The third standoff-alignment path, removed 2026-08-30
 
 Separate from the `bgRef` phase ramp: `App.jsx` carried a ~45-line `alignShifts` `useMemo`

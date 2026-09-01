@@ -55,6 +55,16 @@ export function gridStats({ hCount, hStep, vCount, vStep }) {
 // Gated intensity of one position's range profile, in dB. This is the value a
 // C-scan cell is coloured by: the depth axis collapsed to a single number over
 // the slice the operator selected.
+//
+// Works unchanged on a magnitude-difference profile (bg_sub_mode 'magnitude'),
+// where the per-bin values are dB ratios rather than absolute levels:
+//   - peak: the largest change in the gate -- this is the detector statistic
+//     the 2026-08-28 target A/B actually found the target with (+4.4 dB).
+//   - mean: the average change.
+//   - energy: 10*log10(mean(10^(db/10))), i.e. the mean POWER ratio, since
+//     lin*lin with lin = 10^(db/20) is exactly 10^(db/10). The same expression
+//     is a mean power in absolute mode and a mean power ratio in diff mode, so
+//     no special case is needed.
 export function gatedIntensity(magnitudes, distances, gateStartM, gateEndM, metric) {
   if (!magnitudes || !distances) return -Infinity;
   let peak = -Infinity;
@@ -78,10 +88,46 @@ export function gatedIntensity(magnitudes, distances, gateStartM, gateEndM, metr
   return peak;
 }
 
+// A cell whose background could not be resolved is INVALID, not zero. Colouring
+// it like any other cell is the worst available failure: an un-subtracted
+// spectrum sits 20-30 dB above its subtracted neighbours, so it both reads as a
+// huge target and single-handedly sets the dynamic colour limits for the whole
+// grid. These statuses are set by applyBscanBg and consumed here and by the
+// displays, which draw invalid cells in their own colour and exclude them from
+// every scale computation.
+export const BG_STATUS = {
+  OFF: 'off',                  // no background selected, or subtraction disabled
+  OK: 'ok',
+  CLAMPED: 'clamped',          // model applied, but the standoff is outside its span
+  NO_STANDOFF: 'no_standoff',  // model needs a standoff and the cell has none
+  NO_REF: 'no_ref',            // reference selected but unusable
+  SIZE_MISMATCH: 'size_mismatch',
+  NO_SUPERFIT_CELL: 'no_superfit_cell',
+};
+
+// Did the background actually get applied to this cell? 'off' is not an error --
+// nothing was asked for -- but it must not be mixed into a scale with cells that
+// WERE subtracted, so the caller checks the whole population, not each cell.
+export function bgFailed(status) {
+  return status != null && status !== BG_STATUS.OK
+    && status !== BG_STATUS.OFF && status !== BG_STATUS.CLAMPED;
+}
+
+export const BG_STATUS_TEXT = {
+  [BG_STATUS.OFF]: 'no background applied',
+  [BG_STATUS.OK]: 'background applied',
+  [BG_STATUS.CLAMPED]: 'MODEL CLAMPED — standoff outside the captured span',
+  [BG_STATUS.NO_STANDOFF]: 'INVALID — no lidar standoff, model cannot be evaluated',
+  [BG_STATUS.NO_REF]: 'INVALID — reference sweep unusable',
+  [BG_STATUS.SIZE_MISMATCH]: 'INVALID — background numSteps does not match this sweep',
+  [BG_STATUS.NO_SUPERFIT_CELL]: 'INVALID — no Super Fit reference for this cell',
+};
+
 // Fill the grid with gated intensities. Returns a hCount x vCount array indexed
 // [iy * hCount + ix], holding null where nothing has been captured yet. A cell
 // that was captured but has no range bin inside the gate keeps its entry with a
-// non-finite value, so the display can tell "empty" from "gated out".
+// non-finite value, so the display can tell "empty" from "gated out"; a cell
+// whose background failed is flagged invalid and contributes to no scale.
 export function buildCscanGrid(scanData, params) {
   const { hCount, vCount, gateStart, gateEnd, metric } = params;
   const h = Math.max(1, hCount);
@@ -102,14 +148,95 @@ export function buildCscanGrid(scanData, params) {
       : cellForIndex(i, h);
     if (cell.ix < 0 || cell.ix >= h || cell.iy < 0 || cell.iy >= v) continue;
 
-    const value = gatedIntensity(pos.magnitudes, pos.distances, gateStartM, gateEndM, metric);
-    cells[cell.iy * h + cell.ix] = { value, pos, order: i };
-    if (!isFinite(value)) continue;
+    const invalid = bgFailed(pos.bg_status);
+    const value = invalid
+      ? NaN
+      : gatedIntensity(pos.magnitudes, pos.distances, gateStartM, gateEndM, metric);
+    cells[cell.iy * h + cell.ix] = { value, pos, order: i, invalid, status: pos.bg_status };
+    if (invalid || !isFinite(value)) continue;
     if (value < min) min = value;
     if (value > max) max = value;
   }
 
   return { cells, hCount: h, vCount: v, min, max, filled: cells.filter(Boolean).length };
+}
+
+// ── Shared colour scale ────────────────────────────────────────────────────
+//
+// ONE set of colour limits for the whole panel, computed from every captured
+// cell rather than from one grid's gated scalars and one row's bins separately.
+// Before this the two panes disagreed by construction: the C-scan grid stretched
+// min..max of the gated values across all cells, while the B-scan pane stretched
+// min..max of every bin in the SELECTED ROW ONLY (and included the unsubtracted
+// background row in that, which crushed every residual into the bottom few
+// percent of the colormap). The same colour meant two different dB in two
+// images shown side by side, and clicking to another row silently re-scaled the
+// one on the right. Now a colour means one dB everywhere.
+//
+// The population is every bin the B-scan pane actually draws -- 0 to maxDepth,
+// over all valid cells -- so the two panes are literally scaled to the same
+// pixels. Gated cell values are aggregates over a subset of those bins, so they
+// land inside the same range by construction.
+//
+// Limits are PERCENTILES, not min/max. A range profile has deep interference
+// nulls; after background subtraction it has more of them, and a single bin at
+// -140 dB would otherwise set the bottom of the scale and flatten everything
+// above it. p1..p99.9 keeps a genuine bright return (the top ~5 samples of a
+// 60-cell grid) while ignoring the nulls.
+const SCALE_P_LO = 0.01;
+const SCALE_P_HI = 0.999;
+
+export function computeSharedScale(scanData, params) {
+  const maxDepthM = (params.maxDepth != null ? params.maxDepth : 70) / 100;
+  const vals = [];
+
+  for (const pos of scanData) {
+    if (!pos || !pos.magnitudes || !pos.distances) continue;
+    if (bgFailed(pos.bg_status)) continue;
+    const mags = pos.magnitudes;
+    const dists = pos.distances;
+    for (let i = 0; i < mags.length && i < dists.length; i++) {
+      if (dists[i] > maxDepthM) break;
+      const v = mags[i];
+      if (isFinite(v)) vals.push(v);
+    }
+  }
+
+  if (vals.length === 0) return { min: -90, max: -20, n: 0, degenerate: true };
+
+  vals.sort((a, b) => a - b);
+  const at = (p) => vals[Math.min(vals.length - 1, Math.max(0, Math.round(p * (vals.length - 1))))];
+  let min = at(SCALE_P_LO);
+  let max = at(SCALE_P_HI);
+
+  // Degenerate populations are real and must not produce a divide-by-zero
+  // rainbow: subtracting a Super Fit reference from the very grid it was taken
+  // from gives an exactly-zero residual in every bin (20*log10(1e-12) = -240 dB
+  // everywhere), which is a useful "this is the same data" signal rather than an
+  // error, but there is nothing to stretch.
+  const degenerate = !(max - min > 0.5);
+  if (degenerate) {
+    const mid = (max + min) / 2;
+    min = mid - 0.5;
+    max = mid + 0.5;
+  }
+  return { min, max, n: vals.length, degenerate };
+}
+
+// Roll the per-cell background statuses up into something the panel can show.
+export function bgDiagnostics(scanData) {
+  const counts = {};
+  let invalid = 0;
+  let clamped = 0;
+  let applied = 0;
+  for (const pos of scanData) {
+    const st = pos && pos.bg_status != null ? pos.bg_status : BG_STATUS.OFF;
+    counts[st] = (counts[st] || 0) + 1;
+    if (bgFailed(st)) invalid++;
+    else if (st === BG_STATUS.CLAMPED) { clamped++; applied++; }
+    else if (st === BG_STATUS.OK) applied++;
+  }
+  return { counts, invalid, clamped, applied, total: scanData.length };
 }
 
 // ── Rover raster ───────────────────────────────────────────────────────────

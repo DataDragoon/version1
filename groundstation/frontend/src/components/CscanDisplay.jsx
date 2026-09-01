@@ -1,10 +1,16 @@
 import { useRef, useEffect, useState } from 'react';
-import { orderedCellForIndex, buildCscanGrid } from '@/lib/cscanGrid';
+import { orderedCellForIndex, buildCscanGrid, BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
 
 const BG = '#000000';
 const EMPTY_FILL = '#0d0d0d';
 const EMPTY_STROKE = '#1f1f1f';
 const GATED_OUT_FILL = '#3a3a3a';
+// A cell whose background could not be resolved. Deliberately a colour no
+// colormap produces, so it can never be read as a value: an un-subtracted cell
+// sits 20-30 dB above its subtracted neighbours and would otherwise look like
+// the strongest target in the scan.
+const INVALID_FILL = '#2a0a10';
+const INVALID_STROKE = '#ff4d6d';
 
 function jet(t) {
   t = Math.max(0, Math.min(1, t));
@@ -63,7 +69,7 @@ function snakeOrderOf(cell, hCount) {
   return cell.iy * hCount + (cell.iy % 2 === 0 ? cell.ix : hCount - 1 - cell.ix) + 1;
 }
 
-function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode) {
+function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode) {
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
   const rect = canvas.getBoundingClientRect();
@@ -83,12 +89,19 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   const grid = buildCscanGrid(scanData, params);
   const total = grid.hCount * grid.vCount;
 
-  // Colour limits: from the captured cells, or pinned by the manual sliders.
+  // Colour limits. Dynamic now comes from the SHARED scale computed over the
+  // whole grid (every bin of every valid cell, percentile-clipped), not from
+  // this grid's own gated min/max -- so the colour bar here and the one on the
+  // B-scan pane mean the same dB, and a full min/max stretch of a flat residual
+  // field no longer manufactures rainbow structure out of noise.
   let dbMin;
   let dbMax;
   if (scaleRange && !scaleRange.dynamic) {
     dbMin = scaleRange.min;
     dbMax = scaleRange.max;
+  } else if (sharedScale && isFinite(sharedScale.min) && isFinite(sharedScale.max)) {
+    dbMin = sharedScale.min;
+    dbMax = sharedScale.max;
   } else if (isFinite(grid.min) && isFinite(grid.max)) {
     dbMin = grid.min;
     dbMax = grid.max;
@@ -97,10 +110,15 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
     dbMax = -20;
   }
   if (dbMax - dbMin < 1) { dbMin -= 0.5; dbMax += 0.5; }
+  // A magnitude difference is a dB RATIO centred on zero, not an absolute
+  // level, so the linear warp (which maps 10^(db/20), an amplitude) is
+  // meaningless on it and is bypassed.
+  const isDiff = subMode === 'magnitude';
+  const useLinear = isLinear && !isDiff;
   const linMin = Math.pow(10, dbMin / 20);
   const linMax = Math.pow(10, dbMax / 20);
 
-  const norm = (db) => (isLinear
+  const norm = (db) => (useLinear
     ? (Math.pow(10, db / 20) - linMin) / (linMax - linMin)
     : (db - dbMin) / (dbMax - dbMin));
 
@@ -109,10 +127,36 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
     for (let ix = 0; ix < grid.hCount; ix++) {
       const cell = grid.cells[iy * grid.hCount + ix];
       const r = cellRect(ix, iy, L);
-      if (cell && isFinite(cell.value)) {
+      if (cell && cell.invalid) {
+        // Captured, but no background could be produced for it. Drawn as an
+        // explicit error rather than given a colour it has not earned.
+        ctx.fillStyle = INVALID_FILL;
+        ctx.fillRect(r.x, r.y, Math.ceil(r.w) + 0.5, Math.ceil(r.h) + 0.5);
+        ctx.strokeStyle = INVALID_STROKE;
+        ctx.lineWidth = 1;
+        const inset = Math.min(r.w, r.h) * 0.28;
+        ctx.beginPath();
+        ctx.moveTo(r.x + inset, r.y + inset);
+        ctx.lineTo(r.x + r.w - inset, r.y + r.h - inset);
+        ctx.moveTo(r.x + r.w - inset, r.y + inset);
+        ctx.lineTo(r.x + inset, r.y + r.h - inset);
+        ctx.stroke();
+      } else if (cell && isFinite(cell.value)) {
         const [cr, cg, cb] = jet(norm(cell.value));
         ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
         ctx.fillRect(r.x, r.y, Math.ceil(r.w) + 0.5, Math.ceil(r.h) + 0.5);
+        // The model was applied but clamped to the edge of its captured span.
+        // Measured cost: 19 dB at 5 mm outside, NEGATIVE suppression past 10 mm.
+        // The value is real enough to draw, but not to trust unmarked.
+        if (cell.status === BG_STATUS.CLAMPED) {
+          ctx.fillStyle = '#f59e0b';
+          ctx.beginPath();
+          ctx.moveTo(r.x + r.w, r.y);
+          ctx.lineTo(r.x + r.w, r.y + Math.min(7, r.h));
+          ctx.lineTo(r.x + r.w - Math.min(7, r.w), r.y);
+          ctx.closePath();
+          ctx.fill();
+        }
       } else if (cell) {
         // Captured, but the depth gate falls outside its range profile.
         ctx.fillStyle = GATED_OUT_FILL;
@@ -222,7 +266,9 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   ctx.fillStyle = '#22d3ee';
   ctx.font = 'bold 10px monospace';
   ctx.textAlign = 'left';
-  ctx.fillText(`C-SCAN (${String(metric).toUpperCase()} @ ${gateStart}-${gateEnd} cm)`, L.pad.left, 14);
+  ctx.fillText(
+    `C-SCAN (${String(metric).toUpperCase()} @ ${gateStart}-${gateEnd} cm${isDiff ? ' · Δ MAG' : ''})`,
+    L.pad.left, 14);
   ctx.fillStyle = '#444444';
   ctx.font = '9px monospace';
   ctx.textAlign = 'right';
@@ -245,8 +291,21 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   ctx.fillStyle = manual ? '#f59e0b' : '#555555';
   ctx.font = '8px monospace';
   ctx.textAlign = 'left';
-  ctx.fillText(`${dbMax.toFixed(0)} dB`, barX - 2, barY - 4);
-  ctx.fillText(`${dbMin.toFixed(0)} dB`, barX - 2, barY + barH + 10);
+  const barFmt = (v) => (isDiff ? `${v >= 0 ? '+' : ''}${v.toFixed(1)} dB` : `${v.toFixed(0)} dB`);
+  ctx.fillText(barFmt(dbMax), barX - 2, barY - 4);
+  ctx.fillText(barFmt(dbMin), barX - 2, barY + barH + 10);
+
+  // In difference mode zero is the decision line: below it the cell got quieter
+  // than the reference, above it something was added.
+  if (isDiff && dbMin < 0 && dbMax > 0) {
+    const zy = barY + barH * (1 - (0 - dbMin) / (dbMax - dbMin));
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(barX, zy);
+    ctx.lineTo(barX + barW, zy);
+    ctx.stroke();
+  }
   if (manual) {
     ctx.save();
     ctx.translate(barX + barW + 11, barY + barH / 2);
@@ -269,11 +328,14 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
       const coord = `(${(hit.ix * hStep).toFixed(1)}, ${(hit.iy * vStep).toFixed(1)}) cm`;
       const order = `#${snakeOrderOf(hit, grid.hCount)}`;
       const val = !cell ? 'not captured'
+        : cell.invalid ? (BG_STATUS_TEXT[cell.status] || 'INVALID')
         : !isFinite(cell.value) ? 'outside gate'
-        : (isLinear ? Math.pow(10, cell.value / 20).toExponential(2) : `${cell.value.toFixed(1)} dB`);
+        : isDiff ? `${cell.value >= 0 ? '+' : ''}${cell.value.toFixed(2)} dB`
+        : (useLinear ? Math.pow(10, cell.value / 20).toExponential(2) : `${cell.value.toFixed(1)} dB`);
       const standoff = cell && cell.pos.lidar_standoff_mm != null
         ? ` | ${cell.pos.lidar_standoff_mm.toFixed(0)} mm` : '';
-      const label = `${order} ${coord} | ${val}${standoff}`;
+      const flag = cell && cell.status === BG_STATUS.CLAMPED ? ' | BG CLAMPED' : '';
+      const label = `${order} ${coord} | ${val}${standoff}${flag}`;
 
       ctx.font = '10px monospace';
       const tw = ctx.measureText(label).width;
@@ -290,7 +352,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
 
 export default function CscanDisplay({
   scanData, params, capturing, sfcwProgress, scaleMode, scaleRange,
-  nextIndex, selectedCell, onSelectCell, scanMode,
+  nextIndex, selectedCell, onSelectCell, scanMode, sharedScale, subMode,
 }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
@@ -303,12 +365,12 @@ export default function CscanDisplay({
       if (start === null) start = t;
       // Breathing highlight on the next target cell, only while a capture is pending.
       const pulse = capturing ? 0.5 + 0.5 * Math.sin((t - start) / 180) : 0;
-      drawCscan(canvasRef.current, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode);
+      drawCscan(canvasRef.current, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode);
       animRef.current = requestAnimationFrame(render);
     };
     animRef.current = requestAnimationFrame(render);
     return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
-  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode]);
+  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode]);
 
   const pick = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();

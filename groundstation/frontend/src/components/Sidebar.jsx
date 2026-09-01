@@ -79,6 +79,13 @@ export default function Sidebar({
   lidarOffsetMm,
   onLidarOffsetChange,
   bgApplied,
+  bscanBgSubMode,
+  onBscanBgSubModeChange,
+  bscanSuperFit,
+  onCaptureSuperFit,
+  onClearSuperFit,
+  cscanSharedScale,
+  cscanBgDiag,
   onBgAppliedChange,
   bscanParams,
   onBscanParamsChange,
@@ -346,6 +353,13 @@ export default function Sidebar({
                   scanData={bscanData}
                   scanCapturing={bscanCapturing}
                   bgApplied={bgApplied}
+                  bgSubMode={bscanBgSubMode}
+                  onBgSubModeChange={onBscanBgSubModeChange}
+                  superFit={bscanSuperFit}
+                  onCaptureSuperFit={onCaptureSuperFit}
+                  onClearSuperFit={onClearSuperFit}
+                  sharedScale={cscanSharedScale}
+                  bgDiag={cscanBgDiag}
                   onBgAppliedChange={onBgAppliedChange}
                   onScanAction={onBscanAction}
                   roverConnected={roverConnected}

@@ -43,6 +43,8 @@ export default function Viewport({
   onSfcwDynamicScale,
   bscanData,
   bscanBgDisplay,
+  bscanBgSubMode,
+  cscanSharedScale,
   bscanParams,
   bscanCapturing,
   roverScan,
@@ -431,6 +433,8 @@ export default function Viewport({
                 sfcwProgress={sfcwProgress}
                 scaleMode={bscanScaleMode}
                 scaleRange={bscanScaleRange}
+                sharedScale={cscanSharedScale}
+                subMode={bscanBgSubMode}
                 nextIndex={roverScan?.active ? roverScan.index : bscanData.length}
                 selectedCell={activeCell}
                 onSelectCell={setSelectedCell}
@@ -451,6 +455,8 @@ export default function Viewport({
                 scaleMode={bscanScaleMode}
                 displayMode={bscanDisplayMode}
                 scaleRange={bscanScaleRange}
+                sharedScale={cscanSharedScale}
+                subMode={bscanBgSubMode}
               />
               {rowData.length === 0 && (
                 <div className="absolute inset-0 flex items-center justify-center pointer-events-none">

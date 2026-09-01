@@ -9,6 +9,7 @@ import { inferBgModel } from './lib/bgModelInfer';
 import { computeCaptureStats } from './lib/bgCaptureStats';
 import { computeRangeProfile } from './lib/rangeProfile';
 import { applyBscanBg, bgForStandoff } from './lib/bscanBg';
+import { computeSharedScale, bgDiagnostics } from './lib/cscanGrid';
 import { cellForIndex } from './lib/cscanGrid';
 import { useRoverScan } from './hooks/useRoverScan';
 import { DEFAULT_PARAMS as IMAGING_DEFAULT_PARAMS } from './lib/imagingEffects';
@@ -397,21 +398,34 @@ export default function App() {
   const [bscanDisplayMode, setBscanDisplayMode] = useState('color');
   // Colour limits: dynamic follows the data, manual pins both ends live.
   const [bscanScaleRange, setBscanScaleRange] = useState({ dynamic: true, min: -90, max: -20 });
+  // Complex (vector) or magnitude (dB difference) subtraction. Complex is for
+  // seeing -- it removes the wall so a target beneath it is not buried;
+  // magnitude is for deciding -- it is the statistic the target A/B actually
+  // detected with, and it tolerates ~1 mm of standoff error. See lib/bscanBg.js.
+  const [bscanBgSubMode, setBscanBgSubMode] = useState('complex');
+
+  // Super Fit: a whole previously-captured grid used as the background, matched
+  // cell for cell rather than by standoff. Mutually exclusive with the other two
+  // sources. Held as a lookup keyed "ix,iy" so a new scan in a different capture
+  // ORDER (manual snakes up, the rover snakes down) still lines up.
+  const [bscanSuperFit, setBscanSuperFit] = useState(null);
 
   const bscanBgSource = useMemo(
-    () => ({ bgRef: bscanBgRef, bgModel: bscanBgModel }),
-    [bscanBgRef, bscanBgModel],
+    () => ({ bgRef: bscanBgRef, bgModel: bscanBgModel, superFit: bscanSuperFit }),
+    [bscanBgRef, bscanBgModel, bscanSuperFit],
   );
 
   // Capturing a reference drops any loaded model, and vice versa.
   const handleBscanCaptureBg = useCallback(() => {
     setBscanBgModel(null);
+    setBscanSuperFit(null);
     setBscanBgCapturing(true);
     bscanBgCaptureRef.current = true;
   }, []);
 
   const handleBscanLoadBgModel = useCallback((model) => {
     setBscanBgRef(null);
+    setBscanSuperFit(null);
     bscanBgCaptureRef.current = false;
     setBscanBgCapturing(false);
     setBscanBgModel(model);
@@ -424,9 +438,15 @@ export default function App() {
     setBscanBgCapturing(false);
   }, []);
 
-  // The background as a displayable range profile (no subtraction — raw BG).
+  // The background as a displayable range profile (no subtraction — raw BG),
+  // drawn as one extra row on top of the B-scan pane.
   // With a model there is no single reference sweep, so it is evaluated at the
   // first captured position's standoff to give the same visual sanity check.
+  //
+  // Deliberately null for Super Fit: its reference is a different spectrum for
+  // every cell, so there is no single row that represents it, and drawing any
+  // one cell's would misrepresent the other 59. The per-cell reference is
+  // visible instead by turning BG Applied off.
   const bscanBgDisplay = useMemo(() => {
     let real = null;
     let imag = null;
@@ -460,11 +480,70 @@ export default function App() {
   }, [bscanBgRef, bscanBgModel, bscanBgSource, bscanData, sfcwParams.startFreq, sfcwParams.stopFreq]);
 
 
-  // B-scan processing: complex BG subtract (model or reference) → IFFT
+  // Capture the current grid as a Super Fit reference. The grid must be full:
+  // a partial reference would leave cells with no background at all, and those
+  // are refused rather than silently passed through un-subtracted.
+  const handleBscanCaptureSuperFit = useCallback(() => {
+    const cells = {};
+    let n = 0;
+    for (const pos of bscanData) {
+      if (pos.grid_ix == null || pos.grid_iy == null) continue;
+      if (!pos.h_cal_real || !pos.h_cal_imag) continue;
+      cells[`${pos.grid_ix},${pos.grid_iy}`] = {
+        re: pos.h_cal_real,
+        im: pos.h_cal_imag,
+        standoffMm: pos.lidar_standoff_mm != null ? pos.lidar_standoff_mm : null,
+      };
+      n++;
+    }
+    if (n === 0) return;
+    setBscanBgRef(null);
+    setBscanBgModel(null);
+    bscanBgCaptureRef.current = false;
+    setBscanBgCapturing(false);
+    setBscanSuperFit({
+      cells,
+      count: n,
+      // The grid this was captured on. Editing the grid afterwards would
+      // silently re-key every cell, so the panel locks the dimensions while a
+      // Super Fit is loaded and these are what it locks them to.
+      grid: {
+        hCount: bscanParams.hCount, vCount: bscanParams.vCount,
+        hStep: bscanParams.hStep, vStep: bscanParams.vStep,
+      },
+      capturedAt: new Date().toISOString(),
+    });
+  }, [bscanData, bscanParams]);
+
+  const handleBscanClearSuperFit = useCallback(() => setBscanSuperFit(null), []);
+
+  // B-scan processing: complex BG subtract (model, reference or Super Fit) → IFFT.
+  // This is the COMPLEX-mode result, and it is what SAR and the 2D Map read --
+  // SAR reconstructs from h_cal, which a magnitude difference cannot express.
   const processedBscanData = useMemo(
-    () => applyBscanBg(bscanData, { enabled: bgApplied, ...bscanBgSource }, sfcwParams),
+    () => applyBscanBg(bscanData, { enabled: bgApplied, ...bscanBgSource, mode: 'complex' }, sfcwParams),
     [bscanData, bscanBgSource, bgApplied, sfcwParams],
   );
+
+  // What the C-scan and B-scan panes draw. Identical to the above in complex
+  // mode (reused rather than recomputed), and the dB-difference detector in
+  // magnitude mode.
+  const cscanProcessedData = useMemo(
+    () => (bscanBgSubMode === 'magnitude'
+      ? applyBscanBg(bscanData, { enabled: bgApplied, ...bscanBgSource, mode: 'magnitude' }, sfcwParams)
+      : processedBscanData),
+    [bscanBgSubMode, bscanData, bscanBgSource, bgApplied, sfcwParams, processedBscanData],
+  );
+
+  // ONE colour scale for both panes, computed over the whole grid. See
+  // computeSharedScale for why this is percentile-based and why it replaced the
+  // per-grid / per-row limits the two displays used to compute independently.
+  const cscanSharedScale = useMemo(
+    () => computeSharedScale(cscanProcessedData, bscanParams),
+    [cscanProcessedData, bscanParams],
+  );
+
+  const cscanBgDiag = useMemo(() => bgDiagnostics(cscanProcessedData), [cscanProcessedData]);
 
   // 2D Map state
   const [mapGateStart, setMapGateStart] = useState(2);
@@ -1297,6 +1376,13 @@ export default function App() {
         onBscanDisplayModeChange={setBscanDisplayMode}
         bscanScaleRange={bscanScaleRange}
         onBscanScaleRangeChange={setBscanScaleRange}
+        bscanBgSubMode={bscanBgSubMode}
+        onBscanBgSubModeChange={setBscanBgSubMode}
+        bscanSuperFit={bscanSuperFit}
+        onCaptureSuperFit={handleBscanCaptureSuperFit}
+        onClearSuperFit={handleBscanClearSuperFit}
+        cscanSharedScale={cscanSharedScale}
+        cscanBgDiag={cscanBgDiag}
         sarBscanData={sarBscanInput}
         sarResult={sarResult}
         sarProgress={sarProgress}
@@ -1379,8 +1465,10 @@ export default function App() {
         sfcwScaleRange={sfcwScaleRange}
         onSfcwScaleRangeChange={setSfcwScaleRange}
         onSfcwDynamicScale={handleSfcwDynamicScale}
-        bscanData={processedBscanData}
+        bscanData={cscanProcessedData}
         bscanBgDisplay={bscanBgDisplay}
+        bscanBgSubMode={bscanBgSubMode}
+        cscanSharedScale={cscanSharedScale}
         bscanParams={bscanParams}
         bscanCapturing={bscanCapturing}
         roverScan={roverScan}
