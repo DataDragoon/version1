@@ -769,7 +769,19 @@ class SFCWEngine:
 
         for i in range(num_steps):
             if stop_event.is_set():
-                return None, 0
+                # THREE values, like the success path. This returned `None, 0`
+                # until 2026-08-31 -- missed when adc_peak was added on 2026-08-29 --
+                # so every stop mid-sweep raised
+                #   ValueError: not enough values to unpack (expected 3, got 2)
+                # in _perform_sweep / _perform_sweep_raw. It looked harmless because
+                # _sweep_loop's except falls straight into a finally that stops TX/RX
+                # anyway, which is what stopping was about to do -- but it took the
+                # exception path to get there, printed "[sfcw] Sweep error" on every
+                # single stop, and pushed a bogus {'error': ...} to the groundstation.
+                # Worst of all it buried real sweep errors in noise the operator had
+                # learned to ignore. adc_peak is None here rather than a dict; every
+                # consumer already guards it (_warn_if_adc_hot's `if not adc_peak`).
+                return None, 0, None
 
             f = int(freqs[i])
             if use_qt:

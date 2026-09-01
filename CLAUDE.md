@@ -868,6 +868,21 @@ unpacks `_sweep_core` as a 2-tuple when it has returned `(h_cal, dropped_steps, 
 since 2026-08-29) — needs a rewrite against the current `_sweep_core`/master-table API
 before it's useful again.
 
+**The same 2-tuple slip was live in the engine itself until 2026-08-31.**
+`_sweep_core`'s early `if stop_event.is_set(): return None, 0` was missed when
+`adc_peak` was added, so **every stop mid-sweep** raised
+`ValueError: not enough values to unpack (expected 3, got 2)` in `_perform_sweep` /
+`_perform_sweep_raw`. It presented as a harmless recurring
+`[sfcw] Sweep error: not enough values to unpack (expected 3, got 2)` because
+`_sweep_loop`'s broad `except` falls straight into a `finally` that stops TX/RX —
+which is what stopping was about to do anyway — so the shutdown still happened, just
+via the exception path. It was not harmless: it pushed a bogus `{'error': ...}` to
+the groundstation on every stop, and it trained the operator to ignore the one line
+a genuine sweep failure would print. Now returns `None, 0, None`; every consumer
+already guards a null `adc_peak` (`_warn_if_adc_hot`'s `if not adc_peak`). **If a
+fourth value is ever added to `_sweep_core`, that early return is the one to
+remember** — it is the only path that does not fall through to the bottom.
+
 **Regression, 2026-08-20 to 2026-08-23 (fixed): `num_buffers` default silently dropped
 from 4 to 1, killing per-step noise averaging.** The `c33b0ce` "clean up" commit (same
 day as the `settle_count` regression above) trimmed `sfcwParams`/`SFCWEngine` defaults
