@@ -18,3 +18,4 @@ build/
 data/
 recordings/
 pi/sensors/imu_cal.json
+groundstation/models
