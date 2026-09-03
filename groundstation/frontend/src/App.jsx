@@ -592,6 +592,33 @@ export default function App() {
   // output grid. Only the second is a real parameter, and it belongs here: it
   // sets the extent and the cost of the reconstruction, not what a display shows.
   const [sarMaxDepth, setSarMaxDepth] = useState(70);
+  // Relative permittivity of the wall. The SAR back-projection had NO velocity
+  // parameter before 2026-09-03 and reconstructed at the speed of light in air, so
+  // the hyperbola it matched had the wrong curvature and its depth axis read sqrt(er)
+  // too deep. 4.5 = dry brick, cross-checked against a real scan (29 cm wall, back
+  // face at 63.2 cm apparent -> er 4.68).
+  const [sarEpsilonR, setSarEpsilonR] = useState(4.5);
+  // Rectangular, not the Hanning that used to be hardcoded in the worker: measured
+  // target coherence 0.654 rect / 0.627 kaiser b3 / 0.615 hanning on a real scan.
+  const [sarWindowType, setSarWindowType] = useState('rectangular');
+  // Operator-measured wall thickness, in cm. 29 is THIS bench's wall -- re-measure for
+  // any other. It is what tells the layered model where the dielectric stops; 0 disables
+  // the layered path entirely.
+  const [sarWallThickness, setSarWallThickness] = useState(29);
+  // Layered air/wall/air ray tracing with Snell at both faces, against the straight-ray
+  // model that adds the standoff as a pure delay. Defaults OFF so the existing image
+  // stays the A/B baseline; once the layered one is confirmed better on real data this
+  // toggle should go and it becomes unconditional.
+  const [sarRefraction, setSarRefraction] = useState(false);
+  // 'split' = amplitude and coherence as two panes; 'combined' = one pane of amplitude
+  // weighted by coherence.
+  const [sarViewMode, setSarViewMode] = useState('split');
+  // inferno: perceptually uniform, so a smooth gradient reads as smooth. jet's lightness
+  // is not monotonic and manufactures banded structure that is not in the data -- a bad
+  // property on an image whose whole question is "is that feature real". Kept selectable
+  // because earlier images were read in jet. The coherence pane is NOT affected; it holds
+  // its own ramp so the two split panes stay distinguishable.
+  const [sarColormap, setSarColormap] = useState('inferno');
 
   const sarProcessedData = useMemo(
     () => applyBscanBg(bscanData, { enabled: sarBgEnabled, ...bscanBgSource }, sfcwParams),
@@ -605,7 +632,7 @@ export default function App() {
 
   // SAR and the 2D Map are one-dimensional: they read the horizontal step as the
   // aperture spacing and treat the capture sequence as a line.
-  const sarParams = useMemo(() => ({ ...bscanParams, maxDepth: sarMaxDepth, stepSize: bscanParams.hStep, aperture: sarAperture, coherent: sarCoherent, startFreq: sfcwParams.startFreq, svdEnabled: sarSvdEnabled, svdK: sarSvdK, svdStrength: sarSvdStrength }), [bscanParams, sarMaxDepth, sarAperture, sarCoherent, sfcwParams.startFreq, sarSvdEnabled, sarSvdK, sarSvdStrength]);
+  const sarParams = useMemo(() => ({ ...bscanParams, maxDepth: sarMaxDepth, stepSize: bscanParams.hStep, aperture: sarAperture, coherent: sarCoherent, startFreq: sfcwParams.startFreq, svdEnabled: sarSvdEnabled, svdK: sarSvdK, svdStrength: sarSvdStrength, epsilonR: sarEpsilonR, windowType: sarWindowType, wallThickness: sarWallThickness, refraction: sarRefraction }), [bscanParams, sarMaxDepth, sarAperture, sarCoherent, sfcwParams.startFreq, sarSvdEnabled, sarSvdK, sarSvdStrength, sarEpsilonR, sarWindowType, sarWallThickness, sarRefraction]);
   const { sarResult, sarProgress } = useSarWorker(sarBscanInput, sarParams);
 
   // 2D Map uses the same processed B-scan as the main B-scan panel, optionally with its own SVD
@@ -1505,6 +1532,18 @@ export default function App() {
         onSarDynRangeChange={setSarDynRange}
         sarMaxDepth={sarMaxDepth}
         onSarMaxDepthChange={setSarMaxDepth}
+        sarEpsilonR={sarEpsilonR}
+        onSarEpsilonRChange={setSarEpsilonR}
+        sarWindowType={sarWindowType}
+        onSarWindowTypeChange={setSarWindowType}
+        sarWallThickness={sarWallThickness}
+        onSarWallThicknessChange={setSarWallThickness}
+        sarRefraction={sarRefraction}
+        onSarRefractionChange={setSarRefraction}
+        sarViewMode={sarViewMode}
+        onSarViewModeChange={setSarViewMode}
+        sarColormap={sarColormap}
+        onSarColormapChange={setSarColormap}
         mapBscanData={mapBscanData}
         mapGateStart={mapGateStart}
         mapGateEnd={mapGateEnd}
@@ -1585,6 +1624,8 @@ export default function App() {
         sarProgress={sarProgress}
         sarScaleMode={sarScaleMode}
         sarDynRange={sarDynRange}
+        sarViewMode={sarViewMode}
+        sarColormap={sarColormap}
         mapBscanData={mapBscanData}
         mapGateStart={mapGateStart}
         mapGateEnd={mapGateEnd}

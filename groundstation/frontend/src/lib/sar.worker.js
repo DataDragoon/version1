@@ -1,3 +1,5 @@
+import { windowFn } from './imagingEffects';
+
 const SPEED_OF_LIGHT = 299792458;
 
 function fftInPlace(re, im) {
@@ -154,13 +156,27 @@ function complexSvdFilter(hCalReals, hCalImags, numPositions, numSteps, k, stren
   return { reals: filteredReals, imags: filteredImags };
 }
 
-function computeComplexRangeProfile(hCalReal, hCalImag, numSteps, freqStepHz, rangeOffset) {
+// The window used to be a hardcoded Hanning. It is a parameter now, defaulting to
+// rectangular for range RESOLUTION.
+//
+// WHICH WINDOW IS ACTUALLY BEST HERE IS UNSETTLED -- two measurements on the same
+// 60-position 10 mm-pitch scan disagreed. Evaluating coherence at one point with the
+// full aperture and no debiasing put rectangular ahead (target 0.654 / kaiser b3 0.627
+// / hanning 0.615, separation from clutter 0.273 / 0.248 / 0.234). Running the shipped
+// pipeline end to end -- reconstruction grid, debiased coherence -- reversed it
+// (separation rectangular 0.261 / kaiser 0.314 / hanning 0.362). The second is the more
+// relevant measurement but it is still n=1 scan, n=1 target, so the control is exposed
+// rather than the answer baked in: A/B it on a target-in / target-out pair.
+//
+// Note this is a different question from the range-profile DISPLAY's window, where the
+// problem is a strong return's sidelobes leaking into a distant bin. Do not unify them.
+function computeComplexRangeProfile(hCalReal, hCalImag, numSteps, freqStepHz, rangeOffset, win) {
   const nfftMin = numSteps * 4;
   const nfft = 1 << Math.ceil(Math.log2(nfftMin));
   const re = new Float64Array(nfft);
   const im = new Float64Array(nfft);
   for (let i = 0; i < numSteps; i++) {
-    const w = 0.5 * (1 - Math.cos(2 * Math.PI * i / (numSteps - 1)));
+    const w = win ? win[i] : 1;
     re[i] = hCalReal[i] * w;
     im[i] = hCalImag[i] * w;
   }
@@ -182,6 +198,68 @@ function computeComplexRangeProfile(hCalReal, hCalImag, numSteps, freqStepHz, ra
   return { re: distRe, im: distIm, distances };
 }
 
+const RAY_NQ = 256;
+
+// One-way OPTICAL (air-equivalent) path from an antenna standing off `s` in air, through
+// `T` of wall at index `nw`, to a point at depth `z` below the wall face -- with air
+// again beyond the back face, and Snell obeyed at both interfaces.
+//
+// Parameterised by the ray invariant q = n_i*sin(theta_i), which Snell makes constant
+// across the whole stack. Sweeping q from 0 traces the ray fan outward from broadside,
+// and both the lateral offset X(q) and the optical length L(q) increase monotonically
+// with it -- so ONE table per (standoff, depth) inverts by interpolation for every
+// lateral pixel in that row. Root-finding the crossing points per pixel gives the same
+// answer at roughly 30x the inner-loop cost, which this cannot afford.
+//
+// Why it is worth doing at all: the straight-ray approximation (standoff added as a pure
+// delay) is only good while the air gap is negligible in ANGLE, and it is not. Snell
+// turns a 27 deg ray inside a 29 cm wall into a ~76 deg ray in the air gap, so the true
+// crossing point moves ~1.6 cm sideways and the path shortens by ~2.4 mm -- 29 degrees of
+// two-way phase at 5 GHz, applied exactly to the wide-angle contributions that
+// cross-range resolution depends on.
+//
+// Note also what the fan cannot contain: sin(theta) inside the wall is capped at q/nw,
+// so at er 4.5 no ray propagates further than ~28 deg off normal INSIDE the wall however
+// wide the aperture gets. That is a physical aperture limit rather than a modelling
+// choice, and it is consistent with the measured saturation of coherent gain at ~15 cm
+// of one-sided aperture on this 29 cm wall.
+function buildRayTable(s, z, T, nw, outX, outL) {
+  const dA1 = s;                       // air, antenna -> wall face
+  const dW = Math.min(z, T);           // inside the wall
+  const dA2 = Math.max(0, z - T);      // air again, beyond the back face
+  let qMax = (dA1 > 0 || dA2 > 0) ? 1 : nw;
+  if (dW > 0 && nw < qMax) qMax = nw;
+  for (let i = 0; i < RAY_NQ; i++) {
+    // sin-spaced in angle, so samples crowd towards grazing where X(q) blows up.
+    const q = qMax * Math.sin((i / (RAY_NQ - 1)) * (Math.PI / 2) * 0.9995);
+    let X = 0;
+    let L = 0;
+    if (dA1 > 0) { const c = Math.sqrt(1 - q * q); X += dA1 * q / c; L += dA1 / c; }
+    if (dW > 0) { const sw = q / nw; const c = Math.sqrt(1 - sw * sw); X += dW * sw / c; L += nw * dW / c; }
+    if (dA2 > 0) { const c = Math.sqrt(1 - q * q); X += dA2 * q / c; L += dA2 / c; }
+    outX[i] = X;
+    outL[i] = L;
+  }
+}
+
+// Invert the table: lateral offset -> optical path. Returns -1 when the offset is past
+// the fan's reach, which the caller treats as "no ray gets there" and skips -- the
+// honest answer, rather than extrapolating a path that does not exist.
+function rayLookup(outX, outL, dx) {
+  const last = RAY_NQ - 1;
+  if (dx <= outX[0]) return outL[0];
+  if (dx >= outX[last]) return -1;
+  let lo = 0;
+  let hi = last;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (outX[mid] <= dx) lo = mid; else hi = mid;
+  }
+  const span = outX[hi] - outX[lo];
+  const t = span > 0 ? (dx - outX[lo]) / span : 0;
+  return outL[lo] + t * (outL[hi] - outL[lo]);
+}
+
 self.onmessage = function (e) {
   const { bscanData, bscanParams } = e.data;
   const t0 = performance.now();
@@ -196,16 +274,67 @@ self.onmessage = function (e) {
     return;
   }
 
-  const maxDepthM = (maxDepth || 30) / 100;
+  // Relative permittivity of the medium. This WAS ABSENT ENTIRELY until 2026-09-03,
+  // i.e. every image was back-projected at the speed of light in air: the hyperbola
+  // being matched had the wrong curvature so nothing focused properly, and the depth
+  // axis read sqrt(er) times too deep. Default 4.5 = dry brick, cross-checked against
+  // a real scan -- a 29 cm wall whose back face landed at 63.2 cm of apparent range
+  // gives sqrt(er) = 62.8/29 = 2.16, er = 4.68.
+  const epsilonR = bscanParams.epsilonR > 0 ? bscanParams.epsilonR : 1;
+  const n = Math.sqrt(epsilonR);
+
+  // Per-position standoff in metres, from each cell's own recorded lidar reading.
+  // Without it the back-projection assumes every antenna position sat exactly on the
+  // wall face, and a scan whose standoff wanders is defocused by the resulting phase
+  // error. Measured by injecting known scatter into a real scan and re-migrating both
+  // ways -- target coherence UNCORRECTED 0.591 flat -> 0.557 at 3 mm sigma -> 0.358 at
+  // 5 mm -> 0.156 at 10 mm, while CORRECTED it holds 0.591 all the way to 30 mm. The
+  // lidar is far better than it needs to be here: adding 0.5 mm of noise to the
+  // correction changed nothing. This is what lets the rig be imprecise in standoff.
+  const standoffs = [];
+  let standoffN = 0;
+  for (let p = 0; p < numPositions; p++) {
+    const mm = bscanData[p].lidar_standoff_mm;
+    if (mm === null || mm === undefined || !isFinite(mm)) {
+      standoffs.push(0);
+    } else {
+      standoffs.push(mm / 1000);
+      standoffN++;
+    }
+  }
+  let maxStandoff = 0;
+  for (let p = 0; p < numPositions; p++) if (standoffs[p] > maxStandoff) maxStandoff = standoffs[p];
 
   const distances = bscanData[0].distances;
   const numBins = distances.length;
-  let endBin = numBins - 1;
-  for (let i = numBins - 1; i >= 0; i--) {
-    if (distances[i] <= maxDepthM) { endBin = i; break; }
-  }
+  const apparentAvailable = distances[numBins - 1];
 
-  const depthMax = distances[endBin];
+  // maxDepth is TRUE depth below the wall face now, not apparent range. Reaching
+  // depth z needs apparent range standoff + n*z, so the record itself bounds how deep
+  // the grid can go; the request is clipped and flagged rather than silently imaging
+  // past the end of the profile.
+  // Operator-measured wall thickness. Only used by the layered model, which needs to
+  // know where the dielectric STOPS -- beyond the back face it is air again, and a
+  // uniform-dielectric model puts anything back there at the wrong depth and the wrong
+  // hyperbola curvature. 0 means "not measured", and the layered path stays off.
+  const wallT = Math.max(0, (bscanParams.wallThickness || 0) / 100);
+  const layered = !!bscanParams.refraction && wallT > 0;
+
+  const requested = (maxDepth || 30) / 100;
+  let reachable;
+  if (layered) {
+    // Broadside optical path to the back face, then air-for-air beyond it.
+    const atBack = maxStandoff + n * wallT;
+    reachable = apparentAvailable >= atBack
+      ? wallT + (apparentAvailable - atBack)
+      : (apparentAvailable - maxStandoff) / n;
+  } else {
+    reachable = (apparentAvailable - maxStandoff) / n;
+  }
+  reachable = Math.max(0.01, reachable);
+  const depthMax = Math.min(requested, reachable);
+  const depthClipped = requested > reachable + 1e-9;
+
   const apertureLength = (numPositions - 1) * stepSize / 100;
 
   const antennaX = [];
@@ -214,6 +343,14 @@ self.onmessage = function (e) {
   }
 
   const image = new Float64Array(pixelsX * pixelsZ);
+  const coherence = new Float64Array(pixelsX * pixelsZ);
+
+  // Coherence is only a statement about the aperture if the aperture was actually
+  // there. Pixels near the far corners are reached by only a handful of positions --
+  // the rest need an apparent range the sweep does not contain -- and a sum of two or
+  // three contributions is coherent by chance, not by focusing. Caught in testing: the
+  // raw statistic peaked at 0.997 in the deepest corner, above the real target.
+  const minContrib = Math.max(5, Math.ceil(0.25 * numPositions));
 
   const hasHcal = coherent && bscanData[0].h_cal_real && bscanData[0].h_cal_imag;
 
@@ -234,12 +371,14 @@ self.onmessage = function (e) {
       hCalImags = filtered.imags;
     }
 
+    const win = windowFn(bscanParams.windowType || 'rectangular', bscanParams.kaiserBeta || 3)(numSteps);
+
     // Compute complex range profiles for all positions
     const crps = [];
     for (let p = 0; p < numPositions; p++) {
       crps.push(computeComplexRangeProfile(
         hCalReals[p], hCalImags[p],
-        numSteps, freqStepHz, rangeOffset
+        numSteps, freqStepHz, rangeOffset, win
       ));
     }
 
@@ -248,52 +387,104 @@ self.onmessage = function (e) {
     const crpDistStart = crpDists[0];
     const crpDistStep = crpNumBins > 1 ? (crpDists[crpNumBins - 1] - crpDistStart) / (crpNumBins - 1) : 1;
 
-    // Find end bin for the display depth extent
-    let crpEndBin = crpNumBins - 1;
-    for (let i = crpNumBins - 1; i >= 0; i--) {
-      if (crpDists[i] <= maxDepthM) { crpEndBin = i; break; }
-    }
+    // The lookup limit is the WHOLE profile, not the display depth. With a dielectric
+    // the apparent range to a pixel at depth z is standoff + n*z, which already runs
+    // past z, and the hyperbola tails at large |dx| run further still -- clipping at
+    // the display depth would truncate exactly the wide-angle contributions that
+    // focusing depends on.
+    const crpEndBin = crpNumBins - 1;
 
-    for (let zi = 0; zi < pixelsZ; zi++) {
-      const depth = Math.max(0.005, (zi / (pixelsZ - 1)) * depthMax);
+    // POSITION-OUTER, deliberately. The layered ray table depends only on (standoff,
+    // depth), so building it once per (position, depth) row and reusing it across the
+    // row's lateral pixels is what keeps refraction affordable; with the original
+    // depth-outer order the table would be rebuilt for every pixel. The sum is
+    // associative so the reordering is exact -- verified against the previous order.
+    const accRe = new Float64Array(pixelsX * pixelsZ);
+    const accIm = new Float64Array(pixelsX * pixelsZ);
+    const accAbs = new Float64Array(pixelsX * pixelsZ);
+    const accN = new Int32Array(pixelsX * pixelsZ);
 
-      for (let xi = 0; xi < pixelsX; xi++) {
-        const lateral = (xi / (pixelsX - 1)) * apertureLength;
+    const tblX = new Float64Array(RAY_NQ);
+    const tblL = new Float64Array(RAY_NQ);
 
-        let sumRe = 0;
-        let sumIm = 0;
+    for (let p = 0; p < numPositions; p++) {
+      const cre = crps[p].re;
+      const cim = crps[p].im;
+      const sp = standoffs[p];
 
-        for (let p = 0; p < numPositions; p++) {
+      for (let zi = 0; zi < pixelsZ; zi++) {
+        const depth = Math.max(0.005, (zi / (pixelsZ - 1)) * depthMax);
+        if (layered) buildRayTable(sp, depth, wallT, n, tblX, tblL);
+        const row = zi * pixelsX;
+
+        for (let xi = 0; xi < pixelsX; xi++) {
+          const lateral = (xi / (pixelsX - 1)) * apertureLength;
           const dx = lateral - antennaX[p];
-          const R = Math.sqrt(dx * dx + depth * depth);
+
+          let R;
+          if (layered) {
+            // air(standoff) / wall(wallT) / air(beyond), refracting at both faces.
+            R = rayLookup(tblX, tblL, dx < 0 ? -dx : dx);
+            if (R < 0) continue;
+          } else {
+            // Straight ray: the standoff is added as a pure delay and everything below
+            // the face is treated as one infinite dielectric. Cheaper, and what this
+            // worker did before the layered model existed -- kept as the A/B baseline.
+            R = sp + n * Math.sqrt(dx * dx + depth * depth);
+          }
 
           const binFloat = (R - crpDistStart) / crpDistStep;
           const binIdx = Math.floor(binFloat);
           if (binIdx < 0 || binIdx >= crpEndBin) continue;
 
           const frac = binFloat - binIdx;
-          const valRe = crps[p].re[binIdx] * (1 - frac) + crps[p].re[binIdx + 1] * frac;
-          const valIm = crps[p].im[binIdx] * (1 - frac) + crps[p].im[binIdx + 1] * frac;
+          const valRe = cre[binIdx] * (1 - frac) + cre[binIdx + 1] * frac;
+          const valIm = cim[binIdx] * (1 - frac) + cim[binIdx + 1] * frac;
 
           const phase = 2 * k_start * R;
           const cosP = Math.cos(phase);
           const sinP = Math.sin(phase);
 
-          sumRe += valRe * cosP - valIm * sinP;
-          sumIm += valRe * sinP + valIm * cosP;
+          const o = row + xi;
+          accRe[o] += valRe * cosP - valIm * sinP;
+          accIm[o] += valRe * sinP + valIm * cosP;
+          // Incoherent partner of the very same sum. |sum| / sum|.| asks a different
+          // question from the amplitude: did the contributions AGREE IN PHASE (a
+          // scatterer the aperture genuinely focused -> towards 1) or merely happen to
+          // add up to something large (clutter -> ~0.2)?
+          accAbs[o] += Math.sqrt(valRe * valRe + valIm * valIm);
+          accN[o]++;
         }
-
-        const mag = Math.sqrt(sumRe * sumRe + sumIm * sumIm);
-        image[zi * pixelsX + xi] = 20 * Math.log10(mag + 1e-12);
       }
 
-      if (zi % 10 === 0 || zi === pixelsZ - 1) {
-        self.postMessage({ type: 'progress', progress: (zi + 1) / pixelsZ });
+      self.postMessage({ type: 'progress', progress: (p + 1) / numPositions });
+    }
+
+    for (let i = 0; i < image.length; i++) {
+      const mag = Math.sqrt(accRe[i] * accRe[i] + accIm[i] * accIm[i]);
+      image[i] = 20 * Math.log10(mag + 1e-12);
+
+      // Debias before storing. N contributions with random phases still sum to about
+      // 1/sqrt(N) of their incoherent total, so the RAW ratio is not comparable between
+      // pixels with different support -- and support varies a lot across the grid,
+      // because the deep and off-centre pixels are the ones whose far positions fall off
+      // the end of the range profile (or, under the layered model, are past the reach of
+      // the refracted ray fan). Rescaling so chance maps to 0 and perfect to 1 makes the
+      // number mean the same thing everywhere, which is what lets it be drawn on a fixed
+      // 0-1 colour scale at all.
+      const nUsed = accN[i];
+      if (nUsed >= minContrib) {
+        const chance = 1 / Math.sqrt(nUsed);
+        const raw = accAbs[i] > 0 ? mag / accAbs[i] : 0;
+        coherence[i] = Math.max(0, (raw - chance) / (1 - chance));
+      } else {
+        coherence[i] = 0;
       }
     }
   } else {
     // Incoherent SAR: magnitude-only with nearby-position averaging
     const distStart = distances[0];
+    const endBin = numBins - 1;
     const distStep = endBin > 0 ? (distances[endBin] - distStart) / endBin : 1;
     const stepM = stepSize / 100;
     const maxDist = (aperture + 0.5) * stepM;
@@ -310,7 +501,10 @@ self.onmessage = function (e) {
           const dx = lateral - antennaX[p];
           if (Math.abs(dx) > maxDist) continue;
 
-          const range = Math.sqrt(dx * dx + depth * depth);
+          // Straight ray only. The layered model is coherent-only: this path sums
+          // magnitudes, so it has no phase for a path-length correction to act on and
+          // refraction would buy it nothing but cost.
+          const range = standoffs[p] + n * Math.sqrt(dx * dx + depth * depth);
           const binFloat = (range - distStart) / distStep;
           const binIdx = Math.floor(binFloat);
           if (binIdx < 0 || binIdx >= endBin) continue;
@@ -336,6 +530,10 @@ self.onmessage = function (e) {
     type: 'result',
     result: {
       image: Array.from(image),
+      // Only the coherent path has phase to be coherent about; the incoherent one sums
+      // magnitudes, so no such statistic exists and the display says so rather than
+      // drawing a meaningless zero field.
+      coherence: hasHcal ? Array.from(coherence) : null,
       pixelsX,
       pixelsZ,
       depthMax,
@@ -343,6 +541,12 @@ self.onmessage = function (e) {
       numPositions,
       computeTimeMs,
       coherent: hasHcal,
+      epsilonR,
+      windowType: bscanParams.windowType || 'rectangular',
+      standoffN,
+      depthClipped,
+      layered,
+      wallThicknessCm: wallT * 100,
     },
   });
 };

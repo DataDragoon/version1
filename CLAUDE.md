@@ -2651,3 +2651,535 @@ Two things worth keeping in mind about what was left behind:
 - It also fixed a latent bug: `targetShifts={rowData.map(() => 0)}` built a fresh array
   every render, so that effect's dependency changed identity every render and tore down and
   restarted the rAF loop each time. It now re-runs only when something real changes.
+
+## Five-scan A/B on the new rig: the raster does not see a deep pipe (2026-09-02)
+
+Five 20x1 rover C-scans of one 1 m patch of brick wall, 50 mm pitch, `avgCount: 1`,
+`gateEnd` 70/74 cm, no `bgRef` and no model (`data/` not in repo; user's
+`Desktop/scans test/aligned scan 1..5.json`, v7). Scans 3 and 4 contain a pipe
+~60-70 cm inside the wall at the x = 55 cm mark; 1, 2 and 5 are the empty control.
+Ground truth was supplied only AFTER a blind analysis, so the blind result is a real
+test of the detector rather than a fit.
+
+**Geometry checks that should be repeated on any multi-scan set.** Absolute
+`rover_x_mm` differs by exactly 50 mm per scan (origin re-declaration between
+sessions), but `grid_ix` maps to the same physical spot in all five -- confirmed by
+standoff-profile correlation (r = 0.92-0.98, peak at lag 0) and by `h_cal` complex
+correlation (peak at lag 0). **Match cells on `grid_ix`, never on `rover_x_mm`,
+across sessions.**
+
+### The raster's background floor is ~17.5 dB, and that is the whole story
+
+Leave-one-out against the other target-free scans: 19.3 / 14.6 / 14.8 dB. The two
+target scans against the mean of all three empties: 19.7 / 14.7 dB -- **no excess
+whatsoever**; per-scan residual power is -17.5 dB below signal for the empties and
+-17.8 dB for the target scans. The shared-residual correlation ranks the true (3,4)
+pairing **4th of 10**. So every ordinary differencing metric says the two sets are
+indistinguishable, and no amount of subtraction can recover a target from them.
+
+Against CLAUDE.md's static single-sweep `S_repeat` of 38.6 dB, **the raster loses
+~21 dB of reproducibility.** That gap -- not the estimator, not the background model
+-- is what stands between these scans and a detection, and it is why the user's
+"static radar, move the pipe" test succeeds where the raster fails: that test is a
+differential measurement at one fixed position, so it runs at the full ~38 dB.
+
+The dominant term is a **global standoff difference between scans**: mean standoff
+per scan is 45.4 / 45.7 / 47.5 / 47.8 / 49.1 mm for scans 4, 2, 3, 1, 5, and the
+scan-pair residual-correlation structure orders the scans in *exactly* that sequence
+({2,4} vs {1,5}, scan 3 in the middle). A per-frequency complex recalibration
+(one scalar per frequency, shared over all 20 positions, so it cannot fabricate or
+erase a localized target) recovers 3-5 dB of it -- the drift is up to 7 dB and 36
+degrees, frequency-dependent, i.e. the reference-gain recalibration signature. A
+global gain+delay fit recovers only ~1 dB, so it is not a simple range shift.
+
+### What DID separate them: along-x high-pass + coherent agreement between the two target scans
+
+The clutter is low-spatial-frequency along the rail; a pipe is not. Subtract a
+~5-cell moving average along x per range bin, then compute `Re(E_a . conj(E_b))`
+with the background for each pair built from the other three scans (symmetric over
+all 10 pairings, so the permutation null is fair).
+
+Across 96 processing variants (calibration on/off x nfft x depth gate x spatial
+band) the true (3,4) pairing ranks **1st in 80/96, <=2nd in 93/96**, against a null
+of 10/96; mean rank 1.20 vs 5.5. Holds identically under non-circular filters
+(moving average w = 3/5/7, polynomial detrend order 4/6), so it is not an FFT edge
+artifact. **Scans 3 and 4 genuinely share something the empty three lack.**
+
+It peaks at two positions: **x = 10 cm (won 96/96 variants) and x = 55-60 cm
+(84/96)**. Ground truth: the pipe is at 55 cm. **So the detector's STRONGEST peak is
+a false alarm and its second is the pipe** -- roughly one false alarm per metre of
+scan. Do not treat this detector's ranking as trustworthy; a random peak lands
+within one cell of the truth about 15% of the time, so the x match alone is only
+suggestive (p ~ 0.28 for two peaks).
+
+### But the shared signature is NOT the pipe's echo, and carries no depth
+
+Range distribution of the shared residual at the pipe column (x = 45-70 cm):
+
+| window | 0-10 cm | 10-20 | 20-30 | 30-40 | 60-70 | 120-130 |
+|---|---|---|---|---|---|---|
+| share | **42.5%** | 7.9 | 5.6 | 11.4 | **8.1** | 1.3 |
+
+The largest single 5-cm window holds **27.9%**; a genuine point echo puts >60% in
+one window (the rectangular mainlobe is ~10 cm). Restricting to the pipe column and
+scanning depth windows x sub-bands, (3,4) ranks 1 in essentially *every* window from
+0 to 145 cm -- the signature is broadband in range, not a resolvable reflection. It
+is also not a per-position gain change: a best-fit complex scalar explains only
+15-28% of it.
+
+**An earlier reading of this data placed the target at 5-9 cm; that was wrong** -- an
+artifact of gating the search to 0-30 cm. There is no depth information here at all.
+
+Measured floor at 60-70 cm displayed: **-30.9 dB** relative to the wall/coupling
+peak, with 19.4 dB of headroom. A pipe 65 cm inside brick is tens of dB below that
+(two-way spreading plus 5-20 dB/m of brick over a 1.3 m path plus the cylinder's
+scattering width against a specular wall face), so its direct echo was never within
+reach of a single-sweep raster.
+
+**Note the C-scan gate bites here.** `gateEnd` was 70/74 cm. If a 60-70 cm *physical*
+depth is meant, the displayed range is ~125-145 cm (brick, v ~ c/2) and the grid
+metric never looks at it. Both windows were searched; neither holds a localized echo.
+
+### Consequences for capture
+
+- **`avgCount: 1` is the wrong setting for a deep target.** Coherent averaging is
+  worth up to `10*log10(N)`; at N=16 that is 12 dB of the missing 21.
+- **The split between sweep noise and repositioning noise is unmeasured on this rig
+  and is the single most valuable next experiment**: at one fixed cell take N sweeps,
+  drive away, come back, retake. Averaging fixes the first and only mechanical work
+  fixes the second, so the split decides where the effort goes.
+- **50 mm pitch is spatially aliased above ~3 GHz** (`dx <= lambda_min/(4 sin theta)`
+  caps the aperture at +-17 deg at 5 GHz, which at 10 cm depth is one cell). SAR
+  back-projection on these scans is pure grating-lobe striping. For migration the
+  pitch has to come down to ~20 mm; for a deep target in brick, sweeping 2-3 GHz only
+  is both better-penetrating and unaliased, at 15 cm range resolution.
+- **Merging sessions is still a bad idea** for the reason already documented -- the
+  cross-scan disagreement here is larger than the target.
+
+## Second five-scan A/B, 10 mm pitch: invalidated by a rig move (2026-09-02)
+
+Five 101x1 rover C-scans, **10 mm pitch** over 1 m (`hStep: 1`), same wall as the
+2026-09-02 set above; 3 empty (`e3`/`e4`/`e5`) + 2 with the pipe (`p1`/`p2`), pipe
+again at ~65-70 cm. User's `Desktop/scans test 2/`.
+
+### The pitch change worked; the averaging change did not ship
+
+10 mm pitch un-aliases the aperture (`dx <= lambda_min/(4 sin theta)` now admits
++-48 deg at 5 GHz) and **back-projection migration produces compact, focusable
+features for the first time** -- see below. Keep the 10 mm pitch.
+
+But every cell still holds one sweep. **The exports are v6, with no `sweeps` and no
+`procParams`** -- and `App.jsx` has exported `version: 7` since `40349a0`
+(2026-09-01), the commit that added per-cell `sweeps` and `avgCount`. So the
+groundstation build in use on the bench predates that commit. **Check what is
+actually deployed before concluding a capture-side setting had no effect**; the
+first (2026-09-01) dataset was v7, so this is a regression in what is running,
+not in the repo.
+
+### The dataset cannot answer the question: the rig moved between empty and pipe
+
+| scan | standoff mean | tilt across the 1 m scan | geometry group |
+|---|---|---|---|
+| e5 | 27.2 mm | +2.8 mm | A -- near parallel |
+| e3 | 32.7 mm | +5.2 mm | A |
+| e4 | 49.9 mm | **+30.6 mm** | B -- tilted |
+| p1 | 63.7 mm | **+29.6 mm** | B |
+| p2 | **no LiDAR data at all** | -- | B (by correlation with p1) |
+
+It is the same wall patch -- the standoff profiles all correlate 0.83-0.99 near
+lag 0 and every scan with LiDAR shows the same surface step at cell ~63. But the
+standoff spans **27 to 64 mm across the set**, and both pipe scans sit at one
+extreme while two of the three empties sit at the other. Achievable suppression
+tracks the standoff difference and nothing else:
+
+| pair | standoff difference | suppression |
+|---|---|---|
+| e3-e5 (empty-empty) | 5.5 mm | **15.5 dB** |
+| e4-p1 | 13.8 mm | 0.6 dB |
+| e3-p1 | 31.1 mm | 2.7 dB |
+| e5-p1 | 36.5 mm | 3.4 dB |
+
+**Best empty-vs-pipe suppression is 3.4 dB.** The previous set managed 17.5 dB and
+that was already too little. Migrated images cluster by geometry, not by pipe
+presence: focusing metric e3 4.4 / e5 3.9 (group A) vs e4 1.7 / p1 2.1 / p2 2.1
+(group B). The only geometry-matched comparison available (p1 & p2 against e4)
+gives a best gap of 41.9 dB against a 37.1 dB empty control -- no separation, and a
+flat along-x profile with no localized peak.
+
+**This is now the number-one capture rule, ahead of averaging: do not move, re-mount
+or re-level the rig between the empty and the target capture.** If inserting the
+target requires disturbing it, capture empty -> target -> empty so the drift is
+bracketed and measurable. The LiDAR standoff readout is the go/no-go: mean standoff
+within a few mm of the previous scan, and tilt across the scan under ~5 mm. e3 and
+e5 met that; e4 and p1 did not.
+
+### One real find, in the scans labelled EMPTY
+
+Migration of e3 and e5 -- the two clean near-parallel scans -- each independently
+shows a compact scatterer at **x = 12-16 cm** whose **apparent range stays at
+60.4-62.4 cm across the whole eps_r = 2..8 sweep** (the invariance a genuine echo
+must show; only the inferred depth moves, as `z = D/sqrt(eps_r)`). -3 dB extent is
+~10 cm in x by ~4 cm in depth at eps_r = 4-6. Peak-to-median 16-18 dB.
+
+It is **not** visible in the unmigrated data -- that band at x = 11-17 is a local
+*minimum* in every scan (-2.5 to -3.8 dB below median) -- so it is built up
+coherently by the migration from a distributed hyperbola. That is migration doing
+its job, and it is the first time anything in this project has focused.
+
+~61 cm apparent range is squarely in the 65-70 cm band the pipe is supposed to
+occupy, yet this is in `empty_wall_test3` and `empty_wall_test5`. Either it is a
+wall feature (rebar, void, joint) at that depth, or those scans were not empty.
+Worth resolving before the next A/B, because if it is a wall feature it is a
+permanent confuser sitting at the target depth.
+
+### Other data-quality notes
+
+- **`empty_wall_test4_#2` cell 73 carries 123x the scan's median energy** (the
+  known-bad trace). Nothing else in any scan exceeds 4x. Repaired by neighbour
+  interpolation for this analysis.
+- **`2_pipe_test2` has `lidar_standoff_mm: null` on all 101 cells.** Per the
+  diagnosis section above, check the sidebar IMU Hz tile to tell "port 9001 stream
+  down" from "`read_distance()` returning None".
+- No `bgRef` and no model on any of the five.
+- Absolute `rover_x_mm` differs by whole metres between scans (0-1000, 1000-2000,
+  2000-3000, 2572-3572) purely from origin re-declaration. Match on `grid_ix`.
+- Beware fixed-lag correlation searches over a shrinking overlap: correlation rises
+  trivially as the overlap shrinks, and a naive argmax parks at the search edge with
+  n=25. Slide a **fixed-width** window instead.
+
+### The "two blobs 20 cm apart" reading of that set does not survive (2026-09-02)
+
+`2_pipe_test*` held **two** pipes 20 cm apart, and migrate-then-SVD does show deep
+blobs in both pipe scans that are absent from `e3`/`e5`. Three checks against it:
+
+- **20 cm is not a special separation here.** Over 60 (eps_r x SVD-rank x scan)
+  combinations, an ~20 cm pair among the top-4 deep blobs appears in **42% of EMPTY
+  scans** and only 33% of pipe scans. With 4-6 blobs scattered over a 1 m scan, some
+  pair lands near 20 cm most of the time.
+- **The empty comparison is the geometry comparison.** `e3`/`e5` sit at 27-33 mm and
+  near-parallel; `p1`/`p2` at 64 mm and tilted. `e4` -- the *only* empty sharing the
+  pipe scans' geometry -- carries **more** deep structure than either pipe scan.
+- **The permutation test picks out geometry pairs, not target pairs.** Gap statistic
+  over 16 settings: `(p1,p2)` ranks 1st in 6, but `(e3,e5)` -- two EMPTY scans -- ranks
+  1st in the other 10 and wins the explicit "two blobs 20+-3 cm apart" search
+  (+16.2 dB vs +13.5). The two top pairings are exactly the two matched-geometry
+  pairs, which explains the result with no reference to pipes.
+
+**What does survive is ONE feature, not two.** Averaged over 12 settings (eps_r 3-6 x
+SVD rank 1-3), the pipe pair beats all nine control pairings over a single contiguous
+stretch, **x = 50.0-64.5 cm, centre 57.2, width 14.5 cm**, margin +8.5 to +11.1 dB
+where the control envelope falls to +2.0-3.5. Every other winning stretch is 1-3 cm
+wide at ~1 dB. It passes the echo test: **apparent range 97.4-100.7 cm across
+eps_r 3-6, a 3.3 cm spread against a 5 cm range cell.**
+
+Three reasons not to call it the pipes yet:
+- **It is a single broad peak with no double structure.** Cross-range resolution at
+  that depth is ~2 cm, so two pipes 20 cm apart would resolve as two blobs.
+- **~99 cm apparent range is past the panel's 74.9 cm display limit**, and past the
+  65-70 cm the pipes are meant to occupy. At eps_r = 4 it implies 46 cm below the
+  face; reaching 67 cm would need eps_r ~ 1.9, too low for brick.
+- **It is not independently visible unmigrated** -- at 90-108 cm the pipe-minus-empty
+  gap over x = 50-64 is -0.33 dB. The migration builds it coherently out of
+  noise-floor energy, which is legitimate but unverifiable from the raw B-scan.
+
+**Method note worth keeping: with two matched-geometry pairs among five scans, ANY
+"what do these two share that the other three lack" statistic will rank the two
+matched pairs top, whatever the target does.** Such a statistic is only interpretable
+when geometry is held constant across the whole set.
+
+### Ground truth for that set: pipes at x = 60 and 80 cm. One hit, one miss, still confounded
+
+**The standoff drift is a continuous, near-linear gradient measured at all 101 cells,
+not an endpoint artifact.** `e4` and `p1` ramp `+30.6` and `+29.6` mm across the metre
+with `R^2 = 0.976 / 0.940` about a straight line and 99% / 93% of smoothed steps rising;
+per-quarter means climb steadily (`p1`: 54.4 -> 57.8 -> 66.2 -> 76.1 mm). `e3` and `e5`
+are flat by comparison (+5.2 / +2.8 mm, `R^2` 0.55 / 0.22 -- i.e. mostly wall surface
+texture, no real trend). So the rail sits at a genuine ~3% tilt to the wall in `e4`/`p1`
+(and `p2` by correlation), and near-parallel in `e3`/`e5`. All four scans with LiDAR
+share a `+4` to `+7 mm` surface step at cell ~63, which is what confirms one patch.
+
+Scoring the migrate->SVD shared-excess profile against the true positions:
+
+| | pipe-pair excess | best control | margin | rank of 201 |
+|---|---|---|---|---|
+| **x = 60 cm (pipe 1)** | **+9.99 dB** | +4.73 | **+5.25** | **12** |
+| **x = 80 cm (pipe 2)** | +2.56 dB | +8.25 | -5.69 | **194** |
+| x = 40 (no pipe) | +6.33 | +6.26 | +0.07 | -- |
+
+**Pipe 2 is missed because a strong wall feature saturates x ~ 80 in every scan**
+(deep-region level: e3 +8.45, e5 +8.59, e4 +7.70, p1 +7.00, p2 +8.16 dB -- the
+*empties are brighter than the pipe scans there*). Any "pipe minus empty" statistic is
+structurally blind at such a column. Aperture truncation is only -0.8 dB at x = 80 and
+does not explain it.
+
+**The x = 60 hit is real but NOT attributable, because the level there tracks standoff
+monotonically:** e5 (27 mm) +2.89, e3 (33) +2.30, e4 (50) +7.59, p1 (64) +9.56,
+p2 (~64) +12.36 dB. The pipe scans are also the largest-standoff scans, so "pipe" and
+"standoff" are perfectly confounded at that column; the margin against the
+geometry-matched `e4` is only ~2-5 dB, not the ~7-9 dB against `e3`/`e5`. Note the
+ordering is *not* standoff-ranked at x = 80, so this is not a blanket artifact -- it is
+specifically unresolvable here.
+
+Correction to the figure quoted earlier: apparent-range invariance at the **pipe
+column** (x = 60 +- 2.5 cm, 30-58 cm depth window) is **5.1 cm** across eps_r 3-6
+(95.6 / 100.4 / 99.2 / 100.7 cm), not the 3.3 cm measured over the wider x = 50-64
+stretch. Still about one range cell, so it still passes, but 5.1 is the right number.
+
+**Net: the method put its single strongest feature on a real pipe, and that is the best
+result this project has had -- but five scans split across two rig geometries cannot
+establish it.** One matched-geometry set would settle it outright.
+
+## SAR was reconstructing in AIR, and three other fixes (2026-09-03)
+
+Found while analysing `sartt.json` -- a 60-position, 10 mm-pitch, single-row C-scan of
+a 29 cm brick wall with a pipe stuck to the BACK face at x = 56 cm.
+
+### The big one: there was no permittivity anywhere in the SAR path
+
+`sar.worker.js` computed `R = Math.sqrt(dx*dx + depth*depth)` -- the speed of light in
+air. Two consequences, both silent: the hyperbola being matched had the wrong
+curvature, so nothing focused properly; and the depth axis read `sqrt(er)` times too
+deep. `epsilonR` is now a panel field (`sarEpsilonR`, default **4.5**) and the kernel
+is `R = standoff_p + n*sqrt(dx^2 + depth^2)`, `n = sqrt(er)`.
+
+**`maxDepth` changed meaning with it: it is TRUE depth below the wall face now, not
+apparent range.** Reaching depth z needs apparent range `standoff + n*z`, so the record
+bounds the grid; the request is clipped to what the sweep can reach and the panel says
+so (`depthClipped`).
+
+**Calibrate er from geometry, not from autofocus.** The backwall echo sat at 63.2 cm of
+apparent range and the wall measures 29 cm, giving `sqrt(er) = 62.8/29 = 2.16`,
+er = 4.68 (4.31-4.68 over a 0-3 cm standoff range -- the standoff barely matters). A
+coherence-vs-er sweep peaked at 3.5 but is broad enough that 4.5 sits 0.05 below its
+peak, so the tape measure is the better instrument here.
+
+### Per-position standoff correction is what buys an imprecise rig
+
+The kernel assumed every antenna position sat exactly on the wall face. Each cell's own
+recorded `lidar_standoff_mm` is now added to the path. Measured by injecting known
+standoff scatter into the real scan and re-migrating both ways -- target coherence:
+
+| injected sigma | 0 | 3 mm | 5 mm | 10 mm | 30 mm |
+|---|---|---|---|---|---|
+| uncorrected | 0.591 | 0.557 | **0.358** | **0.156** | **0.163** |
+| corrected | 0.591 | 0.591 | 0.591 | 0.590 | 0.591 |
+| corrected, +0.5 mm lidar noise | 0.594 | 0.591 | 0.593 | 0.592 | 0.591 |
+
+**Uncorrected you need standoff stable to ~3 mm; corrected it is immune out to at least
+30 mm, and the lidar is far better than it needs to be.** This is the difference between
+needing a precise rig and not. It gained nothing on `sartt.json` itself only because
+that scan already held standoff to +/-1.5 mm -- do not read that as "it does not
+matter". Caveat: the test models a standoff change as pure extra path delay; moving the
+antenna also changes illumination slightly, so the real benefit is somewhat less than
+the table.
+
+### Coherence output -- and it MUST be debiased
+
+`|sum_i c_i| / sum_i |c_i|` over the back-projection's own contributions, computed in the
+same loop and returned beside the amplitude image. It asks whether the positions agreed
+in phase (a scatterer the aperture focused) rather than whether they added up to
+something large (clutter that happened to be bright). Absolute 0-1, so the display pins
+it to a fixed scale and never dynamically stretches it.
+
+**The raw ratio is NOT comparable across the image and shipping it that way is a bug --
+caught in testing.** N contributions with random phases still sum to ~`1/sqrt(N)` of
+their incoherent total, and N varies hugely across the grid because deep and off-centre
+pixels need an apparent range the sweep does not contain. Raw coherence therefore peaked
+at **0.997 in the deepest image corner**, above the real target, on 2-3 contributions.
+Fixed with both: a `minContrib = max(5, 0.25*numPositions)` floor (below it, 0), and
+rescaling so chance maps to 0 and perfect to 1.
+
+### What it does and does not do, on the one scan tested
+
+Both panes are drawn at once, deliberately -- the reading is the pair. At the backwall
+depth, amplitude vs debiased coherence:
+
+| x | 5 cm | 15 | 25 | 35 | 45 | **56 (pipe)** |
+|---|---|---|---|---|---|---|
+| amplitude (dB rel peak) | -4.6 | -20.9 | -5.3 | -10.4 | -15.9 | **-1.5** |
+| coherence | 0.81 | 0.00 | 0.56 | 0.21 | 0.00 | **0.82** |
+
+Coherence pushes the mid-scan lobe down (0.56 against the pipe's 0.82) and zeroes two
+others. **It does NOT uniquely pick the pipe** -- a feature at the opposite aperture edge
+scores comparably (0.89) and cannot be controlled for without extending the scan past
+it. Treat an edge feature with suspicion. Note also this discriminant was validated
+knowing where the pipe was; it is physically motivated (a cylinder scatters over a wide
+angle, a flat backwall is specular and only returns near normal incidence) but it has
+not had a blind test.
+
+### Window is now a parameter, and which one wins is UNSETTLED
+
+Was a hardcoded Hanning. Now `sarWindowType`, default rectangular, options
+rectangular / hanning / kaiser b3 (shares `imagingEffects.js` `windowFn` -- one
+implementation, as with CFAR). **Two measurements on the same scan disagreed**:
+evaluating coherence at one point with the full aperture and no debiasing put
+rectangular ahead (separation 0.273 / kaiser 0.248 / hanning 0.234), while running the
+shipped pipeline end to end -- reconstruction grid, debiased coherence -- reversed it
+(rectangular 0.261 / kaiser 0.314 / **hanning 0.362**). The second is the more relevant
+measurement but is still n=1 scan, n=1 target. The control is exposed rather than the
+answer baked in; A/B it on a target-in / target-out pair.
+
+### Geometry findings from `sartt.json` worth keeping
+
+- **The rig is level now.** Standoff trend 0.2 mm over the whole 59 cm scan, against the
+  30 mm of tilt in the 2026-08-30 rover sets. Whatever was done to the mount, keep it.
+- **A target stuck to the backwall cannot be separated by range, ever.** Depth gating,
+  time gating and range resolution are all aimed at the wrong axis when the target and
+  the interface are at the same delay. The discriminant has to be cross-range structure
+  (coherence, migration) or polarization.
+- **Aperture: the coherent amplitude saturated at ~15 positions of one-sided aperture**
+  (3 cm -> -11.4 dB, 6 -> -6.9, 10 -> -2.3, 15 -> saturated). The pipe at x = 56 with
+  data ending at 59 had only 3 cm on its right, so it was reconstructed from about half
+  its available aperture. **Overscan 15-20 cm past the region of interest**; a longer
+  scan overall is not what is needed.
+- **SVD rank 1, not higher.** At rank 1 the peak sits on the pipe; at rank 2-3 it jumps
+  to x = 13-14 cm. Over-filtering eats the target.
+- **Scan perpendicular to the pipe axis.** A pipe parallel to the scan gives a
+  constant-range flat event with no hyperbola and no coherence signature --
+  indistinguishable from the backwall.
+
+### Verification
+
+`sar.worker.js` was exercised head-first from node against the real `sartt.json` (shim
+`self`, copy `imagingEffects.js` alongside with an explicit extension since the repo
+imports extensionless for Vite): 60 positions, `standoffN=60`, 26-36 ms, amplitude peak
+at pos 54.8 cm / depth 28.9 cm against a ground truth of 56 cm / 29.8 cm. Also checked
+that er actually changes the image, that the incoherent path returns `coherence: null`
+rather than a zero field, and `vite build` passes. There is still no test runner in this
+repo, so these were throwaway scripts.
+
+## SAR layered refraction: air / wall / air, and the combined view (2026-09-03)
+
+Follow-on to the section above. Two toggles were added, both intended to be TEMPORARY
+A/B controls -- once the layered model is confirmed on more than one scan the toggle
+should go and it becomes unconditional.
+
+### The straight-ray model was badly wrong at wide angles
+
+The previous kernel was `R = standoff_p + n*sqrt(dx^2 + z^2)`: standoff added as a pure
+delay, everything below the face treated as one infinite dielectric, no refraction.
+Measured against an exact Fermat solve for a 4.3 mm standoff and a 29 cm wall at er 4.5:
+
+| lateral offset | 5 cm | 10 cm | 15 cm | 20 cm |
+|---|---|---|---|---|
+| straight-ray path error, as two-way phase at 5 GHz | 3.4 deg | 13.7 deg | **34.8 deg** | **106.2 deg** |
+
+Broadside is fine and the wide angles are wrecked -- and the wide angles are exactly the
+contributions cross-range resolution comes from. The mechanism is that Snell turns a
+~27 deg ray inside the wall into a ~76 deg ray in the air gap, so the true crossing point
+moves centimetres sideways even though the gap is only millimetres thick. **A thin air
+gap is not a small ANGULAR perturbation, which is what the old comment assumed.**
+
+### How it is solved: ray-invariant table, not per-pixel root-finding
+
+`buildRayTable()` / `rayLookup()` in `sar.worker.js`. Layers are air(standoff) /
+wall(wallThickness) / air(beyond the back face). Parameterised by the ray invariant
+`q = n_i*sin(theta_i)`, which Snell holds constant across the stack; sweeping q traces
+the ray fan outward from broadside and gives lateral offset `X(q)` and optical length
+`L(q)` both monotonic, so ONE table per (standoff, depth) inverts by interpolation for
+every lateral pixel in that row. 256 samples, sin-spaced in angle so they crowd towards
+grazing where `X(q)` diverges.
+
+**Verified against a brute-force Fermat minimisation over the crossing points: worst
+disagreement 0.0012 mm, against a 49 mm range bin.**
+
+**The reconstruction loop is now POSITION-OUTER** so the table is built once per
+(position, depth) row rather than per pixel; per-pixel root-finding would have been the
+same answer at ~30x the inner-loop cost. Verified the reorder is exact -- with refraction
+off the amplitude peak is unchanged at pos 54.83 cm / depth 28.89 cm. Cost 29 ms -> 65 ms
+with refraction on, which is nothing against the 300 ms worker debounce.
+
+`rayLookup` returns -1 past the fan's reach and the caller SKIPS that contribution rather
+than extrapolating a path no ray takes.
+
+### Wall thickness is an operator input, and it gates the layered model
+
+`sarWallThickness`, cm, default **29 -- that is THIS bench's wall, re-measure for any
+other.** Nothing on the rig can infer it. It is what tells the model where the dielectric
+stops: beyond the back face it is air again, and a uniform-dielectric model puts anything
+back there at the wrong depth with the wrong curvature. 0 disables the layered path and
+greys the toggle. Cross-check it against the data: the back-face echo should land at
+`standoff + sqrt(er) * thickness` of apparent range.
+
+Note the reachable depth changes with it -- the same record reaches 35.0 cm layered
+against 34.46 cm straight, because the beyond-wall leg travels at c rather than c/n.
+
+### What it bought on the one scan tested (`sartt.json`, pipe on the back face at x=56)
+
+| x | straight amp / coh | layered amp / coh |
+|---|---|---|
+| 5 cm (edge confuser) | -4.58 dB / **0.812** | -4.31 dB / **0.733** |
+| 25 cm (clutter) | -5.26 dB / 0.563 | -3.55 dB / 0.516 |
+| **56 cm (the pipe)** | -1.48 dB / **0.824** | **-0.36 dB / 0.845** |
+
+Under the straight ray the pipe and the opposite-edge confuser were effectively tied on
+coherence (0.824 vs 0.812). Under the layered model they separate (**0.845 vs 0.733**) and
+the pipe becomes the brightest pixel outright. The focused depth also moves 28.89 ->
+29.34 cm, i.e. onto the 29 cm back face where the pipe physically is -- an independent
+consistency check nobody fitted for.
+
+### Combined view: amplitude weighted by coherence
+
+`sarViewMode` = `split` (two panes) or `combined` (one). Combined multiplies LINEAR
+amplitude by coherence, i.e. `+20*log10(coh)` in dB, floored at coh 0.01 so a zero
+coherence pixel lands at -40 dB instead of -infinity.
+
+Worth understanding: the amplitude image ALREADY contains the raw coherence once, since
+`|sum| = coh_raw * sum|.|` by construction. This weights it a second time and by the
+DEBIASED figure, which is a different quantity -- so it is not simply squaring what is
+there. It is a deliberate display choice to punish bright-but-unfocused clutter.
+
+Measured target-vs-clutter separation (x=56 against x=25): amplitude alone **3.78 dB**
+straight / 3.18 dB layered, weighted **7.09 dB** / **7.46 dB**. Roughly doubles it either
+way.
+
+### Still open
+
+- Layered refraction is validated on ONE scan with ONE target whose position was known in
+  advance. The physics check (Fermat, 0.0012 mm) is solid and target-independent; the
+  imaging improvement is not yet blind-tested.
+- The layered model is COHERENT-MODE ONLY. The incoherent path sums magnitudes, so there
+  is no phase for a path correction to act on; it stays straight-ray and says so.
+- The window question from the previous section is still unsettled and untouched by this.
+
+### Ablation: which SAR change actually flipped the image (2026-09-03)
+
+The visible symptom before any of this was that a clutter blob at x = 25 cm dominated the
+image and the real pipe at x = 56 cm did not. Amplitude at each lobe, each sampled at its
+OWN best depth so a change of velocity model cannot masquerade as a change of contrast.
+`PIPE-MID` is the number that decides which blob the eye picks out:
+
+| config | pipe | mid | PIPE-MID | coh pipe/mid | weighted gap |
+|---|---|---|---|---|---|
+| as it was (er=1, hanning, no standoff, straight) | -25.15 | -20.17 | **-4.98 dB** | 0.14/0.34 | -12.76 dB |
+| + er 1 -> 4.5 | -19.08 | -20.15 | **+1.06** | 0.97/0.95 | +1.30 |
+| + rectangular window | -11.06 | -12.42 | +1.35 | 0.81/0.81 | +1.28 |
+| + per-position standoff | -10.87 | -12.56 | +1.69 | 0.82/0.81 | +1.83 |
+| + layered refraction | -10.46 | -12.74 | **+2.28** | **0.89/0.54** | **+6.53** |
+
+Leave-one-out from the final config, same metric: **er back to 1 costs 11.1 dB**
+(+2.28 -> -8.83), straight ray costs 0.59 dB of amplitude gap but **4.7 dB of the weighted
+gap**, no standoff costs 0.44, hanning costs 0.30.
+
+**er is essentially the entire answer, and the mechanism is worth remembering.** Going
+from er 1 to 4.5 moved the PIPE by +6.07 dB and moved the MID BLOB by +0.02 dB -- it did
+not respond to the velocity model at all. A compact scatterer focuses, and focusing is
+what a correct velocity buys; a layer or a smear does not focus and is therefore
+indifferent to velocity. So **sensitivity of a feature to er is itself a discriminant**,
+and a cheap one: sweep er and watch which blobs brighten. Confirmed by where the
+brightest pixel in the whole image lands -- er=1 puts it at 25.6 cm (the clutter), er=4.5
+at 54.8 cm (the pipe).
+
+**Layered refraction is second and it acts on COHERENCE, not amplitude.** It barely moves
+the amplitude gap (1.69 -> 2.28 dB) but drops the mid blob's coherence 0.81 -> 0.54 while
+raising the pipe's 0.82 -> 0.89, which is what takes the weighted gap from 1.83 to
+6.53 dB. Under the straight ray the two lobes were coherence-tied and the combined view
+could not separate them.
+
+**Window and standoff are worth a few tenths each on THIS scan** -- the standoff was
+already stable to +/-1.5 mm here, so its 0.44 dB is not evidence about a sloppier scan.
+
+**Third measurement now favours HANNING for the weighted gap**: 8.33 dB against
+rectangular's 6.53 (while amplitude-only slightly favours rectangular, 2.28 vs 1.98). Two
+of three metrics now lean Hanning. The default stays rectangular because that is what was
+asked for, but this is worth re-deciding on a target-in / target-out pair.

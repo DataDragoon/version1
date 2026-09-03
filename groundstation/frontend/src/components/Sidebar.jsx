@@ -120,6 +120,18 @@ export default function Sidebar({
   onSarDynRangeChange,
   sarMaxDepth,
   onSarMaxDepthChange,
+  sarEpsilonR,
+  onSarEpsilonRChange,
+  sarWindowType,
+  onSarWindowTypeChange,
+  sarWallThickness,
+  onSarWallThicknessChange,
+  sarRefraction,
+  onSarRefractionChange,
+  sarViewMode,
+  onSarViewModeChange,
+  sarColormap,
+  onSarColormapChange,
   mapBscanData,
   mapGateStart,
   mapGateEnd,
@@ -421,6 +433,19 @@ export default function Sidebar({
                   onDynRangeChange={onSarDynRangeChange}
                   maxDepth={sarMaxDepth}
                   onMaxDepthChange={onSarMaxDepthChange}
+                  epsilonR={sarEpsilonR}
+                  onEpsilonRChange={onSarEpsilonRChange}
+                  windowType={sarWindowType}
+                  onWindowTypeChange={onSarWindowTypeChange}
+                  wallThickness={sarWallThickness}
+                  onWallThicknessChange={onSarWallThicknessChange}
+                  refraction={sarRefraction}
+                  onRefractionChange={onSarRefractionChange}
+                  viewMode={sarViewMode}
+                  onViewModeChange={onSarViewModeChange}
+                  colormap={sarColormap}
+                  onColormapChange={onSarColormapChange}
+                  onScanAction={onBscanAction}
                 />
               )}
               {activePanel === 'map' && (

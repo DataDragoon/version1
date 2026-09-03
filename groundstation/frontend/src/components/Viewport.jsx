@@ -58,6 +58,8 @@ export default function Viewport({
   sarProgress,
   sarScaleMode,
   sarDynRange,
+  sarViewMode,
+  sarColormap,
   mapBscanData,
   mapGateStart,
   mapGateEnd,
@@ -502,6 +504,8 @@ export default function Viewport({
               sarProgress={sarProgress}
               scaleMode={sarScaleMode}
               dynRange={sarDynRange}
+              viewMode={sarViewMode}
+              colormap={sarColormap}
             />
             {!sarResult && sarProgress === null && (
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
