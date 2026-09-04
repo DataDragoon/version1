@@ -9,7 +9,7 @@ import { inferBgModel } from './lib/bgModelInfer';
 import { computeCaptureStats } from './lib/bgCaptureStats';
 import { computeRangeProfile } from './lib/rangeProfile';
 import { applyBscanBg, bgForStandoff, coherentMean } from './lib/bscanBg';
-import { computeSharedScale, bgDiagnostics } from './lib/cscanGrid';
+import { computeSharedScale, computeRowScales, computeGridScales, bgDiagnostics } from './lib/cscanGrid';
 import { cellForIndex } from './lib/cscanGrid';
 import { useRoverScan } from './hooks/useRoverScan';
 import { DEFAULT_PARAMS as IMAGING_DEFAULT_PARAMS } from './lib/imagingEffects';
@@ -408,6 +408,16 @@ export default function App() {
   const [bscanDisplayMode, setBscanDisplayMode] = useState('color');
   // Colour limits: dynamic follows the data, manual pins both ends live.
   const [bscanScaleRange, setBscanScaleRange] = useState({ dynamic: true, min: -90, max: -20 });
+  // Dynamic scaling scope: 'global' (one scale over the whole grid) or 'row'
+  // (each grid row scaled to itself). Ignored while scaling is manual.
+  const [bscanScaleScope, setBscanScaleScope] = useState('global');
+  // Draw the depth gate on the B-scan pane. Purely a placement aid -- the gate
+  // always drives the plan view's cell values whether or not it is drawn.
+  const [bscanShowGate, setBscanShowGate] = useState(true);
+  // 'linked' (both panes off one population of bins, so a colour means one dB
+  // in both) or 'independent' (the plan view scales within its own gated cell
+  // values). Ignored while scaling is manual, which pins both by definition.
+  const [bscanScaleLink, setBscanScaleLink] = useState('linked');
   // Complex (vector) or magnitude (dB difference) subtraction. Complex is for
   // seeing -- it removes the wall so a target beneath it is not buried;
   // magnitude is for deciding -- it is the statistic the target A/B actually
@@ -573,6 +583,27 @@ export default function App() {
   const cscanSharedScale = useMemo(
     () => computeSharedScale(cscanProcessedData),
     [cscanProcessedData],
+  );
+
+  // The same percentile treatment, one population per grid row. Computed
+  // unconditionally rather than behind the scope toggle: it is O(bins) over the
+  // grid, the same pass computeSharedScale already makes, and keeping it live
+  // means flipping the toggle cannot make the colours lag a capture behind.
+  const cscanRowScales = useMemo(
+    () => computeRowScales(cscanProcessedData),
+    [cscanProcessedData],
+  );
+
+  // The plan view's own population: one gated scalar per cell, global and
+  // per-row. Depends on the gate and the metric, which the bin-domain scales do
+  // not -- that asymmetry IS the unlinked mode.
+  const cscanGridScales = useMemo(
+    () => computeGridScales(cscanProcessedData, {
+      gateStart: bscanParams.gateStart,
+      gateEnd: bscanParams.gateEnd,
+      metric: bscanParams.metric,
+    }),
+    [cscanProcessedData, bscanParams.gateStart, bscanParams.gateEnd, bscanParams.metric],
   );
 
   const cscanBgDiag = useMemo(() => bgDiagnostics(cscanProcessedData), [cscanProcessedData]);
@@ -1580,6 +1611,14 @@ export default function App() {
         onBscanDisplayModeChange={setBscanDisplayMode}
         bscanScaleRange={bscanScaleRange}
         onBscanScaleRangeChange={setBscanScaleRange}
+        bscanScaleScope={bscanScaleScope}
+        onBscanScaleScopeChange={setBscanScaleScope}
+        bscanShowGate={bscanShowGate}
+        onBscanShowGateChange={setBscanShowGate}
+        bscanScaleLink={bscanScaleLink}
+        onBscanScaleLinkChange={setBscanScaleLink}
+        cscanRowScales={cscanRowScales}
+        cscanGridScales={cscanGridScales}
         bscanBgSubMode={bscanBgSubMode}
         onBscanBgSubModeChange={setBscanBgSubMode}
         bscanSuperFit={bscanSuperFit}
@@ -1698,6 +1737,11 @@ export default function App() {
         bscanScaleMode={bscanScaleMode}
         bscanDisplayMode={bscanDisplayMode}
         bscanScaleRange={bscanScaleRange}
+        bscanScaleScope={bscanScaleScope}
+        bscanShowGate={bscanShowGate}
+        bscanScaleLink={bscanScaleLink}
+        cscanRowScales={cscanRowScales}
+        cscanGridScales={cscanGridScales}
         sarResult={sarResult}
         sarProgress={sarProgress}
         sarScaleMode={sarScaleMode}

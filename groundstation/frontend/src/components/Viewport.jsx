@@ -54,6 +54,11 @@ export default function Viewport({
   bscanScaleMode,
   bscanDisplayMode,
   bscanScaleRange,
+  bscanScaleScope,
+  bscanShowGate,
+  bscanScaleLink,
+  cscanRowScales,
+  cscanGridScales,
   sarResult,
   sarProgress,
   sarScaleMode,
@@ -380,6 +385,22 @@ export default function Viewport({
       ? `B-Scan · Row ${activeCell.iy + 1}`
       : 'B-Scan';
 
+    // Per-row scaling: this pane draws one grid row, so its limits are that
+    // row's. Manual pinning still wins over both (the displays check
+    // scaleRange.dynamic themselves), and a scan with no grid indices lands in
+    // row 0, where per-row and global are the same population anyway.
+    const bscanScale = (bscanScaleScope === 'row' && cscanRowScales)
+      ? (cscanRowScales.get(activeCell ? activeCell.iy : 0) || cscanSharedScale)
+      : cscanSharedScale;
+
+    // Which population the PLAN VIEW is scaled from. Unlinked, it uses its own
+    // gated cell values, so the two panes' colour bars stop agreeing -- both
+    // say so on screen. The B-scan always keeps the bin-domain population; it
+    // draws bins, and there is nothing gated about them to scale within.
+    const unlinked = bscanScaleLink === 'independent' && !!cscanGridScales;
+    const cscanScaleGlobal = unlinked ? cscanGridScales.global : cscanSharedScale;
+    const cscanScaleRows = unlinked ? cscanGridScales.rows : cscanRowScales;
+
     return (
       <div className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
         {/* Live sweep range profile (top) — shown during a C-scan session */}
@@ -451,7 +472,10 @@ export default function Viewport({
                 sfcwProgress={sfcwProgress}
                 scaleMode={bscanScaleMode}
                 scaleRange={bscanScaleRange}
-                sharedScale={cscanSharedScale}
+                sharedScale={cscanScaleGlobal}
+                rowScales={cscanScaleRows}
+                scaleScope={bscanScaleScope}
+                scaleLink={bscanScaleLink}
                 subMode={bscanBgSubMode}
                 nextIndex={roverScan?.active ? roverScan.index : bscanData.length}
                 selectedCell={activeCell}
@@ -473,7 +497,10 @@ export default function Viewport({
                 scaleMode={bscanScaleMode}
                 displayMode={bscanDisplayMode}
                 scaleRange={bscanScaleRange}
-                sharedScale={cscanSharedScale}
+                sharedScale={bscanScale}
+                scaleScope={bscanScaleScope}
+                scaleLink={bscanScaleLink}
+                showGate={bscanShowGate}
                 subMode={bscanBgSubMode}
               />
               {rowData.length === 0 && (

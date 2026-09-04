@@ -13,7 +13,7 @@ function jet(t) {
   ];
 }
 
-function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, bgDisplay, scaleRange, sharedScale, subMode) {
+function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, bgDisplay, scaleRange, sharedScale, subMode, showGate, scaleScope, scaleLink) {
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
   const rect = canvas.getBoundingClientRect();
@@ -55,7 +55,9 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
   // to 70 cm against a displayed range of ~74 cm, which bought nothing and meant
   // the pane could silently hide the far end of the record. Depth SELECTION is
   // the Depth Slice gate's job, and that only governs the C-scan grid's colour;
-  // this pane exists to show where things actually are before you gate.
+  // this pane exists to show where things actually are before you gate. The
+  // gate markers below shade the excluded bins but never drop them -- the data
+  // outside the gate stays drawn, and stays clickable, deliberately.
   const startBin = 0;
   const endBin = allDistances.length - 1;
 
@@ -252,6 +254,75 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
 
   ctx.restore();
 
+  // ── Depth gate markers ───────────────────────────────────────────────────
+  //
+  // The gate lives on the C-scan panel and ALWAYS governs the plan view: the
+  // cell colour is gatedIntensity() over exactly these bins and nothing else.
+  // These markers are a placement aid only -- turning them off stops drawing
+  // them and changes nothing that is computed. That separation is deliberate;
+  // a display toggle that silently altered a measurement is the class of bug
+  // this panel has been bitten by before.
+  //
+  // The shaded region is the exact complement of the bins gatedIntensity()
+  // keeps, found the same way it finds them, so what is left bright is what the
+  // cell was actually built from -- not an approximation of it.
+  if (showGate) {
+    const gsM = (params.gateStart != null ? params.gateStart : 0) / 100;
+    const geM = (params.gateEnd != null ? params.gateEnd : 0) / 100;
+    let first = -1;
+    let last = -1;
+    for (let j = 0; j < numBins; j++) {
+      const d = distances[j];
+      if (d < gsM || d > geM) continue;
+      if (first < 0) first = j;
+      last = j;
+    }
+    const empty = first < 0;
+    const plotR = pad.left + plotW;
+    const xL = empty ? plotR : pad.left + first * cellW;
+    const xR = empty ? plotR : Math.min(plotR, pad.left + (last + 1) * cellW);
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(pad.left, pad.top, plotW, plotH);
+    ctx.clip();
+
+    ctx.fillStyle = 'rgba(0,0,0,0.70)';
+    if (xL > pad.left) ctx.fillRect(pad.left, pad.top, xL - pad.left, plotH);
+    if (xR < plotR) ctx.fillRect(xR, pad.top, plotR - xR, plotH);
+
+    if (!empty) {
+      ctx.strokeStyle = '#22d3ee';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 3]);
+      ctx.beginPath();
+      ctx.moveTo(xL, pad.top);
+      ctx.lineTo(xL, pad.top + plotH);
+      ctx.moveTo(xR, pad.top);
+      ctx.lineTo(xR, pad.top + plotH);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    ctx.restore();
+
+    ctx.fillStyle = '#22d3ee';
+    ctx.font = 'bold 9px monospace';
+    if (empty) {
+      ctx.textAlign = 'center';
+      ctx.fillText('GATE OUTSIDE THIS RECORD — no bins contribute',
+        pad.left + plotW / 2, pad.top + plotH / 2);
+    } else {
+      ctx.textAlign = 'left';
+      ctx.fillText(`${params.gateStart} cm`, Math.min(xL + 3, plotR - 44), pad.top + 10);
+      ctx.textAlign = 'right';
+      ctx.fillText(`${params.gateEnd} cm`, Math.max(xR - 3, pad.left + 44), pad.top + 10);
+      ctx.textAlign = 'center';
+      ctx.font = '8px monospace';
+      ctx.fillStyle = '#22d3ee99';
+      ctx.fillText(`GATE · ${last - first + 1} bins`, (xL + xR) / 2, pad.top + plotH - 4);
+    }
+  }
+
   // Grid overlay
   ctx.strokeStyle = GRID_COLOR;
   ctx.lineWidth = 0.5;
@@ -315,10 +386,18 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
   // Title
   const scaleLabel = isDiff ? 'Δ MAG dB' : useLinear ? 'LINEAR' : 'dB';
   const modeLabel = displayMode === 'color' ? 'COLOR' : 'PROFILE';
+  // The caller hands this pane whichever limits are in force; say which they
+  // are, so a colour that does not match the plan view's is explained.
+  const dyn = !(scaleRange && !scaleRange.dynamic);
+  const perRow = scaleScope === 'row' && dyn;
+  // Unlinked, the plan view is scaled to its own gated values and this pane is
+  // not -- so the two colour bars mean different things and both must say so.
+  const unlinked = scaleLink === 'independent' && dyn;
+  const tag = [perRow ? 'PER ROW' : null, unlinked ? 'UNLINKED' : null].filter(Boolean).join(' · ');
   ctx.fillStyle = '#6B9BD2';
   ctx.font = 'bold 10px monospace';
   ctx.textAlign = 'left';
-  ctx.fillText(`B-SCAN (${scaleLabel} / ${modeLabel})`, pad.left, 14);
+  ctx.fillText(`B-SCAN (${scaleLabel} / ${modeLabel})${tag ? ` · ${tag}` : ''}`, pad.left, 14);
 
   ctx.fillStyle = '#444444';
   ctx.font = '9px monospace';
@@ -396,7 +475,7 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
   }
 }
 
-export default function BscanDisplay({ scanData, bgDisplay, params, capturing, sfcwProgress, scaleMode, displayMode, scaleRange, sharedScale, subMode }) {
+export default function BscanDisplay({ scanData, bgDisplay, params, capturing, sfcwProgress, scaleMode, displayMode, scaleRange, sharedScale, subMode, showGate, scaleScope, scaleLink }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
   const [crosshair, setCrosshair] = useState(null);
@@ -412,12 +491,12 @@ export default function BscanDisplay({ scanData, bgDisplay, params, capturing, s
   // whole path was removed (2026-08-30).
   useEffect(() => {
     const render = () => {
-      drawBscan(canvasRef.current, scanData, params, crosshair, isLinear, mode, bgDisplay, scaleRange, sharedScale, subMode);
+      drawBscan(canvasRef.current, scanData, params, crosshair, isLinear, mode, bgDisplay, scaleRange, sharedScale, subMode, showGate, scaleScope, scaleLink);
       animRef.current = requestAnimationFrame(render);
     };
     animRef.current = requestAnimationFrame(render);
     return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
-  }, [scanData, params, crosshair, isLinear, mode, bgDisplay, scaleRange, sharedScale, subMode]);
+  }, [scanData, params, crosshair, isLinear, mode, bgDisplay, scaleRange, sharedScale, subMode, showGate, scaleScope, scaleLink]);
 
   return (
     <div className="flex flex-col w-full h-full">

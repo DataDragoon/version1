@@ -98,6 +98,14 @@ export default function Sidebar({
   bscanDisplayMode,
   onBscanDisplayModeChange,
   bscanScaleRange,
+  bscanScaleScope,
+  onBscanScaleScopeChange,
+  bscanShowGate,
+  onBscanShowGateChange,
+  bscanScaleLink,
+  onBscanScaleLinkChange,
+  cscanRowScales,
+  cscanGridScales,
   onBscanScaleRangeChange,
   sarBscanData,
   sarResult,
@@ -392,6 +400,14 @@ export default function Sidebar({
                   onDisplayModeChange={onBscanDisplayModeChange}
                   scaleRange={bscanScaleRange}
                   onScaleRangeChange={onBscanScaleRangeChange}
+                  scaleScope={bscanScaleScope}
+                  onScaleScopeChange={onBscanScaleScopeChange}
+                  rowScales={cscanRowScales}
+                  gridScales={cscanGridScales}
+                  scaleLink={bscanScaleLink}
+                  onScaleLinkChange={onBscanScaleLinkChange}
+                  showGate={bscanShowGate}
+                  onShowGateChange={onBscanShowGateChange}
                   lidarMm={lidarMm}
                   lidarOffsetMm={lidarOffsetMm}
                   bgRef={bscanBgRef}

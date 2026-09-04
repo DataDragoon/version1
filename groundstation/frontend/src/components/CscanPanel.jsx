@@ -22,6 +22,8 @@ export default function CscanPanel({
   bgSubMode, onBgSubModeChange,
   superFit, onCaptureSuperFit, onClearSuperFit,
   sharedScale, bgDiag, procParams, captureProgress,
+  scaleScope, onScaleScopeChange, rowScales, showGate, onShowGateChange,
+  scaleLink, onScaleLinkChange, gridScales,
   roverConnected, roverStatus, sendRover, roverScan,
 }) {
   const {
@@ -157,6 +159,29 @@ export default function CscanPanel({
     const p0 = scanData.find(p => p && p.distances && p.distances.length);
     if (!p0) return 100;
     return Math.ceil(p0.distances[p0.distances.length - 1] * 100);
+  })();
+
+  // How far apart the per-row limits are: the number that says whether per-row
+  // scaling is buying anything. A big spread means one row was setting the
+  // global limits for all of them.
+  const unlinked = scaleLink === 'independent';
+  // What the PLAN VIEW is actually drawn from, so the tiles below describe the
+  // image rather than the population it was linked to before the toggle.
+  const gridGlobal = unlinked && gridScales ? gridScales.global : sharedScale;
+  const gridRows = unlinked && gridScales ? gridScales.rows : rowScales;
+
+  const rowSpreadLabel = (() => {
+    const rowScales = gridRows;
+    if (!rowScales || rowScales.size === 0) return '—';
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const r of rowScales.values()) {
+      if (!isFinite(r.max)) continue;
+      if (r.max < lo) lo = r.max;
+      if (r.max > hi) hi = r.max;
+    }
+    if (!isFinite(lo) || !isFinite(hi)) return '—';
+    return `${(hi - lo).toFixed(1)} dB`;
   })();
 
   const isDiff = bgSubMode === 'magnitude';
@@ -695,6 +720,26 @@ export default function CscanPanel({
             </button>
           ))}
         </div>
+
+        {/* A placement aid, and nothing more. The gate always decides the plan
+            view's cell values -- gatedIntensity() sums exactly the bins inside
+            it -- whether or not the markers are drawn. */}
+        <button
+          onClick={() => onShowGateChange(!showGate)}
+          className={cn(
+            'w-full px-3 py-2 rounded-lg text-xs font-medium transition-all border',
+            showGate
+              ? 'bg-[#22d3ee]/10 border-[#22d3ee]/30 text-[#22d3ee]'
+              : 'bg-white/5 border-white/10 text-white/50 hover:text-white/80',
+          )}
+        >
+          {showGate ? '● Gate markers on B-scan' : 'Gate markers hidden'}
+        </button>
+        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
+          {showGate
+            ? 'Two cyan lines on the B-scan mark the gate edges and everything outside them is dimmed — what stays bright is exactly the bins each plan-view cell is built from. Drag the sliders and watch it move.'
+            : 'Markers hidden. The gate still decides every plan-view cell value — this toggle only stops drawing it.'}
+        </div>
       </Section>
 
       <Section label="Display">
@@ -714,8 +759,9 @@ export default function CscanPanel({
         </div>
         <div className="px-2 text-[9px] text-white/40 leading-relaxed">
           The B-scan pane draws the whole record — {depthLimitCm} cm at the current
-          step size. Use the Depth Slice gate above to choose what the plan view
-          colours by; it does not hide anything on the right.
+          step size, gate or no gate. The Depth Slice gate chooses what the plan
+          view colours by; on the right it only shades the excluded bins, and
+          the data under the shading is still drawn and still readable.
         </div>
 
         {/* Mirrors the Live Sweep pane's controls bar, which is where they are
@@ -785,18 +831,104 @@ export default function CscanPanel({
           disabled={scaleRange.dynamic}
           onChange={(v) => onScaleRangeChange({ ...scaleRange, max: Math.max(v, scaleRange.min + 1) })}
         />
-        {sharedScale && scaleRange.dynamic && (
+        {/* Do the two panes share one scale? Linked is the guarantee: a colour
+            means one dB in the plan view and in the B-scan, because both are
+            drawn from every bin of every valid cell. That population ignores
+            the gate, so narrowing the gate onto a quiet depth leaves the cells
+            in the bottom of a range still set by the wall and the grid goes
+            dark. Unlinked scales the grid within its own GATED values, which
+            is the only way to keep contrast there -- and gives up the
+            guarantee, so both panes are labelled when it is on. */}
+        <div className="flex gap-2">
+          {[
+            { id: 'linked', label: 'Linked', hint: 'One scale, both panes' },
+            { id: 'independent', label: 'Grid: own scale', hint: 'Scales within the gate' },
+          ].map((m) => (
+            <button
+              key={m.id}
+              onClick={() => onScaleLinkChange(m.id)}
+              disabled={!scaleRange.dynamic}
+              className={cn(
+                'flex-1 flex flex-col gap-0.5 px-3 py-2 rounded-lg border text-left transition-all',
+                !scaleRange.dynamic
+                  ? 'bg-white/5 border-white/10 text-white/25 cursor-not-allowed'
+                  : scaleLink === m.id
+                    ? (m.id === 'independent'
+                      ? 'bg-[#f59e0b]/10 border-[#f59e0b]/30 text-[#f59e0b]'
+                      : 'bg-[#6B9BD2]/10 border-[#6B9BD2]/30 text-[#6B9BD2]')
+                    : 'bg-white/5 border-white/10 text-white/50 hover:text-white/80',
+              )}
+            >
+              <span className="text-xs font-semibold">{m.label}</span>
+              <span className="text-[9px] leading-tight opacity-70">{m.hint}</span>
+            </button>
+          ))}
+        </div>
+        {scaleRange.dynamic && unlinked && (
+          <div className="px-2 py-1.5 rounded-lg bg-[#f59e0b]/5 border border-[#f59e0b]/30 text-[9px] text-[#f59e0b] leading-relaxed">
+            The plan view is scaled to its own gated cell values — the same colour
+            means a different dB in the two panes. Both are marked on screen
+            (OWN SCALE · GATED on the grid, UNLINKED on the B-scan). Compare cells
+            to cells here, not cells to bins.
+          </div>
+        )}
+
+        {/* What population a DYNAMIC scale is drawn from. Global is the honest
+            one -- a colour means one dB everywhere, so cells are comparable
+            across the whole grid. Per-row gives that up to get contrast back:
+            on a wall whose standoff varies row to row the loudest row otherwise
+            sets the limits and crushes the rest. Neither is a better version of
+            the other. Manual pinning overrides both, so it is disabled there. */}
+        <div className="flex gap-2">
+          {[
+            { id: 'global', label: 'Global', hint: 'One scale, whole grid' },
+            { id: 'row', label: 'Per row', hint: 'Each row scaled to itself' },
+          ].map((m) => (
+            <button
+              key={m.id}
+              onClick={() => onScaleScopeChange(m.id)}
+              disabled={!scaleRange.dynamic}
+              className={cn(
+                'flex-1 flex flex-col gap-0.5 px-3 py-2 rounded-lg border text-left transition-all',
+                !scaleRange.dynamic
+                  ? 'bg-white/5 border-white/10 text-white/25 cursor-not-allowed'
+                  : scaleScope === m.id
+                    ? 'bg-[#6B9BD2]/10 border-[#6B9BD2]/30 text-[#6B9BD2]'
+                    : 'bg-white/5 border-white/10 text-white/50 hover:text-white/80',
+              )}
+            >
+              <span className="text-xs font-semibold">{m.label}</span>
+              <span className="text-[9px] leading-tight opacity-70">{m.hint}</span>
+            </button>
+          ))}
+        </div>
+        {gridGlobal && scaleRange.dynamic && scaleScope !== 'row' && (
           <div className="grid grid-cols-2 gap-2">
-            <InfoTile label="Scale low" value={`${sharedScale.min.toFixed(1)} dB`} />
-            <InfoTile label="Scale high" value={`${sharedScale.max.toFixed(1)} dB`} />
+            <InfoTile label={unlinked ? 'Grid low' : 'Scale low'} value={`${gridGlobal.min.toFixed(1)} dB`} />
+            <InfoTile label={unlinked ? 'Grid high' : 'Scale high'} value={`${gridGlobal.max.toFixed(1)} dB`} />
+          </div>
+        )}
+        {scaleRange.dynamic && scaleScope === 'row' && (
+          <div className="grid grid-cols-2 gap-2">
+            <InfoTile label="Rows scaled" value={gridRows ? `${gridRows.size}` : '—'} />
+            <InfoTile
+              label="Row spread"
+              value={rowSpreadLabel}
+            />
           </div>
         )}
         <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          {scaleRange.dynamic
-            ? 'One scale for both panes, from every bin of every valid cell in the grid (1st–99.9th percentile, so a single interference null cannot flatten the image). A colour means the same dB in the plan view and in the B-scan.'
-            : 'Colour limits pinned — both the C-scan and B-scan panes update live.'}
+          {!scaleRange.dynamic
+            ? 'Colour limits pinned — both the C-scan and B-scan panes update live.'
+            : unlinked
+              ? (scaleScope === 'row'
+                ? 'Each grid row is scaled to its own gated cell values, and the B-scan keeps the bin-domain scale. Contrast where you need it; no colour agrees with any other pane or row.'
+                : 'The grid is scaled to its own gated cell values, so it follows the Depth Slice gate. The B-scan keeps the bin-domain scale, so the two colour bars no longer agree.')
+              : scaleScope === 'row'
+                ? 'Each grid row gets its own limits, from every bin of that row (1st–99.9th percentile). Contrast within a row, but a colour no longer means the same dB in different rows — the colour bar shows the selected row and is marked PER ROW.'
+                : 'One scale for both panes, from every bin of every valid cell in the grid (1st–99.9th percentile, so a single interference null cannot flatten the image). A colour means the same dB in the plan view and in the B-scan.'}
         </div>
-        {sharedScale && sharedScale.degenerate && scaleRange.dynamic && (
+        {gridGlobal && gridGlobal.degenerate && scaleRange.dynamic && (
           <div className="px-2 py-1.5 rounded-lg bg-[#f59e0b]/5 border border-[#f59e0b]/30 text-[9px] text-[#f59e0b] leading-relaxed">
             Every bin has the same value — there is nothing to scale. Expected right
             after a Super Fit capture, where the grid is being subtracted from itself.

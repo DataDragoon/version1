@@ -186,20 +186,23 @@ export function buildCscanGrid(scanData, params) {
 const SCALE_P_LO = 0.01;
 const SCALE_P_HI = 0.999;
 
-export function computeSharedScale(scanData) {
-  const vals = [];
-
-  for (const pos of scanData) {
-    if (!pos || !pos.magnitudes || !pos.distances) continue;
-    if (bgFailed(pos.bg_status)) continue;
-    const mags = pos.magnitudes;
-    const dists = pos.distances;
-    for (let i = 0; i < mags.length && i < dists.length; i++) {
-      const v = mags[i];
-      if (isFinite(v)) vals.push(v);
-    }
+// Every bin of one cell that is allowed to vote on a colour scale. A cell whose
+// background failed is excluded -- it is un-subtracted and would set the top of
+// the scale on its own.
+function pushCellValues(pos, out) {
+  if (!pos || !pos.magnitudes || !pos.distances) return;
+  if (bgFailed(pos.bg_status)) return;
+  const mags = pos.magnitudes;
+  const dists = pos.distances;
+  for (let i = 0; i < mags.length && i < dists.length; i++) {
+    const v = mags[i];
+    if (isFinite(v)) out.push(v);
   }
+}
 
+// Percentile limits from an already-collected population of dB values. Sorts in
+// place, so hand it a scratch array.
+function limitsFrom(vals) {
   if (vals.length === 0) return { min: -90, max: -20, n: 0, degenerate: true };
 
   vals.sort((a, b) => a - b);
@@ -219,6 +222,81 @@ export function computeSharedScale(scanData) {
     max = mid + 0.5;
   }
   return { min, max, n: vals.length, degenerate };
+}
+
+export function computeSharedScale(scanData) {
+  const vals = [];
+  for (const pos of scanData) pushCellValues(pos, vals);
+  return limitsFrom(vals);
+}
+
+// PER-ROW colour limits: the same percentile treatment, but with the population
+// restricted to one grid row. Keyed by grid_iy, so it survives either capture
+// order (the hand snake climbs from the bottom-left, the rover snake descends
+// from the top-left, and both write the same indices).
+//
+// Why it exists: the global scale is the honest one -- a colour means one dB
+// everywhere -- but on a wall whose standoff varies row to row the wall return
+// itself sets the limits, and every row but the loudest is crushed into the
+// bottom of the colormap. Scoping to a row gives up cross-row comparability to
+// get contrast back inside each one. Both are useful; neither is a better
+// version of the other, which is why it is a toggle rather than a replacement.
+//
+// Data with no grid indices (an imported linear scan) all lands in row 0, so
+// per-row is identical to global there.
+export function computeRowScales(scanData) {
+  const byRow = new Map();
+  for (const pos of scanData) {
+    if (!pos) continue;
+    const iy = pos.grid_iy != null ? pos.grid_iy : 0;
+    let vals = byRow.get(iy);
+    if (!vals) { vals = []; byRow.set(iy, vals); }
+    pushCellValues(pos, vals);
+  }
+  const out = new Map();
+  for (const [iy, vals] of byRow) out.set(iy, limitsFrom(vals));
+  return out;
+}
+
+// UNLINKED colour limits for the plan view: the population is the GATED CELL
+// VALUES -- the scalars the grid actually draws -- rather than every bin of
+// every profile.
+//
+// The difference is the whole point of the toggle. The linked scale is built
+// from all bins, gate or no gate, so narrowing the gate onto a quiet depth does
+// not move it: the cells all drop into the bottom of a range still set by the
+// wall return, and the grid goes near-uniformly dark exactly when it is finally
+// being asked the interesting question. Scaling the grid within its own gated
+// values restores the contrast, at the cost of the guarantee the linked scale
+// exists to provide -- a colour then means one dB in the plan view and a
+// different dB in the B-scan beside it, so both panes flag it.
+//
+// Returns global and per-row limits together, because the two scope choices
+// need the same population and it is one pass either way. Cells with no bin
+// inside the gate are skipped, not floored: they are drawn as "gated out" in
+// their own colour and have no value to contribute.
+export function computeGridScales(scanData, params) {
+  const gateStartM = params.gateStart / 100;
+  const gateEndM = params.gateEnd / 100;
+  const { metric } = params;
+  const all = [];
+  const byRow = new Map();
+
+  for (const pos of scanData) {
+    if (!pos || !pos.magnitudes || !pos.distances) continue;
+    if (bgFailed(pos.bg_status)) continue;
+    const v = gatedIntensity(pos.magnitudes, pos.distances, gateStartM, gateEndM, metric);
+    if (!isFinite(v)) continue;
+    all.push(v);
+    const iy = pos.grid_iy != null ? pos.grid_iy : 0;
+    let vals = byRow.get(iy);
+    if (!vals) { vals = []; byRow.set(iy, vals); }
+    vals.push(v);
+  }
+
+  const rows = new Map();
+  for (const [iy, vals] of byRow) rows.set(iy, limitsFrom(vals));
+  return { global: limitsFrom(all), rows };
 }
 
 // Roll the per-cell background statuses up into something the panel can show.

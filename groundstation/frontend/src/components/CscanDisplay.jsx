@@ -69,7 +69,7 @@ function snakeOrderOf(cell, hCount) {
   return cell.iy * hCount + (cell.iy % 2 === 0 ? cell.ix : hCount - 1 - cell.ix) + 1;
 }
 
-function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode) {
+function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink) {
   if (!canvas) return;
   const ctx = canvas.getContext('2d');
   const rect = canvas.getBoundingClientRect();
@@ -89,38 +89,63 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   const grid = buildCscanGrid(scanData, params);
   const total = grid.hCount * grid.vCount;
 
-  // Colour limits. Dynamic now comes from the SHARED scale computed over the
-  // whole grid (every bin of every valid cell, percentile-clipped), not from
-  // this grid's own gated min/max -- so the colour bar here and the one on the
+  // Colour limits. Dynamic comes from the SHARED scale computed over the whole
+  // grid (every bin of every valid cell, percentile-clipped), not from this
+  // grid's own gated min/max -- so the colour bar here and the one on the
   // B-scan pane mean the same dB, and a full min/max stretch of a flat residual
   // field no longer manufactures rainbow structure out of noise.
-  let dbMin;
-  let dbMax;
-  if (scaleRange && !scaleRange.dynamic) {
-    dbMin = scaleRange.min;
-    dbMax = scaleRange.max;
+  //
+  // The caller decides WHICH population these are drawn from -- every bin of
+  // every cell (linked, so a colour means the same dB here and on the B-scan),
+  // or this grid's own gated cell values (unlinked, which follows the gate and
+  // is the only way to keep contrast when the gate is narrowed onto a quiet
+  // depth). Either way the arithmetic below is the same; only the label changes.
+  //
+  // scaleScope === 'row' narrows that population to each cell's OWN grid row.
+  // A colour then means a different dB in different rows -- which is the whole
+  // point on a wall whose standoff varies row to row, where the loudest row
+  // would otherwise set the limits and crush every other one -- so the colour
+  // bar says so and shows the SELECTED row's limits rather than pretending to
+  // describe the image. Manual scaling still overrides both.
+  const manual = !!(scaleRange && !scaleRange.dynamic);
+  const spread = (lo, hi) => (hi - lo < 1 ? { min: lo - 0.5, max: hi + 0.5 } : { min: lo, max: hi });
+
+  let globalLim;
+  if (manual) {
+    globalLim = spread(scaleRange.min, scaleRange.max);
   } else if (sharedScale && isFinite(sharedScale.min) && isFinite(sharedScale.max)) {
-    dbMin = sharedScale.min;
-    dbMax = sharedScale.max;
+    globalLim = spread(sharedScale.min, sharedScale.max);
   } else if (isFinite(grid.min) && isFinite(grid.max)) {
-    dbMin = grid.min;
-    dbMax = grid.max;
+    globalLim = spread(grid.min, grid.max);
   } else {
-    dbMin = -90;
-    dbMax = -20;
+    globalLim = { min: -90, max: -20 };
   }
-  if (dbMax - dbMin < 1) { dbMin -= 0.5; dbMax += 0.5; }
+
+  const perRow = !manual && scaleScope === 'row' && rowScales && rowScales.size > 0;
+  const rowLimCache = new Map();
+  const limitsFor = (iy) => {
+    if (!perRow) return globalLim;
+    if (rowLimCache.has(iy)) return rowLimCache.get(iy);
+    const s = rowScales.get(iy);
+    const lim = (s && isFinite(s.min) && isFinite(s.max)) ? spread(s.min, s.max) : globalLim;
+    rowLimCache.set(iy, lim);
+    return lim;
+  };
+
   // A magnitude difference is a dB RATIO centred on zero, not an absolute
   // level, so the linear warp (which maps 10^(db/20), an amplitude) is
   // meaningless on it and is bypassed.
   const isDiff = subMode === 'magnitude';
   const useLinear = isLinear && !isDiff;
-  const linMin = Math.pow(10, dbMin / 20);
-  const linMax = Math.pow(10, dbMax / 20);
 
-  const norm = (db) => (useLinear
-    ? (Math.pow(10, db / 20) - linMin) / (linMax - linMin)
-    : (db - dbMin) / (dbMax - dbMin));
+  const norm = (db, lim) => {
+    if (useLinear) {
+      const lo = Math.pow(10, lim.min / 20);
+      const hi = Math.pow(10, lim.max / 20);
+      return (Math.pow(10, db / 20) - lo) / (hi - lo);
+    }
+    return (db - lim.min) / (lim.max - lim.min);
+  };
 
   // Cells
   for (let iy = 0; iy < grid.vCount; iy++) {
@@ -142,7 +167,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
         ctx.lineTo(r.x + inset, r.y + r.h - inset);
         ctx.stroke();
       } else if (cell && isFinite(cell.value)) {
-        const [cr, cg, cb] = jet(norm(cell.value));
+        const [cr, cg, cb] = jet(norm(cell.value, limitsFor(iy)));
         ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
         ctx.fillRect(r.x, r.y, Math.ceil(r.w) + 0.5, Math.ceil(r.h) + 0.5);
         // The model was applied but clamped to the edge of its captured span.
@@ -274,8 +299,13 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   ctx.textAlign = 'right';
   ctx.fillText(`${grid.filled} / ${total} cells`, w - L.pad.right, 14);
 
-  // Colour bar
-  const manual = !!(scaleRange && !scaleRange.dynamic);
+  // Colour bar. Under per-row scaling there is no single range that describes
+  // the image, so it shows the SELECTED row's -- the one the B-scan pane beside
+  // it is drawn with -- and is labelled PER ROW so it is not read as global.
+  const unlinked = !manual && scaleLink === 'independent';
+  const barLim = perRow ? limitsFor(selected ? selected.iy : 0) : globalLim;
+  const dbMin = barLim.min;
+  const dbMax = barLim.max;
   const barW = 12;
   const barH = L.plotH;
   const barX = w - L.pad.right + 16;
@@ -285,10 +315,11 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
     ctx.fillStyle = `rgb(${r},${g},${b})`;
     ctx.fillRect(barX, barY + i, barW, 1);
   }
-  ctx.strokeStyle = manual ? '#f59e0b' : '#2a2a2a';
+  const flagged = manual || unlinked;
+  ctx.strokeStyle = flagged ? '#f59e0b' : perRow ? '#22d3ee' : '#2a2a2a';
   ctx.lineWidth = 1;
   ctx.strokeRect(barX - 0.5, barY - 0.5, barW + 1, barH + 1);
-  ctx.fillStyle = manual ? '#f59e0b' : '#555555';
+  ctx.fillStyle = flagged ? '#f59e0b' : perRow ? '#22d3ee' : '#555555';
   ctx.font = '8px monospace';
   ctx.textAlign = 'left';
   const barFmt = (v) => (isDiff ? `${v >= 0 ? '+' : ''}${v.toFixed(1)} dB` : `${v.toFixed(0)} dB`);
@@ -306,12 +337,18 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
     ctx.lineTo(barX + barW, zy);
     ctx.stroke();
   }
-  if (manual) {
+  // Anything but the plain shared scale is named, because every one of these
+  // means a colour here is not a colour on the B-scan beside it.
+  const tag = manual ? 'MANUAL' : [
+    unlinked ? 'OWN SCALE · GATED' : null,
+    perRow ? `PER ROW ${(selected ? selected.iy : 0) + 1}` : null,
+  ].filter(Boolean).join(' · ');
+  if (tag) {
     ctx.save();
     ctx.translate(barX + barW + 11, barY + barH / 2);
     ctx.rotate(Math.PI / 2);
     ctx.textAlign = 'center';
-    ctx.fillText('MANUAL', 0, 0);
+    ctx.fillText(tag, 0, 0);
     ctx.restore();
   }
 
@@ -353,6 +390,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
 export default function CscanDisplay({
   scanData, params, capturing, sfcwProgress, scaleMode, scaleRange,
   nextIndex, selectedCell, onSelectCell, scanMode, sharedScale, subMode,
+  rowScales, scaleScope, scaleLink,
 }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
@@ -365,12 +403,12 @@ export default function CscanDisplay({
       if (start === null) start = t;
       // Breathing highlight on the next target cell, only while a capture is pending.
       const pulse = capturing ? 0.5 + 0.5 * Math.sin((t - start) / 180) : 0;
-      drawCscan(canvasRef.current, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode);
+      drawCscan(canvasRef.current, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink);
       animRef.current = requestAnimationFrame(render);
     };
     animRef.current = requestAnimationFrame(render);
     return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
-  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode]);
+  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink]);
 
   const pick = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
