@@ -8,8 +8,19 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
   // How many cells carry a lidar standoff. The back-projection uses each cell's own
   // value; cells without one fall back to zero, so a partially-instrumented scan is
   // silently mixing two conventions and the operator should be able to see that.
+  //
+  // NOTE the standoffN === 0 case used to fall through both tests and show NOTHING,
+  // which is the worst of the three: a scan with no lidar at all reconstructs with
+  // every antenna assumed to be flat against the wall, and that is precisely the case
+  // the per-position standoff correction exists for. It is not hypothetical -- the
+  // 3row* sets and 2_pipe_test2 are all lidar-less.
   const standoffN = sarResult ? sarResult.standoffN : null;
   const standoffPartial = standoffN !== null && standoffN > 0 && standoffN < numPositions;
+  const standoffNone = standoffN === 0 && numPositions > 0;
+
+  // The worker falls back to the incoherent path when the data carries no h_cal, and
+  // the Mode buttons would otherwise keep claiming Coherent.
+  const coherentDowngraded = coherent && sarResult && sarResult.coherent === false;
 
   return (
     <>
@@ -196,6 +207,18 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
             treated as zero standoff.
           </div>
         )}
+        {standoffNone && (
+          <div className="px-1 text-[9px] text-amber-400/80 leading-relaxed">
+            No lidar standoff on any cell — every antenna position is assumed flat
+            against the wall. Uncorrected, focus needs the standoff stable to ~3 mm.
+          </div>
+        )}
+        {coherentDowngraded && (
+          <div className="px-1 text-[9px] text-amber-400/80 leading-relaxed">
+            Coherent is selected but this scan carries no h_cal — reconstructed
+            incoherently, so there is no coherence pane and no layered ray.
+          </div>
+        )}
         {sarResult && sarResult.depthClipped && (
           <div className="px-1 text-[9px] text-amber-400/80 leading-relaxed">
             Max Depth clipped to {(sarResult.depthMax * 100).toFixed(1)} cm — the sweep
@@ -254,6 +277,8 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
           >
             <option value="inferno" className="bg-[#0a0a0a]">inferno</option>
             <option value="viridis" className="bg-[#0a0a0a]">viridis</option>
+            <option value="turbo" className="bg-[#0a0a0a]">turbo</option>
+            <option value="grey" className="bg-[#0a0a0a]">grey</option>
             <option value="jet" className="bg-[#0a0a0a]">jet</option>
           </select>
           {/* Coherence is deliberately excluded -- it holds its own ramp so the two
@@ -284,23 +309,40 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
             Linear
           </button>
         </div>
-        <div className="flex flex-col gap-1">
+        {/* Read by the INCOHERENT path only -- the coherent back-projection sums every
+            position and has no aperture limit. It used to render live in both modes and
+            do nothing in the default one; disabled rather than removed, since incoherent
+            mode genuinely needs it. */}
+        <div className={cn('flex flex-col gap-1', coherent && 'opacity-40')}>
           <div className="flex items-center justify-between">
-            <span className="text-[10px] uppercase tracking-wider text-[#555555] font-medium">Nearby positions</span>
-            <span className="text-[10px] font-mono text-white/60">{aperture}</span>
+            <span className="text-[10px] uppercase tracking-wider text-[#555555] font-medium">
+              Nearby positions
+            </span>
+            <span className="text-[10px] font-mono text-white/60">
+              {coherent ? 'all' : aperture}
+            </span>
           </div>
           <input
             type="range"
             min={1}
             max={Math.max(1, numPositions - 1)}
             value={aperture}
+            disabled={coherent}
             onChange={(e) => onApertureChange(parseInt(e.target.value))}
-            className="w-full h-1 rounded-full appearance-none bg-white/10 accent-emerald-500 cursor-pointer"
+            className={cn(
+              'w-full h-1 rounded-full appearance-none bg-white/10 accent-emerald-500',
+              coherent ? 'cursor-not-allowed' : 'cursor-pointer',
+            )}
           />
           <div className="flex justify-between text-[9px] font-mono text-white/30">
             <span>1</span>
             <span>{Math.max(1, numPositions - 1)}</span>
           </div>
+          {coherent && (
+            <span className="text-[9px] text-[#555555]">
+              Incoherent mode only — coherent SAR uses the full aperture.
+            </span>
+          )}
         </div>
         <div className="flex flex-col gap-1">
           <div className="flex items-center justify-between">

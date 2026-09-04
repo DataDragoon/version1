@@ -196,6 +196,17 @@ export default function App() {
   const sfcwParamsRef = useRef(sfcwParams);
   sfcwParamsRef.current = sfcwParams;
 
+  // The ONLY two fields applyBscanBg reads out of sfcwParams (its freqGrid call).
+  // Passing the whole object made every C-scan/SAR record re-derive -- and, through
+  // sarBscanInput, restart the SAR worker -- whenever an unrelated field changed, so
+  // nudging TX1 gain or Settle in the SFCW panel threw away and recomputed the entire
+  // reconstruction. Provably behaviour-identical: nothing else in bscanBg.js touches
+  // sfcwParams.
+  const sfcwFreqParams = useMemo(
+    () => ({ startFreq: sfcwParams.startFreq, stopFreq: sfcwParams.stopFreq }),
+    [sfcwParams.startFreq, sfcwParams.stopFreq],
+  );
+
   // How the background is removed. NOTE a complex/magnitude toggle was deliberately
   // deleted here once before, on the reasoning that complex was the only correct mode --
   // do not delete it again. The 2026-08-28 target A/B established that the two modes do
@@ -542,8 +553,8 @@ export default function App() {
   // This is the COMPLEX-mode result, and it is what SAR and the 2D Map read --
   // SAR reconstructs from h_cal, which a magnitude difference cannot express.
   const processedBscanData = useMemo(
-    () => applyBscanBg(bscanData, { enabled: bgApplied, ...bscanBgSource, mode: 'complex', ...bscanProcParams }, sfcwParams),
-    [bscanData, bscanBgSource, bgApplied, sfcwParams, bscanProcParams],
+    () => applyBscanBg(bscanData, { enabled: bgApplied, ...bscanBgSource, mode: 'complex', ...bscanProcParams }, sfcwFreqParams),
+    [bscanData, bscanBgSource, bgApplied, sfcwFreqParams, bscanProcParams],
   );
 
   // What the C-scan and B-scan panes draw. Identical to the above in complex
@@ -551,9 +562,9 @@ export default function App() {
   // magnitude mode.
   const cscanProcessedData = useMemo(
     () => (bscanBgSubMode === 'magnitude'
-      ? applyBscanBg(bscanData, { enabled: bgApplied, ...bscanBgSource, mode: 'magnitude', ...bscanProcParams }, sfcwParams)
+      ? applyBscanBg(bscanData, { enabled: bgApplied, ...bscanBgSource, mode: 'magnitude', ...bscanProcParams }, sfcwFreqParams)
       : processedBscanData),
-    [bscanBgSubMode, bscanData, bscanBgSource, bgApplied, sfcwParams, processedBscanData, bscanProcParams],
+    [bscanBgSubMode, bscanData, bscanBgSource, bgApplied, sfcwFreqParams, processedBscanData, bscanProcParams],
   );
 
   // ONE colour scale for both panes, computed over the whole grid. See
@@ -621,19 +632,65 @@ export default function App() {
   const [sarColormap, setSarColormap] = useState('inferno');
 
   const sarProcessedData = useMemo(
-    () => applyBscanBg(bscanData, { enabled: sarBgEnabled, ...bscanBgSource }, sfcwParams),
-    [bscanData, bscanBgSource, sarBgEnabled, sfcwParams],
+    () => applyBscanBg(bscanData, { enabled: sarBgEnabled, ...bscanBgSource }, sfcwFreqParams),
+    [bscanData, bscanBgSource, sarBgEnabled, sfcwFreqParams],
   );
 
+  // svdFilter works on `magnitudes`, which ONLY the worker's incoherent path reads --
+  // the coherent path rebuilds its profiles from h_cal and runs its own complex SVD
+  // there. Running it in coherent mode was a full main-thread power iteration over
+  // (positions x bins) on every SVD slider move whose result was then discarded.
   const sarBscanInput = useMemo(() => {
-    if (!sarSvdEnabled || sarProcessedData.length < 2) return sarProcessedData;
+    if (!sarSvdEnabled || sarCoherent || sarProcessedData.length < 2) return sarProcessedData;
     return svdFilter(sarProcessedData, sarSvdK, sarSvdStrength);
-  }, [sarProcessedData, sarSvdEnabled, sarSvdK, sarSvdStrength]);
+  }, [sarProcessedData, sarSvdEnabled, sarCoherent, sarSvdK, sarSvdStrength]);
 
   // SAR and the 2D Map are one-dimensional: they read the horizontal step as the
   // aperture spacing and treat the capture sequence as a line.
-  const sarParams = useMemo(() => ({ ...bscanParams, maxDepth: sarMaxDepth, stepSize: bscanParams.hStep, aperture: sarAperture, coherent: sarCoherent, startFreq: sfcwParams.startFreq, svdEnabled: sarSvdEnabled, svdK: sarSvdK, svdStrength: sarSvdStrength, epsilonR: sarEpsilonR, windowType: sarWindowType, wallThickness: sarWallThickness, refraction: sarRefraction }), [bscanParams, sarMaxDepth, sarAperture, sarCoherent, sfcwParams.startFreq, sarSvdEnabled, sarSvdK, sarSvdStrength, sarEpsilonR, sarWindowType, sarWallThickness, sarRefraction]);
+  //
+  // Listed field by field rather than spread from bscanParams, deliberately. The spread
+  // dragged in gateStart/gateEnd/metric/scanMode/roverOrigin*/roverSettleMs -- none of
+  // which the worker reads -- and useSarWorker keys its debounce on this object, so
+  // dragging the C-scan depth-slice gate, or the rover origin fields DURING a raster,
+  // terminated and restarted the reconstruction.
+  const sarParams = useMemo(() => ({
+    stepSize: bscanParams.hStep,
+    maxDepth: sarMaxDepth,
+    aperture: sarAperture,
+    coherent: sarCoherent,
+    startFreq: sfcwParams.startFreq,
+    svdEnabled: sarSvdEnabled,
+    svdK: sarSvdK,
+    svdStrength: sarSvdStrength,
+    epsilonR: sarEpsilonR,
+    windowType: sarWindowType,
+    // The panel's third window option is labelled "Kaiser B3"; passed explicitly so it
+    // is the label's value rather than the worker's fallback for a missing field.
+    kaiserBeta: 3,
+    wallThickness: sarWallThickness,
+    refraction: sarRefraction,
+  }), [bscanParams.hStep, sarMaxDepth, sarAperture, sarCoherent, sfcwParams.startFreq, sarSvdEnabled, sarSvdK, sarSvdStrength, sarEpsilonR, sarWindowType, sarWallThickness, sarRefraction]);
   const { sarResult, sarProgress } = useSarWorker(sarBscanInput, sarParams);
+
+  // Max Depth auto-fit. The field is TRUE depth below the wall face, so the 70 cm
+  // default asks for standoff + sqrt(4.5)*0.70 = ~157 cm of apparent range against a
+  // sweep that reaches ~74 cm -- the "clipped" warning was therefore lit permanently at
+  // defaults and carried no signal at all. Seed it once from the reconstruction's own
+  // reachable depth, which adapts to the record AND to the current epsilon_r, then get
+  // out of the way: any manual edit disarms it until the next import.
+  const sarDepthAutoFitRef = useRef(true);
+  useEffect(() => {
+    if (!sarDepthAutoFitRef.current) return;
+    if (!sarResult || !sarResult.depthClipped) return;
+    sarDepthAutoFitRef.current = false;
+    // Floored, so the value it lands on cannot itself re-trip the clip.
+    setSarMaxDepth(Math.max(1, Math.floor(sarResult.depthMax * 100)));
+  }, [sarResult]);
+
+  const handleSarMaxDepthChange = useCallback((v) => {
+    sarDepthAutoFitRef.current = false;
+    setSarMaxDepth(v);
+  }, []);
 
   // 2D Map uses the same processed B-scan as the main B-scan panel, optionally with its own SVD
   const mapBscanData = useMemo(() => {
@@ -1210,6 +1267,27 @@ export default function App() {
             const imported = JSON.parse(ev.target.result);
             if (imported.data && Array.isArray(imported.data)) {
               setBscanData(imported.data);
+              // A fresh scan gets one shot at fitting Max Depth to what it can reach.
+              sarDepthAutoFitRef.current = true;
+              // The FREQUENCY PLAN only -- deliberately not the whole sfcwParams. SAR
+              // phase-compensates with startFreq and applyBscanBg builds its freq axis
+              // from start/stop, and both were silently taking whatever the panel
+              // happened to be set to: measured, importing a 2000 MHz scan while the
+              // panel read 2500 moved the amplitude peak 7 pixels and changed its level
+              // 1.9 dB. Gains, settle and buffers are NOT restored, because
+              // sendSfcwParams() pushes the full set before every sfcw_start, so
+              // restoring them would silently re-gain the radio off an old file --
+              // exactly the trap CLAUDE.md documents for capture_bgmodel.py.
+              if (imported.sfcwParams) {
+                const { startFreq, stopFreq, stepSize: fStep, rangeOffset } = imported.sfcwParams;
+                setSfcwParams(prev => ({
+                  ...prev,
+                  ...(startFreq != null && { startFreq }),
+                  ...(stopFreq != null && { stopFreq }),
+                  ...(fStep != null && { stepSize: fStep }),
+                  ...(rangeOffset != null && { rangeOffset }),
+                }));
+              }
               // Window and averaging MODE are display choices and are restored so
               // the import opens on the image it was exported as. avgCount is a
               // CAPTURE parameter -- the sweeps are already in the file and the
@@ -1531,7 +1609,7 @@ export default function App() {
         sarDynRange={sarDynRange}
         onSarDynRangeChange={setSarDynRange}
         sarMaxDepth={sarMaxDepth}
-        onSarMaxDepthChange={setSarMaxDepth}
+        onSarMaxDepthChange={handleSarMaxDepthChange}
         sarEpsilonR={sarEpsilonR}
         onSarEpsilonRChange={setSarEpsilonR}
         sarWindowType={sarWindowType}

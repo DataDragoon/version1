@@ -60,9 +60,17 @@ function drawPane(canvas, off, sarResult, crosshair, opts) {
   const ctx = canvas.getContext('2d');
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
-  canvas.width = rect.width * dpr;
-  canvas.height = rect.height * dpr;
-  ctx.scale(dpr, dpr);
+  // Assigning width/height reallocates the backing store AND clears it, so doing it
+  // unconditionally inside a 60 fps rAF loop reallocated two canvases 120 times a
+  // second. Only touch it when the box has actually changed; the redraw below still
+  // happens every frame, which is what makes the pane track a panel resize.
+  const wantW = Math.round(rect.width * dpr);
+  const wantH = Math.round(rect.height * dpr);
+  if (canvas.width !== wantW || canvas.height !== wantH) {
+    canvas.width = wantW;
+    canvas.height = wantH;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   const w = rect.width;
   const h = rect.height;
 
@@ -80,10 +88,10 @@ function drawPane(canvas, off, sarResult, crosshair, opts) {
     ctx.fillText(text, w / 2, h / 2);
   };
 
-  if (!sarResult || !sarResult.image) {
-    msg('No SAR image — need ≥2 B-scan positions');
-    return;
-  }
+  // Deliberately silent: Viewport renders one centred "No SAR image" overlay over the
+  // whole pane stack, and drawing it here too put the same sentence on screen three
+  // times in split view.
+  if (!sarResult || !sarResult.image) return;
   if (isCoh && !sarResult.coherence) {
     msg('Coherence needs Coherent mode — incoherent SAR has no phase');
     return;
@@ -133,7 +141,18 @@ function drawPane(canvas, off, sarResult, crosshair, opts) {
     if (!isFinite(vMin)) vMin = isLinear ? 0 : -90;
     if (!isFinite(vMax)) vMax = isLinear ? 1 : -20;
     if (vMax - vMin < (isLinear ? 0.001 : 1)) { vMin -= isLinear ? 0.0005 : 0.5; vMax += isLinear ? 0.0005 : 0.5; }
-    if (opts.dynRange && !isLinear && (vMax - vMin) > opts.dynRange) vMin = vMax - opts.dynRange;
+    // Dynamic range is a RATIO below the peak, so it means the same thing in both
+    // scales -- it just has to be applied multiplicatively in linear. It used to be
+    // skipped entirely when linear was selected, leaving a slider that read "dB",
+    // stayed enabled, and did nothing.
+    if (opts.dynRange) {
+      if (isLinear) {
+        const floor = vMax * Math.pow(10, -opts.dynRange / 20);
+        if (vMin < floor) vMin = floor;
+      } else if (vMax - vMin > opts.dynRange) {
+        vMin = vMax - opts.dynRange;
+      }
+    }
   }
 
   blit(ctx, off, displayVals, pixelsX, pixelsZ, vMin, vMax, cmap,

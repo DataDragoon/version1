@@ -1,6 +1,13 @@
+// The starting vector is DETERMINISTIC, and that matters more than it looks. It was
+// Math.random(), so every call returned a different filtered matrix -- measured on a
+// real 101-position scan, three consecutive svdFilter(d, 2, 1.0) calls produced three
+// different results, and since SAR re-reconstructs whenever any upstream parameter
+// changes identity, the incoherent image visibly changed with nothing touched. Same
+// cos() seed the worker's complexSvdFilter has always used, offset so that component 0
+// does not start from the constant vector.
 export function powerIteration(matrix, rows, cols, maxIter = 100, tol = 1e-10) {
   let v = new Float64Array(cols);
-  for (let i = 0; i < cols; i++) v[i] = Math.random() - 0.5;
+  for (let i = 0; i < cols; i++) v[i] = Math.cos(i + 0.5);
 
   let norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
   for (let i = 0; i < cols; i++) v[i] /= norm;

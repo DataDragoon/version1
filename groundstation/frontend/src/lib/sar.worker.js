@@ -198,6 +198,16 @@ function computeComplexRangeProfile(hCalReal, hCalImag, numSteps, freqStepHz, ra
   return { re: distRe, im: distIm, distances };
 }
 
+// Last usable distance on the grid computeComplexRangeProfile() produces, without
+// paying to build it. Deliberately sited next to that function: any change to nfft or
+// to the `d >= 0` clip has to be made in both or the reachable-depth check below stops
+// describing the array the reconstruction actually indexes.
+function profileMaxDist(numSteps, freqStepHz, rangeOffset) {
+  const nfft = 1 << Math.ceil(Math.log2(numSteps * 4));
+  const maxRange = SPEED_OF_LIGHT / (2 * freqStepHz);
+  return ((nfft / 2 - 1) / nfft) * maxRange - rangeOffset;
+}
+
 const RAY_NQ = 256;
 
 // One-way OPTICAL (air-equivalent) path from an antenna standing off `s` in air, through
@@ -274,6 +284,14 @@ self.onmessage = function (e) {
     return;
   }
 
+  // Whether the coherent path can actually run. The `&&` chain used to be assigned
+  // straight to hasHcal, which made it the h_cal_imag ARRAY rather than a flag --
+  // harmless for branching, but it was posted back as `result.coherent`, so the field
+  // that says which reconstruction ran was 51 floats and any consumer reading it as a
+  // boolean would have been misled. Coerced here, and hoisted above `layered` and the
+  // reachable-depth maths because both of those have to know which path will run.
+  const hasHcal = !!(coherent && bscanData[0].h_cal_real && bscanData[0].h_cal_imag);
+
   // Relative permittivity of the medium. This WAS ABSENT ENTIRELY until 2026-09-03,
   // i.e. every image was back-projected at the speed of light in air: the hyperbola
   // being matched had the wrong curvature so nothing focused properly, and the depth
@@ -307,7 +325,19 @@ self.onmessage = function (e) {
 
   const distances = bscanData[0].distances;
   const numBins = distances.length;
-  const apparentAvailable = distances[numBins - 1];
+  const numSteps = hasHcal ? bscanData[0].h_cal_real.length : 0;
+  const freqStepHz = bscanData[0].step_size || 20000000;
+  const rangeOffset = bscanData[0].range_offset || 0.5;
+
+  // The two paths index DIFFERENT profiles -- the coherent one rebuilds its own
+  // zero-padded IFFT from h_cal, the incoherent one uses the magnitudes/distances that
+  // arrived -- so the reachable depth is derived from whichever grid is about to be
+  // read, not from whatever happens to be sitting on bscanData[0]. They agree to ~2 mm
+  // on the current sweep plan, but they are not the same axis and a different step size
+  // would separate them.
+  const apparentAvailable = hasHcal
+    ? profileMaxDist(numSteps, freqStepHz, rangeOffset)
+    : distances[numBins - 1];
 
   // maxDepth is TRUE depth below the wall face now, not apparent range. Reaching
   // depth z needs apparent range standoff + n*z, so the record itself bounds how deep
@@ -318,7 +348,14 @@ self.onmessage = function (e) {
   // uniform-dielectric model puts anything back there at the wrong depth and the wrong
   // hyperbola curvature. 0 means "not measured", and the layered path stays off.
   const wallT = Math.max(0, (bscanParams.wallThickness || 0) / 100);
-  const layered = !!bscanParams.refraction && wallT > 0;
+  // Coherent-only, and enforced HERE rather than left to the reconstruction loop. It
+  // used to be `refraction && wallT > 0` alone, which let the incoherent path take the
+  // layered reachable depth -- deeper, because the leg beyond the back face travels at
+  // c -- while still mapping range with the straight ray. Measured on a real
+  // 101-position scan: the deepest row went from -39.1 dB to -85.4 dB, i.e. almost
+  // every deep pixel fell to the "no contribution" sentinel, and the result still
+  // reported layered:true so the display captioned a straight-ray image "layered".
+  const layered = !!bscanParams.refraction && wallT > 0 && hasHcal;
 
   const requested = (maxDepth || 30) / 100;
   let reachable;
@@ -334,6 +371,18 @@ self.onmessage = function (e) {
   reachable = Math.max(0.01, reachable);
   const depthMax = Math.min(requested, reachable);
   const depthClipped = requested > reachable + 1e-9;
+
+  // One depth ramp for both paths. The 0.005 m floor is there because a zero-depth
+  // pixel degenerates the layered ray table -- every leg has zero length, so the fan
+  // has no lateral reach and the entire row is skipped -- but it used to be applied
+  // only in the coherent branch, so the two modes reconstructed row 0 at 0.5 cm and
+  // 0.0 cm while the axis labelled both 0.0.
+  const depthAt = (zi) => Math.max(0.005, (zi / (pixelsZ - 1)) * depthMax);
+
+  // Progress is a progress bar, not telemetry: one message per position meant 101
+  // setState round-trips per reconstruction on a 101-cell scan, every one of them
+  // queued behind a ~30 ms compute and re-rendering the whole app.
+  const progressEvery = Math.max(1, Math.ceil(numPositions / 20));
 
   const apertureLength = (numPositions - 1) * stepSize / 100;
 
@@ -352,13 +401,9 @@ self.onmessage = function (e) {
   // raw statistic peaked at 0.997 in the deepest corner, above the real target.
   const minContrib = Math.max(5, Math.ceil(0.25 * numPositions));
 
-  const hasHcal = coherent && bscanData[0].h_cal_real && bscanData[0].h_cal_imag;
 
   if (hasHcal) {
     // Coherent SAR: complex range profiles + phase-compensated summation
-    const numSteps = bscanData[0].h_cal_real.length;
-    const freqStepHz = bscanData[0].step_size || 20000000;
-    const rangeOffset = bscanData[0].range_offset || 0.5;
     const startFreq = bscanParams.startFreq ? bscanParams.startFreq * 1e6 : 2e9;
     const k_start = 2 * Math.PI * startFreq / SPEED_OF_LIGHT;
 
@@ -413,7 +458,7 @@ self.onmessage = function (e) {
       const sp = standoffs[p];
 
       for (let zi = 0; zi < pixelsZ; zi++) {
-        const depth = Math.max(0.005, (zi / (pixelsZ - 1)) * depthMax);
+        const depth = depthAt(zi);
         if (layered) buildRayTable(sp, depth, wallT, n, tblX, tblL);
         const row = zi * pixelsX;
 
@@ -457,7 +502,9 @@ self.onmessage = function (e) {
         }
       }
 
-      self.postMessage({ type: 'progress', progress: (p + 1) / numPositions });
+      if (p === numPositions - 1 || p % progressEvery === 0) {
+        self.postMessage({ type: 'progress', progress: (p + 1) / numPositions });
+      }
     }
 
     for (let i = 0; i < image.length; i++) {
@@ -490,7 +537,7 @@ self.onmessage = function (e) {
     const maxDist = (aperture + 0.5) * stepM;
 
     for (let zi = 0; zi < pixelsZ; zi++) {
-      const depth = (zi / (pixelsZ - 1)) * depthMax;
+      const depth = depthAt(zi);
 
       for (let xi = 0; xi < pixelsX; xi++) {
         const lateral = (xi / (pixelsX - 1)) * apertureLength;
