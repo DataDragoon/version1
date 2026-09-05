@@ -207,7 +207,13 @@ export default function App() {
     stopFreq: 5000,
     stepSize: 60,
     numBuffers: 1,
-    settleCount: 3,
+    // 0 is the minimum AND the default, and it is not "settling off": the Pi's
+    // settle gate always waits one whole buffer period beyond this so a capture
+    // cannot straddle the retune, and settleCount is settling on top of that.
+    // Measured 2026-09-05 -- extra settling buys nothing (quick-tune fastlock is
+    // long settled within a buffer period) and costs 0.41 ms per step, i.e.
+    // 21 ms/sweep per unit. See pi/radar/sfcw_engine.py _sweep_core.
+    settleCount: 0,
     tx1Gain: 50,
     rx1Gain: 25,
     // Reference channel (TX2 -> loopback cable -> RX2). These were previously absent

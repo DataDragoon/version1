@@ -3183,3 +3183,392 @@ already stable to +/-1.5 mm here, so its 0.44 dB is not evidence about a sloppie
 rectangular's 6.53 (while amplitude-only slightly favours rectangular, 2.28 vs 1.98). Two
 of three metrics now lean Hanning. The default stays rectangular because that is what was
 asked for, but this is worth re-deciding on a target-in / target-out pair.
+
+## FPGA sweep-acceleration roadmap + Phase 0 baseline (2026-09-05)
+
+Prior art lives on **`fpga_branch`** (unmerged, deliberately kept separate): a working
+NIOS autonomous sweep, an FPGA patch against Nuand `73ce750b`, a state-machine simulator
+(`pi/radar/nios_sim/`) and `docs/nios_sweep.md`. Read that doc before doing FPGA work.
+
+**The bottleneck is the Nios II/e CPU, not USB.** Per step the firmware issues 42 AD9361
+SPI transactions at a measured 47.7 us each -- but the transaction itself is 0.6 us on the
+40 MHz bus, so ~47 us of each is pure CPU overhead. That is why the autonomous sweep
+measured 176 ms against a host-driven 188 ms: both paths ask the same slow CPU to do the
+same SPI work. Moving *who issues* the retune was never going to help.
+
+**Quartus edition: the device is `5CEBA9F23C8`, Cyclone V E** (`platform.conf:25`).
+Quartus Prime **Pro does not support Cyclone V** (Pro is Agilex / Stratix 10 / Arria 10 /
+Cyclone 10 GX). Cyclone V needs **Standard** (Nios II/f) or **Lite** (Nios II/e only).
+`fpga/build_sweep_firmware.sh:26` says "Standard or Pro" -- the Pro half is wrong.
+
+**Nios II/f and a hardware SPI sequencer do NOT compound** -- both delete the same ~47 us
+of per-transaction CPU overhead. Nios II/f makes the CPU ~6x faster (2.003 -> ~0.35 ms/step);
+a sequencer removes the CPU from the path entirely (-> ~0.004 ms/step). Doing both leaves
+the sequencer's number, so the sequencer's incremental value over Nios II/f is only ~18 ms
+on a sweep that is ~30-50 ms by then. **The sequencer phase was dropped for this reason.**
+Nios II/f and FPGA-side demod DO compound -- they attack different terms (retune vs
+dwell+host). Plan: `rx.vhd` validation -> Nios II/f -> gate -> FPGA demod only if needed.
+
+### Phase 0 baseline, measured on hardware 2026-09-05
+
+51 steps, 2-5 GHz, 60 MHz, settle=3, num_buffers=1, tx1/rx1=50/25, tx2/rx2=45/5.
+Bracketed controls (100 sweeps each, first and last) agreed to **0.1 ms (0.0%)** and
+0.3 dB -- that is the error bar; anything above ~1 ms is real.
+
+**210.9 ms/sweep, 4.74 Hz, 4.136 ms/step.** Quality clean: adjacent-sweep correlation
+0.99995 (0/99 pairs under the 0.999 bar), **0/5100 cells** beyond 8 robust sigma
+(worst z 6.3), S_repeat **41.9 dB**.
+
+| term | ms/step | ms/sweep | share |
+|---|---|---|---|
+| retune (2x `bladerf_schedule_retune`) | 2.434 | 124.1 | 58.8% |
+| settle wait | 0.861 | 43.9 | 20.8% |
+| capture wait | 0.409 | 20.9 | 9.9% |
+| per-step numpy demod | 0.432 | 22.0 | 10.4% |
+| `_process_h_cal` | -- | 0.27 | 0.1% |
+
+Three corrections to earlier assumptions:
+
+- **`_process_h_cal` is 0.27 ms, not the ~8 ms `docs/nios_sweep.md` assumed.** Dead concern.
+  What that doc never separated out is the **per-step numpy demod at 22 ms/sweep**: the
+  `if sig_bufs:` block allocates float64 arrays, strided-slices into an intermediate complex
+  array and means it, once per step. At 10% today it is invisible; after Nios II/f it is
+  ~40% of the sweep. It is pure software -- a single `np.dot` against the conjugate tone
+  should give 3-5x. Do it BEFORE Phase 2 so Phase 2's number is not polluted by it.
+- **`settle_count=3` is not buying 3 buffers of settled signal.** 3 x 0.41 ms should cost
+  1.23 ms; measured 0.861 ms = 0.287 ms/buffer. `_sweep_core` holds `_rx_cond` across the
+  settle-plus-capture block, so the RX thread stalls, buffers back up in the 16-deep ring,
+  and the first arrivals after each 2.4 ms retune are drained backlog, not fresh real-time
+  data -- the same "true settling is unknowable" ambiguity documented for the pre-`sync_rx`
+  era, reintroduced by a different mechanism. **When the retune shrinks the overlap
+  disappears and settle grows back toward 1.23 ms**, so do not subtract the 124 ms naively,
+  and re-derive `settle_count` per step at every phase.
+- **`num_buffers` 4 -> 1 (2026-08-30) was never re-benchmarked; it is worth ~1.4 Hz.**
+  CLAUDE.md's last recorded figure was 3.35 Hz at settle=3 with num_buffers=4; this run
+  measures 4.74 Hz at num_buffers=1.
+
+Also stale above: the reference-gain section says the Pi default "ends up unchanged" at
+tx2/rx2 = 30/20. Both `SFCWEngine.__init__` and `App.jsx` `sfcwParams` actually carry
+**45/5**, and this run's 41.9 dB S_repeat is consistent with 45/5 (CLAUDE.md's own table:
+45/5 -> 38.6 dB, 30/20 -> 28.1 dB), not with 30/20.
+
+Benchmark methodology that produced this (rebuild it rather than trusting
+`benchmark_sweep.py`, which is still broken -- it references `_sweep_core_fast`/`sweep_mode`
+and unpacks `_sweep_core` as a 2-tuple): stop `sdr_server` only (`start.py` does no
+supervision, so `stream.py`/`rover_server.py` keep running), drive `SFCWEngine` directly,
+bracket the measurement with identical control blocks, and check per-step robust-z rather
+than aggregate correlation.
+
+### Demod vectorised: 210.9 -> 195.9 ms (2026-09-05)
+
+`_sweep_core`'s per-step demod produces ONE complex number per channel from a 4096-sample
+buffer, and `mean(iq * tone)` **is a dot product**. The old float64 expression
+(`(a[:,0::2] + 1j*a[:,1::2]) * tone`, then `.mean()`) allocated five temporaries per
+channel per step -- two strided float64 slices, a complex128 from the `1j*Q`, another from
+the addition, another from the tone multiply -- about 320 kB of traffic per channel to
+produce one number. Now: `sb.astype(np.float32).view(np.complex64)` (one pass; the view is
+free, because float32 I,Q pairs already have exactly the complex64 layout) then one
+`np.dot` against `self._ref_tone_c64`. `adc_peak` is taken on the int16 directly, via
+Python ints so negating a hypothetical -32768 cannot overflow.
+
+Equivalence checked over 200 randomised trials (1/2/4 buffers, 20-2000 ADC counts):
+**worst relative error 1.4e-5 = -97.2 dB** against a system limited at ~42 dB S_repeat,
+and `adc_peak` matched exactly every time. Measured: **210.9 -> 195.9 ms (-15.0 ms,
+-7.1%), 4.74 -> 5.11 Hz**, bracketed controls agreeing to 0.2 ms.
+
+**The isolated micro-benchmark under-predicts this 3.5x** (0.084 ms/step in a warm-cache
+loop vs 0.295 ms/step measured in the real sweep). The allocation traffic was competing
+with the RX thread, which runs `_rx_loop_dual`'s own numpy deinterleave continuously at
+~2440 buffers/s -- so the cost was contention, not just cycles. **Do not size a numpy
+optimisation in this loop by timing it in isolation.**
+
+### `settle_count` does NOT control the rare corrupted step, and counts the wrong thing
+
+**Still true as to why the count-based gate could not work, but see the RESOLVED section at
+the end of this file for what actually fixed it.**
+
+400 sweeps at each of 8 settle values = **163,200 step-captures** (2026-09-05):
+
+| settle | ms | Hz | S_repeat | corr_min | >8 sigma | worst z |
+|---|---|---|---|---|---|---|
+| 1 | **153.2** | **6.53** | **44.2** | 0.99993 | 0/20400 | 6.2 |
+| 2 | 172.0 | 5.81 | 42.9 | 0.99764 | 2/20400 | **298.6** |
+| 3 | 196.5 | 5.09 | 43.7 | 0.99988 | 0/20400 | 5.3 |
+| 4 | 219.6 | 4.55 | 43.5 | 0.99994 | 1/20400 | 9.8 |
+| 5 | 243.6 | 4.10 | 42.8 | 0.99982 | 1/20400 | 12.6 |
+| 6 | 256.7 | 3.90 | 43.0 | 0.99994 | 0/20400 | 3.5 |
+| 8 | 298.6 | 3.35 | 42.7 | 0.99988 | 0/20400 | 6.7 |
+| 10 | 340.8 | 2.93 | 41.2 | 0.99961 | 0/20400 | 4.1 |
+
+Outlier counts run **0,2,0,1,1,0,0,0** -- no trend, and the worst excursion by two orders
+of magnitude sits at settle=2, mid-range. Four events in 163,200 cells is a constant
+~1-in-40,000 rate; Poisson at that rate gives P(0)=0.61, P(2)=0.076 per block, so this is
+exactly what a settle-INDEPENDENT process looks like. S_repeat is flat at 41-44 dB across
+the whole range and is best at settle=1. **Raising settle does not buy margin here.**
+
+**Why: `settle_count` counts buffer DELIVERIES, not elapsed time since the retune.**
+`_sweep_core` holds `_rx_cond` across the whole settle-plus-capture block, so the RX thread
+blocks in `_rx_capture` and buffers pile up in libbladeRF's 16-deep ring; when the lock
+releases during the next retune the RX thread dumps the backlog. Measured directly: 3
+buffers of settle take **0.861 ms = 0.287 ms/buffer against 0.41 ms of real time** -- they
+arrive faster than real time because they are queued, not fresh, so **some "settle" buffers
+were captured during the previous dwell at the previous frequency.** That is the exact
+corruption `settle_count` exists to prevent, which is why turning the knob does not help.
+
+Consequences:
+- The 2026-08-29 choice of settle=3 over settle=1 (7.6 sigma vs 2.9) looks **over-fit to a
+  single 400-sweep sample**. Today settle=1 is among the cleanest (worst z 6.2) and settle=3
+  reads 5.3, not 2.9.
+- **settle=1 is 43.3 ms faster than settle=3** (196.5 -> 153.2 ms, 5.09 -> 6.53 Hz) at no
+  measurable quality cost in this data -- nearly 3x the demod win. Default left at 3 pending
+  a proper fix; do not flip it on one dataset given the regression history.
+- The real fix is to gate settle on **elapsed wall time since the retune**, or flush the ring
+  after retuning, so the parameter means what its name says. Until then, per-step validation
+  of any settle value is measuring a quantity that depends on ring backlog, i.e. on the
+  previous step's timing, not on settling.
+- This also predicts the Phase 2 (Nios II/f) win is smaller than naive subtraction of the
+  124 ms retune term suggests: shrink the retune and the backlog that was being drained
+  during it disappears, so the settle wait grows back toward its nominal 0.41 ms/buffer.
+
+### Benchmark through the WEBSOCKET, not the engine (2026-09-05)
+
+The Phase 0 / demod numbers above were taken by driving `_perform_sweep()` directly with
+`sdr_server` stopped. **That measures a narrower thing than the GUI shows and reads ~7 ms
+fast.** `timestamp` is stamped in `_process_h_cal` and `Viewport.jsx` `useSweepRate` takes
+the median adjacent difference, so the GUI reports the FULL loop: sweep + `_sfcw_callback`
++ the asyncio task doing `json.dumps` and the websocket broadcast, all competing for CPU
+with the sweep thread and the RX thread.
+
+| | ms/sweep, settle=3 |
+|---|---|
+| engine only, server stopped | 195.9 |
+| through the running server, `timestamp` deltas | 202-205 |
+| operator's GUI (browser attached as a second client) | ~209 |
+
+Benchmark by connecting a websocket client to `ws://localhost:9003`, sending
+`{'cmd':'sfcw_set_params',...}` then `{'cmd':'sfcw_start'}`, and taking median adjacent
+`timestamp` differences -- run the FULL stack (`start.py`), because load is a variable
+here, not a constant.
+
+### The rare corrupted sweep is CPU CONTENTION, and settle_count was counting the wrong thing
+
+**SUPERSEDED, 2026-09-05 -- see the RESOLVED section at the end of this file. The time gate
+described here was right in principle but its lockstep test was one-sided and accepted the
+stalest buffer available, and its deadline was one buffer period short. `settle_count` is now
+0 by default and the corruption is gone.**
+
+Measured rate of `(sweep, step)` cells >8 robust sigma, same code, three load levels:
+
+| load | rate |
+|---|---|
+| engine alone, nothing else running | **0 / 25,500** |
+| + `stream.py` + `rover_server` | 4 / 163,200 |
+| + full server, JSON serialisation, websocket client | 1 / 6,120 |
+
+**Mechanism.** When the asyncio serialisation task starves the RX thread, buffers pile up
+in libbladeRF's 16-deep ring. The old gate waited for `settle_count` buffer DELIVERIES --
+and consuming backlogged buffers costs ~zero wall time and skips zero history, so every
+"settle" buffer AND the capture after them still held pre-retune IQ at the previous
+frequency. One such step corrupts the whole sweep, because the range profile is one IFFT
+across all steps. This is why 163,200 cells over settle 1..10 showed **no trend**: the knob
+could not act on the failure.
+
+**Fix (`_sweep_core`).** Settle is now gated on (1) wall time since the retune,
+`settle_count * 4096/sample_rate`, then (2) draining until a buffer's arrival gap proves
+the backlog is gone. **The gap is stamped in `_rx_capture`, i.e. in the RX (producer)
+thread** -- an earlier version timed the sweep thread's own wait and that is a real hole:
+under exactly the contention that causes the bug, a scheduling stall is indistinguishable
+from a real-time wait, so a stale buffer gets accepted. Measured from the producer the gap
+is a property of the data, not of the consumer's scheduling luck. `MAX_BACKLOG_DRAIN = 24`
+bounds the drain past the 16-deep ring; `LOCKSTEP_FRAC = 0.5`. The buffer that ends the
+drain is already proven current and is used as the capture rather than waiting for another
+(that cost a whole buffer period per step, 21 ms/sweep).
+
+**settle_count now has a real effect, which is itself the evidence the gate works** -- under
+the old count-based gate settle=1 was among the CLEANEST; under the time gate it is clearly
+too little settling. 400 sweeps per block through the websocket, `vis` = sweeps whose
+adjacent correlation fell under the 0.999 bar (what the operator actually sees):
+
+| settle | ms | Hz | S_repeat | >8 sigma | vis corrupt |
+|---|---|---|---|---|---|
+| 1 | 171.2 | 5.84 | 26.6 | 9/20400 | **18/399** |
+| 2 | 189-192 | 5.2-5.3 | 31-38 | 0-4/20400 | **0,0,6,4,0** |
+| 3 | 209.6-210.1 | 4.76 | 36.9-38.0 | **0** | **0/947 cumulative** |
+| 4 | 234.5 | 4.27 | 37.8 | 0/20400 | 0/399 |
+
+**Default stays `settle_count = 3`** (`SFCWEngine.__init__`, `App.jsx` `settleCount`) --
+0 corrupted sweeps in **947** on the final code (0/48,450 cells), against ~1 per 120 before.
+settle=2 is 20 ms faster and mostly clean but corrupted 2 of 5 blocks, so it does not meet
+the "not one in 100 sweeps" bar. Net cost vs the old code at the same setting is ~+5 ms.
+
+**Confound worth knowing: repeated `sfcw_start`/`sfcw_stop` degrades the device.** After the
+5th cycle in one session the stream died outright -- `Failed to receive NIOS II response`,
+`Transfer timed out for TX/RX buffer`, `_rfic_host_enable_module ... FPGA operation reported
+a failure`, then `13/51 steps had incomplete captures` and `TX/RX stream died unexpectedly`.
+Restarting `start.py` recovers it. **A/B blocks late in a long cycling session are therefore
+not comparable to early ones**, which is the most likely reason settle=2 looked clean in
+some blocks and not others. Bracket with controls, keep sessions short, and restart the
+stack between them.
+
+### The 42 ms IS real, contention is genuinely the cause -- but the GIL rounding was not it (2026-09-05)
+
+**SUPERSEDED on the cause, 2026-09-05 -- see "RESOLVED: the 42 ms was two bugs in the settle
+gate" at the end of this file. The 42 ms was real and has been taken, but NOT by fixing
+contention: the gate had an inverted lockstep test and gated on a buffer's arrival rather
+than its contents. The timings and the GIL findings below stand; the diagnosis does not.**
+
+**Correcting the section above.** It argued the time gate pays for USB pipeline latency, so
+fixing contention would not release the settle margin. **That was wrong.** Measured
+engine-direct with the whole stack stopped -- the best case any contention fix could reach:
+
+| settle | contention-free (engine alone) | through the full server |
+|---|---|---|
+| 1 | **0/15300 cells, 0/299 sweeps**, worst z 2.8, S_rep 41.3, **168.0 ms** | 9/20400, **18/399**, worst z 318, S_rep 26.6 |
+| 2 | **0/15300, 0/299**, worst z 3.2, S_rep 41.4, 188.9 ms | 0-4/20400, 0-6/399 |
+| 3 | 0/3060, worst z 7.2, S_rep 40.6, 209.7 ms | 0/947, S_rep 36.9-38.0 |
+
+settle=1 is perfectly clean with nothing competing. **So ~42 ms (209.7 -> 168.0) is available
+if and only if contention is fixed**, plus ~2-4 dB of S_repeat. The earlier "4.5% is too
+systematic to be scheduling" inference was simply wrong -- do not reuse it.
+
+Note the time gate also made sweep duration **load-independent**: settle=3 reads 209.7 ms
+engine-direct and 209.6-210.1 ms through the server. The old count-based gate was faster
+under load precisely because it was draining backlog instead of waiting.
+
+**Two GIL fixes shipped, both verified byte-identical, and they were NOT the answer.**
+`[round(x, n) for x in ...]` is pure Python and holds the GIL for the whole comprehension:
+
+| site | thread | before | after |
+|---|---|---|---|
+| `sdr_server.py` broadcast `distances`/`magnitudes` (~512 elts) | asyncio | 2.778 ms | **0.023 ms** (122x) |
+| `sfcw_engine.py` `_process_h_cal` `h_cal_real/imag` (102 elts) | sweep | ~0.55 ms | ~0.01 ms |
+
+2.8 ms of held GIL is ~7 RX buffer periods, which looked like an exact match for the
+backlog mechanism. **It was not.** settle=1 went 18/399 -> 12/399 -> 10/299 across the two
+fixes -- unchanged within noise. What they DID buy is real: **S_repeat at settle=3 went
+36.9-38.0 -> 39.1-40.4, now matching the contention-free 40.6**, so the quality gap is
+closed even though the timing one is not. Keep both fixes; they are free.
+
+**The dominant contention source is still unidentified.** Untested candidates, in order:
+(1) plain CPU competition from `stream.py` / `rover_server.py` -- separate processes, so not
+GIL, but 3 processes plus a 34.8%-of-a-core RX thread on 4 cores; bisect by running
+`sdr_server` alone. (2) RX thread priority -- `SCHED_FIFO` or core pinning for
+`_rx_loop_dual`. (3) websocket/TCP syscall latency in the broadcast.
+
+**Do NOT "optimise" `_rx_loop_dual`'s deinterleave.** The obvious rewrite
+(`frombuffer().reshape(-1,4)` then two 2-column `.copy()`) measures **5x SLOWER** -- 0.0728
+vs 0.0143 ms/buffer -- because a 2-of-4 column slice is non-contiguous. The current strided
+assignment is already the fast path at 34.8% of one core.
+
+**Device degradation got worse this session.** Repeated `sfcw_start`/`stop` cycling produced
+`Failed to receive NIOS II response` twice more, once ending in `No devices available` with
+the board **re-enumerating on the USB bus under a new device number** (Device 002 -> 003).
+Restarting `start.py` after an 8-18 s gap recovers it; a 4 s gap is not enough (the previous
+process has not released the device and the new one gets "No devices available"). Budget for
+this in any long A/B session.
+
+**Unrelated, noticed in the logs: the BNO085 is failing init** -- `RuntimeError('BNO085:
+feature 0x01 was not confirmed enabled')`, so `stream.py` runs without the IMU. Per the
+bring-up notes above that signature is the loose-contact/reseat case, not firmware.
+
+### RESOLVED (2026-09-05): the 42 ms was two bugs in the settle gate, not contention
+
+`settle_count` default is now **0** and a sweep is **168.3 ms (5.95 Hz)**, against 210.5 ms
+at the old default of 3 -- the full 42 ms, at **better** quality (S_repeat 39.3 dB vs the
+36.9-38.0 the previous section records). **5,100 consecutive sweeps with ZERO visibly
+corrupted** (adjacent-sweep complex correlation of `h_cal` below 0.999), unloaded and with
+four concurrent websocket clients, and one cell beyond 8 robust sigma in **261,142** --
+better than the ~1-in-40,000 settle-independent background measured earlier.
+
+The previous section's conclusion -- that ~42 ms is available "if and only if contention is
+fixed" -- was **wrong about the cause**. Contention is real and does stall the RX thread, but
+the gate was supposed to be immune to that and was not, for two separate reasons. Neither is
+about RF settling, which is why 163,200 step-captures over settle 1..10 had shown no trend.
+No contention work was needed in the end: nothing was pinned, reniced, or moved off the
+asyncio thread.
+
+**Bug 1: the lockstep test was one-sided, and inverted on the case that mattered.** It
+accepted a buffer once `_rx_gap >= 0.5 * buf_period`. Write `lag(n)` for a buffer's queueing
+delay and `T(n)` for its arrival: `gap(n) = BP + lag(n) - lag(n-1)`, so **the gap measures the
+CHANGE in staleness and both directions mean stale.** A large gap means the RX thread was
+descheduled and has just handed over the *oldest* buffer in the ring -- precisely the
+pre-retune buffer the gate existed to reject -- and the old test read that as proof of
+freshness. Measured over 172,901 buffers under load: 96.4% of gaps land in [0.9, 1.1]*BP, and
+a >1.5*BP gap is followed by a <0.5*BP one 80.7% of the time (stall, then backlog drain).
+`drains` averaged **1.00**, i.e. the drain loop never actually drained. **328 of 21,421 steps
+accepted an out-of-band buffer; with the two-sided band [0.8, 1.2]*BP it is 0**, and
+`settle_count=1` went from 12/399 corrupted sweeps and S_repeat 26.98 dB to 0/399 and 39.52.
+
+**Do NOT replace the band with a cumulative lag estimate** (`lag += gap - BP`, clamped at 0).
+Tried: mean gap measures 0.4097 ms against a nominal 0.4096, and that 24 ppm integrates to a
+19 ms phantom lag within seconds. The band is drift-free because it never integrates.
+
+**Bug 2: the deadline gated a buffer's ARRIVAL, not its CONTENTS.** A buffer arriving at `T`
+holds the samples captured in `[T - BP, T]`, so `deadline = t_retune + settle_count*BP` let
+the capture window start *at* the retune, or straddle it. Measured: implied capture start ran
+down to 0.106*BP (43 us) and 11% of steps got under 0.2 ms of settling -- still 2 corrupted
+sweeps in 1199 after Bug 1 was fixed. The deadline is now
+`t_retune + buf_period + settle_count*buf_period`; **that leading buffer period is structural
+and must not be removed.**
+
+**Extra settling then measured to buy nothing, which is why the default is 0.** At
+`settle_count=0` over 77,542 steps the tightest capture began **9.7 us** after the retune, and
+the 1,803 steps with under 41 us of margin had a worst robust-z of **2.81** against 3.7 for
+the run as a whole -- the *least*-settled captures were the cleanest. Margin and corruption
+are uncorrelated, as they should be: quick-tune fastlock settles the AD9361 long inside one
+buffer period. Cost per unit is 0.41 ms/step = **21 ms/sweep**, so `settle_count=3` now costs
+231.1 ms. Sweep time fits `51 * (2.89 ms + (1 + settle_count + num_buffers) * 0.4096 ms)` to
+0.2 ms; `SfcwPanel.jsx` uses exactly that (its old estimate omitted the ~2.4 ms/step retune
+entirely and read 84 ms against a real 210).
+
+**`settle_count = 0` is the minimum AND the default and does NOT mean "settling off"** -- it
+means "capture the first buffer lying entirely after the retune". The panel's minimum is now
+0 (`SfcwPanel.jsx`), and `App.jsx` `sfcwParams.settleCount` is 0. **Do not raise it to chase a
+corrupted sweep without first checking `SFCW_DIAG`:** if the gate is working the fault is not
+settling, and more settling will not fix it.
+
+**`SFCW_DIAG=<prefix>` is the tool that found all of this, and it is kept.** Off unless the
+env var is set (one falsy global check per RX buffer when off). It writes `<prefix>NN_gaps.npy`
+-- every RX inter-arrival gap -- and `<prefix>NN_steps.npy`, one row per step:
+`(step index, drains, accepted gap, retune->accept seconds, backlog drained, locked,
+h_cal real, h_cal imag)`. **Recording `h_cal` beside its own timing is what made the
+measurement decisive**: per-step robust-z and capture margin come from one file, with no need
+to align the diagnostic against the websocket stream.
+
+### The device wedging was OUR bug: `sdr_server` never closed the bladeRF (2026-09-05)
+
+The "repeated `sfcw_start`/`stop` degrades the bladeRF" problem documented above is largely
+**unclean shutdown**, and it is fixed. `sdr_server.py` had no signal handling at all: `start()`
+awaited `asyncio.Future()` forever, so SIGTERM killed the process with TX and RX still enabled
+and USB transfers in flight. `bladerf_close()` never ran, the FPGA kept DMA-ing into an
+endpoint that had gone away, and the board was left wedged -- still enumerating, but every
+open failing `No devices available`, and **libbladeRF's own USB reset on open does not clear
+it.** `start.py` SIGTERMs this process on every restart, so the damage accumulated once per
+restart, which is exactly why "restart `start.py` to recover" grew unreliable over a session.
+
+There is now a `_shutdown()` on SIGINT/SIGTERM that stops the sweep, stops both dual streams
+and closes the device; it logs `[sdr] device closed`. With it the board reopens cleanly with
+no intervention.
+
+**Recovery when it does wedge: `usbreset <bus>/<dev>`** (from `lsusb`, e.g. `usbreset 002/006`),
+which is the only thing short of a physical replug that worked -- resting the device, killing
+processes and libbladeRF's own reset all failed. Watch for the board re-enumerating under a new
+device number in `lsusb`; that is the signature.
+
+### Benchmark harness (rebuild it this way)
+
+`benchmark_sweep.py` is still broken and was not used. What works: a websocket client on
+`ws://localhost:9003` that sends `sfcw_set_params` then `sfcw_start`, collects `sfcw_result`,
+and reports **median of adjacent differences of `msg['timestamp']`** -- exactly what
+`Viewport.jsx` `useSweepRate` shows. Metrics: sweeps whose adjacent-sweep complex correlation
+of `h_cal` falls below 0.999 ("visibly corrupted"), per-(sweep, step) robust-z outliers, and
+S_repeat. Run the FULL stack via `start.py`; extra idle subscriber clients are a cheap and
+realistic load knob (they add a `json.dumps` consumer and a TCP send per sweep in the asyncio
+thread). Bracket every A/B with repeated controls -- ours agreed to **0.07-0.2 ms**.
+
+**400 sweeps is NOT enough to qualify a settle change.** The failure rate being chased is
+~0.17% of sweeps, so a single 400-sweep block reads 0 most of the time: the identical
+configuration gave 2/399 in one block and 0/1499 in another. That is the same trap that let
+the 2026-08-23 `settle_count` regression ship. Use >=1200 sweeps, prefer the per-step robust-z
+(51x more samples per sweep), and best of all use `SFCW_DIAG` to test the *mechanism* rather
+than the rate.

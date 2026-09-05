@@ -9,6 +9,7 @@ eliminates random PLL phase offsets between TX and RX synthesizers.
 """
 
 import math
+import os
 import threading
 import time
 import numpy as np
@@ -34,6 +35,47 @@ SPEED_OF_LIGHT = 299_792_458
 # every frequency past it (this happened: a prior 1-6 GHz/10 MHz table needed 501
 # profiles against a 256 cap).
 MAX_QUICK_TUNE_PROFILES = 256  # NUM_BBP_FASTLOCK_PROFILES, fpga_common/bladerf2_common.h
+
+# Settle is gated on wall time since the retune, not on a count of delivered RX
+# buffers -- see the long comment in _sweep_core. After the time gate the loop
+# drains until a buffer arrives in LOCKSTEP with the hardware, which is what
+# distinguishes "the hardware just produced this" from "this was sitting in the
+# ring". MAX_BACKLOG_DRAIN bounds that at more than the 16-deep ring so a
+# pathological stall cannot hang a sweep.
+#
+# The lockstep test is TWO-SIDED and that is the whole point. Let lag(n) be a
+# buffer's queueing delay, T(n) its arrival: gap(n) = BP + lag(n) - lag(n-1). So
+# the gap measures the CHANGE in staleness, and BOTH directions mean stale:
+#   gap >> BP  the RX thread was descheduled and has just delivered the OLDEST
+#              buffer in the ring -- lag jumped up by (gap - BP). This is the
+#              stalest buffer available, and a one-sided `gap >= 0.5*BP` test
+#              accepted it as proof of freshness. Inverted, and it was the bug.
+#   gap << BP  the ring is non-empty, so sync_rx returns immediately and the gap
+#              is just deinterleave time -- backlog being drained, also stale.
+# Only gap ~= BP means lag did not change, and lag can only sit at its floor
+# there, because a non-empty ring cannot produce a full-period gap.
+# Measured 2026-09-05 over 172,901 buffers under full-stack load: 96.4% of gaps
+# land in [0.9, 1.1]*BP and a >1.5*BP gap is followed by a <0.5*BP one 80.7% of
+# the time -- the stall/drain signature, textbook. [0.8, 1.2] keeps 97.5%, so
+# rejecting the rest costs one extra buffer wait on ~2.5% of steps.
+#
+# Do NOT replace this with a cumulative lag estimate (lag += gap - BP, clamped at
+# 0). Tried: mean gap measures 0.4097 ms against a nominal 0.4096, and that 24 ppm
+# accumulates to a 19 ms phantom lag within seconds. The gap band is drift-free
+# because it never integrates.
+MAX_BACKLOG_DRAIN = 24
+LOCKSTEP_LO = 0.8
+LOCKSTEP_HI = 1.2
+
+
+# Diagnostics for the settle gate, off unless SFCW_DIAG names a path prefix.
+# Costs one array store per RX buffer and one per step when on, nothing when off.
+# Writes <prefix>_gaps.npy (every RX inter-arrival gap, seconds) and
+# <prefix>_steps.npy (per accepted step: step index, drains, accepted gap,
+# seconds from retune to acceptance, buffers judged backlog, locked flag).
+SFCW_DIAG = os.environ.get('SFCW_DIAG')
+DIAG_MAX_GAPS = 4000000
+DIAG_MAX_STEPS = 1000000
 
 # SC16_Q11 is 12-bit signed: +-2047 (the negative rail reaches -2048).
 ADC_FULL_SCALE = 2047.0
@@ -116,16 +158,29 @@ class SFCWEngine:
         # when the reference was compressed and the within-step term was much closer to
         # the limit. If the RF chain regresses, this needs re-checking, not assuming.
         self.num_buffers = 1
-        # 3, not 10. Validated 2026-08-29 PER STEP, which is what CLAUDE.md's settle_count
-        # regression note says an aggregate metric failed to catch: 400 sweeps x 51 steps
-        # = 20,400 step-captures at settle=3 produced ZERO cells more than 8 robust sigmas
-        # off that step's median, worst excursion 2.9 sigma (Gaussian expectation for that
-        # many samples is ~4.1). settle=1 is faster still (3.90 vs 3.35 Hz) and equally
-        # clean on the aggregate, but threw a 7.6-sigma excursion in the same test -- the
-        # exact intermittent tail that produced the earlier regression -- so 3 is chosen
-        # for margin, not for speed. Do not drop below it without repeating the per-step
-        # check; an aggregate correlation will not see this.
-        self.settle_count = 3
+        # 0, and 0 does NOT mean "no settling" -- read the deadline comment in
+        # _sweep_core first. The gate always waits one whole buffer period beyond
+        # settle_count so a capture cannot straddle the retune; settle_count is
+        # EXTRA settling on top of that, and extra settling was measured to buy
+        # nothing while costing 0.41 ms per step (21 ms/sweep per unit).
+        #
+        # This supersedes the 2026-08-29 choice of 3. That value was margin against
+        # an intermittent corrupted step which has since been traced to two real
+        # bugs in the gate (an inverted one-sided lockstep test, and gating on a
+        # buffer's arrival rather than its contents) rather than to RF settling --
+        # raising settle_count only ever bought margin by accident, which is why
+        # 163,200 step-captures over settle 1..10 had shown no trend. With both
+        # fixed, validated PER STEP as CLAUDE.md requires: 5,100 consecutive sweeps
+        # at settle_count=0 through the running server -- unloaded, and with four
+        # concurrent websocket clients -- gave ZERO visibly corrupted sweeps and
+        # one cell beyond 8 robust sigma in 261,142, against the ~1-in-40,000
+        # settle-independent background this repo already measured. 168.3 ms/sweep
+        # against 231.1 at settle_count=3.
+        #
+        # Do not raise it to chase a corrupted sweep without first checking the
+        # per-step diagnostics (SFCW_DIAG): if the gate is working, the fault is
+        # not settling and more settling will not fix it.
+        self.settle_count = 0
         self.tx1_gain = 50
         self.rx1_gain = 25
         # Reference-channel (TX2 -> loopback cable -> RX2) gains. These set the level
@@ -279,7 +334,11 @@ class SFCWEngine:
             if 'num_buffers' in kwargs:
                 self.num_buffers = max(1, int(kwargs['num_buffers']))
             if 'settle_count' in kwargs:
-                self.settle_count = max(1, int(kwargs['settle_count']))
+                # 0 is legal and is the default: the gate ALWAYS waits one buffer
+                # period beyond this so the capture cannot straddle the retune,
+                # and settle_count is settling asked for on top of that. See
+                # _sweep_core.
+                self.settle_count = max(0, int(kwargs['settle_count']))
             if 'tx1_gain' in kwargs:
                 self.tx1_gain = int(kwargs['tx1_gain'])
                 self._gains_dirty = True
@@ -654,10 +713,25 @@ class SFCWEngine:
         self._rx_cond = threading.Condition()
         self._rx_latest = None
         self._rx_seq = 0
+        self._rx_t = None
+        self._rx_gap = 0.0
+        self._diag_gaps = None
+        if SFCW_DIAG:
+            self._diag_gaps = np.zeros(DIAG_MAX_GAPS, dtype=np.float64)
+            self._diag_gaps_n = 0
+            self._diag_steps = np.zeros((DIAG_MAX_STEPS, 8), dtype=np.float64)
+            self._diag_steps_n = 0
         n = 4096
         t = np.arange(n, dtype=np.float64) / self.driver.sample_rate
         self._ref_tone = np.exp(-1j * 2 * np.pi * self.driver.cw_offset * t)
         self._ref_tone_scaled = self._ref_tone / 2047.0
+        # complex64 copy for the hot demod path in _sweep_core. float32 pairs view
+        # directly as complex64, so the int16 -> complex conversion there is one
+        # astype plus a free view; the dot then runs in complex64 too. Checked over
+        # 200 randomised trials (1/2/4 buffers, 20-2000 ADC counts) against the
+        # float64 expression this replaced: worst relative error 1.4e-5 (-97.2 dB),
+        # against a system limited at ~42 dB S_repeat. 55 dB of margin.
+        self._ref_tone_c64 = self._ref_tone_scaled.astype(np.complex64)
         self.driver.start_tx_dual()
         self.driver.start_rx_dual(self._rx_capture, num_samples=n)
         time.sleep(0.05)
@@ -675,7 +749,21 @@ class SFCWEngine:
         libbladeRF.bladerf_set_gain(dev_ptr, bladerf.CHANNEL_RX(1), int(self.rx2_gain))
         self._gains_dirty = False
 
+    def _diag_dump(self):
+        if not SFCW_DIAG or getattr(self, '_diag_gaps', None) is None:
+            return
+        try:
+            self._diag_seq = getattr(self, '_diag_seq', 0) + 1
+            tag = f"{SFCW_DIAG}{self._diag_seq:02d}"
+            np.save(tag + '_gaps.npy', self._diag_gaps[:self._diag_gaps_n])
+            np.save(tag + '_steps.npy', self._diag_steps[:self._diag_steps_n])
+            print(f"[sfcw] diag: {self._diag_gaps_n} gaps, {self._diag_steps_n} steps "
+                  f"-> {tag}_*.npy")
+        except Exception as e:
+            print(f"[sfcw] diag dump failed: {e}")
+
     def _stop_tx_rx(self):
+        self._diag_dump()
         self.driver.stop_rx_dual()
         self.driver.stop_tx_dual()
         # Restore single-channel config so calib panel works after SFCW
@@ -684,9 +772,21 @@ class SFCWEngine:
 
 
     def _rx_capture(self, rx1_iq, rx2_iq):
+        # Stamp the arrival gap HERE, in the RX thread. The sweep thread cannot
+        # measure this for itself: timing its own wait conflates "the hardware
+        # took a buffer period to produce this" with "I was descheduled", and
+        # under the contention that causes the corruption in the first place the
+        # second is exactly what happens. Measured from the producer, the gap is
+        # a property of the data, not of the consumer's scheduling luck.
+        now = time.perf_counter()
         with self._rx_cond:
+            self._rx_gap = (now - self._rx_t) if self._rx_t is not None else 0.0
+            self._rx_t = now
             self._rx_latest = (rx1_iq, rx2_iq)
             self._rx_seq += 1
+            if SFCW_DIAG and self._diag_gaps_n < DIAG_MAX_GAPS:
+                self._diag_gaps[self._diag_gaps_n] = self._rx_gap
+                self._diag_gaps_n += 1
             self._rx_cond.notify_all()
 
     def _perform_sweep(self):
@@ -755,11 +855,17 @@ class SFCWEngine:
         rx_ch = bladerf.CHANNEL_RX(0)
 
         use_qt = qt_rx is not None
-        ref_tone_scaled = self._ref_tone_scaled
+        ref_tone_c64 = self._ref_tone_c64
         rx_cond = self._rx_cond
         stop_event = self._stop_event
 
         dropped_steps = 0
+        backlog_drained = 0
+        lockstep_misses = 0
+        buf_period = 4096.0 / float(self.driver.sample_rate)
+        settle_s = settle_count * buf_period
+        lo_gap = LOCKSTEP_LO * buf_period
+        hi_gap = LOCKSTEP_HI * buf_period
         # Peak |I|,|Q| seen on each RX, in ADC counts of 2047 full scale. Nothing in
         # this repo checked ADC headroom before 2026-08-29, and a too-hot reference was
         # the entire cause of the variability investigated then -- it is cheap to
@@ -791,16 +897,94 @@ class SFCWEngine:
                 libbladeRF.bladerf_set_frequency(dev_ptr, tx_ch, f)
                 libbladeRF.bladerf_set_frequency(dev_ptr, rx_ch, f)
 
+            t_retune = time.perf_counter()
             with rx_cond:
-                target_seq = self._rx_seq + settle_count
-                while self._rx_seq < target_seq:
-                    if not rx_cond.wait(timeout=1.0):
+                # Settle in WALL TIME, then prove we are back in lockstep with the
+                # hardware before believing a buffer.
+                #
+                # The old gate counted buffer DELIVERIES (`_rx_seq + settle_count`),
+                # which is not the same as waiting. Under CPU contention -- the
+                # asyncio JSON/websocket task in sdr_server is enough -- the RX
+                # thread gets starved and buffers pile up in libbladeRF's 16-deep
+                # ring. The sweep then consumes settle_count of them in ~zero wall
+                # time, so every one, and the capture after them, still holds
+                # PRE-RETUNE IQ at the previous frequency: a fully corrupted step.
+                # Measured 2026-09-05: 0/25500 bad cells with the engine running
+                # alone, 1/6120 through the full server. Raising settle_count could
+                # never fix it (163,200 cells over settle 1..10 showed no trend) --
+                # skipping N backlogged buffers costs no time and skips no history.
+                #
+                # (1) real time since the retune, so the hardware has actually
+                #     produced settled samples, and (2) drain until a buffer takes
+                #     real time to arrive, which is what proves the backlog is gone
+                #     and `_rx_latest` is genuinely current.
+                # + buf_period, and that term is structural, not slack. A buffer
+                # arriving at T holds the samples captured in [T - BP, T], so
+                # gating on its ARRIVAL says nothing about its CONTENTS: without
+                # this term a buffer arriving one period after the retune starts
+                # its capture AT the retune, and anything earlier straddles it.
+                # Measured before it existed: implied capture start ran down to
+                # 0.106*BP (43 us) after the retune, 11% of steps got under 0.2 ms,
+                # and 2 sweeps in 1199 were still corrupted after the lockstep bug
+                # above was fixed. With it, settle_count = N means N buffer periods
+                # of genuinely settled signal inside the capture window.
+                #
+                # settle_count therefore DEFAULTS TO 0, and that is not "settling
+                # off" -- it is "capture the first buffer that lies entirely after
+                # the retune". Extra settling was measured to buy nothing: at
+                # settle_count=0 over 77,542 steps the tightest capture began just
+                # 9.7 us after the retune, and the 1803 steps with under 41 us of
+                # margin had a worst robust-z of 2.81 against 3.7 for the run as a
+                # whole -- i.e. the least-settled captures were the cleanest. That
+                # is what quick-tune fastlock is supposed to do; the AD9361 is
+                # long since settled by the time a whole buffer has elapsed. Raise
+                # settle_count only with a per-step check (robust-z per (sweep,
+                # step) cell), never on an aggregate correlation -- see CLAUDE.md.
+                deadline = t_retune + buf_period + settle_s
+                while True:
+                    rem = deadline - time.perf_counter()
+                    if rem <= 0:
                         break
+                    rx_cond.wait(timeout=rem)
+
+                drains = 0
+                locked = False
+                while drains < MAX_BACKLOG_DRAIN:
+                    # Test what is already in hand before waiting for more. The
+                    # wall-clock sleep above usually overshoots into a buffer that
+                    # already qualifies, and unconditionally waiting for the NEXT
+                    # one cost a further period per step for nothing.
+                    if (self._rx_t is not None and self._rx_t >= deadline
+                            and lo_gap <= self._rx_gap <= hi_gap):
+                        locked = True
+                        break
+                    last_seq = self._rx_seq
+                    while self._rx_seq <= last_seq:
+                        if not rx_cond.wait(timeout=1.0):
+                            break
+                    if self._rx_seq <= last_seq:
+                        break
+                    drains += 1
+                    backlog_drained += 1
+                if not locked:
+                    # Never reached lockstep inside the ring's depth. The capture
+                    # below is taken anyway (a dropped step punches a zero into
+                    # h_cal, which corrupts the IFFT just as badly) but it is
+                    # counted, because a nonzero count here means the RX thread is
+                    # being starved for longer than the ring can absorb.
+                    lockstep_misses += 1
 
                 sig_bufs = []
                 ref_bufs = []
+                # The buffer the gate accepted is already proven current and
+                # post-settle -- use it rather than waiting for another, which
+                # cost a whole buffer period per step (21 ms/sweep at 51 steps)
+                # for no extra safety.
+                if self._rx_latest is not None:
+                    sig_bufs.append(self._rx_latest[0])
+                    ref_bufs.append(self._rx_latest[1])
                 last_seq = self._rx_seq
-                for _ in range(num_buffers):
+                while len(sig_bufs) < num_buffers:
                     while self._rx_seq <= last_seq:
                         if not rx_cond.wait(timeout=1.0):
                             break
@@ -810,23 +994,49 @@ class SFCWEngine:
                     sig_bufs.append(self._rx_latest[0])
                     ref_bufs.append(self._rx_latest[1])
 
+                t_accept = time.perf_counter()
+
             if sig_bufs:
-                sig_arr = np.asarray(sig_bufs, dtype=np.float64)
-                ref_arr = np.asarray(ref_bufs, dtype=np.float64)
-                sig_cplx = (sig_arr[:, 0::2] + 1j * sig_arr[:, 1::2]) * ref_tone_scaled
-                ref_cplx = (ref_arr[:, 0::2] + 1j * ref_arr[:, 1::2]) * ref_tone_scaled
-                h_signal[i] = sig_cplx.mean()
-                h_reference[i] = ref_cplx.mean()
-                # max(|min|, max) rather than np.abs(...).max() -- two reductions with
-                # no temporary allocation, which matters at ~3 sweeps/s on the Pi.
-                p1 = max(-sig_arr.min(), sig_arr.max())
-                if p1 > adc_peak_rx1:
-                    adc_peak_rx1 = p1
-                p2 = max(-ref_arr.min(), ref_arr.max())
-                if p2 > adc_peak_rx2:
-                    adc_peak_rx2 = p2
+                # mean(iq * tone) IS a dot product, so it is one BLAS call and no
+                # intermediates. The float64 expression this replaced allocated five
+                # temporaries per channel per step -- two strided float64 slices for I
+                # and Q, a complex128 from the 1j*Q, another from the addition, another
+                # from the tone multiply -- about 320 kB of traffic per channel to
+                # produce ONE complex number. int16 -> float32 -> view(complex64) is a
+                # single pass and the view is free, because float32 I,Q pairs already
+                # have exactly the complex64 layout. See _ref_tone_c64 for the accuracy
+                # check. adc_peak is taken on the int16 directly (via Python ints, so
+                # negating a hypothetical -32768 cannot overflow) rather than on a
+                # float64 copy that no longer exists.
+                nb = len(sig_bufs)
+                acc_s = 0j
+                acc_r = 0j
+                for sb, rb in zip(sig_bufs, ref_bufs):
+                    acc_s += np.dot(sb.astype(np.float32).view(np.complex64), ref_tone_c64)
+                    acc_r += np.dot(rb.astype(np.float32).view(np.complex64), ref_tone_c64)
+                    p1 = max(int(sb.max()), -int(sb.min()))
+                    if p1 > adc_peak_rx1:
+                        adc_peak_rx1 = p1
+                    p2 = max(int(rb.max()), -int(rb.min()))
+                    if p2 > adc_peak_rx2:
+                        adc_peak_rx2 = p2
+                nsamp = len(ref_tone_c64)
+                h_signal[i] = acc_s / (nb * nsamp)
+                h_reference[i] = acc_r / (nb * nsamp)
             else:
                 dropped_steps += 1
+
+            if SFCW_DIAG and self._diag_steps_n < DIAG_MAX_STEPS:
+                # h_cal for THIS step is recorded alongside its own timing, so an
+                # outlier step can be tied to the margin it was captured with
+                # without aligning against the websocket stream.
+                hr = h_reference[i]
+                hc = (h_signal[i] / hr) if abs(hr) > 1e-12 else 0j
+                self._diag_steps[self._diag_steps_n] = (
+                    i, drains, self._rx_gap, t_accept - t_retune,
+                    backlog_drained, 1.0 if locked else 0.0,
+                    hc.real, hc.imag)
+                self._diag_steps_n += 1
 
             if progress_cb and i % 10 == 0:
                 progress_cb(i)
@@ -919,8 +1129,13 @@ class SFCWEngine:
             'type': 'range_profile',
             'distances': distances.tolist(),
             'magnitudes': magnitude_db.tolist(),
-            'h_cal_real': [round(v, 8) for v in h_cal_real],
-            'h_cal_imag': [round(v, 8) for v in h_cal_imag],
+            # Vectorised for the same reason as sdr_server's broadcast rounding:
+            # a Python comprehension over 102 elements holds the GIL for ~0.55 ms
+            # on the SWEEP thread, which is ~1.3 RX buffer periods of backlog
+            # handed straight to the next step. np.round matches round()'s
+            # half-to-even, so the output is identical.
+            'h_cal_real': np.round(h_cal_real, 8).tolist(),
+            'h_cal_imag': np.round(h_cal_imag, 8).tolist(),
             'range_resolution': SPEED_OF_LIGHT / (2 * (stop - start)),
             'unambiguous_range': max_range,
             'displayed_range_max': max_range / 2 - self.range_offset,

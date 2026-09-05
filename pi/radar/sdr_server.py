@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import signal
 import sys
 import numpy as np
 import websockets
@@ -40,8 +41,43 @@ class SDRServer:
         print(f"[sdr] Starting WebSocket server on port {PORT}")
         self._broadcast_task = asyncio.create_task(self._broadcast_loop())
         self._sfcw_broadcast_task = asyncio.create_task(self._sfcw_broadcast_loop())
+
+        # Shut the device down properly on SIGTERM/SIGINT. Without this the
+        # process died with TX and RX still enabled and USB transfers in flight,
+        # so bladerf_close() never ran and the FPGA kept DMA-ing into an endpoint
+        # that had gone away. That is what left the board wedged -- it still
+        # enumerates, but every open fails "No devices available" and even
+        # libbladeRF's own USB reset on open does not clear it (recovery needed
+        # `usbreset`, or a replug). start.py terminates this process with SIGTERM
+        # on every restart, so the damage accumulated once per restart. See
+        # CLAUDE.md "repeated sfcw_start/stop degrades the bladeRF".
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, stop.set)
+            except NotImplementedError:
+                pass
+
         async with websockets.serve(self._handler, "0.0.0.0", PORT):
-            await asyncio.Future()
+            await stop.wait()
+
+        self._shutdown()
+
+    def _shutdown(self):
+        print("[sdr] shutting down: stopping streams and closing device")
+        try:
+            if self.sfcw.running or self.sfcw._warm:
+                self.sfcw.stop()
+        except Exception as e:
+            print(f"[sdr] sweep stop during shutdown: {e}")
+        for fn in (self.driver.stop_rx_dual, self.driver.stop_tx_dual,
+                   self.driver.close):
+            try:
+                fn()
+            except Exception as e:
+                print(f"[sdr] {fn.__name__} during shutdown: {e}")
+        print("[sdr] device closed")
 
     async def _handler(self, ws):
         self.clients.add(ws)
@@ -248,8 +284,18 @@ class SDRServer:
             elif isinstance(data, dict) and data.get('type') == 'range_profile':
                 result_msg = {
                     'type': 'sfcw_result',
-                    'distances': [round(d, 4) for d in data['distances']],
-                    'magnitudes': [round(m, 2) for m in data['magnitudes']],
+                    # np.round(...).tolist(), NOT [round(x, n) for x in ...].
+                    # Byte-identical output, 2.778 -> 0.023 ms/sweep (122x). The
+                    # comprehensions were pure Python over ~512 elements and so held
+                    # the GIL for ~2.8 ms in one block -- about 7 RX buffer periods --
+                    # stalling _rx_loop_dual exactly while the next sweep was stepping.
+                    # That backlog is what corrupted a step: the sweep then drained
+                    # pre-retune buffers holding the PREVIOUS frequency's IQ. Measured
+                    # 2026-09-05: settle=1 is 0/299 sweeps contention-free but 18/399
+                    # through the server, so this cost ~42 ms of sweep time in the
+                    # settle margin needed to survive it. Keep this vectorised.
+                    'distances': np.round(data['distances'], 4).tolist(),
+                    'magnitudes': np.round(data['magnitudes'], 2).tolist(),
                     'h_cal_real': data.get('h_cal_real', []),
                     'h_cal_imag': data.get('h_cal_imag', []),
                     'range_resolution': round(data['range_resolution'], 4),

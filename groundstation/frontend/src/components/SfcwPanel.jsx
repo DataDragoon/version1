@@ -51,6 +51,7 @@ function geometryMismatch(bgModel, lidarOffsetMm, params) {
 const BUFFER_SAMPLES = 4096;
 const SAMPLE_RATE = 10_000_000;
 const BUFFER_TIME_MS = (BUFFER_SAMPLES / SAMPLE_RATE) * 1000;
+const PER_STEP_OVERHEAD_MS = 2.89;
 
 // SC16_Q11 full scale, and the fraction above which the AD9361 RX path compresses
 // enough to matter. Mirrors ADC_FULL_SCALE / ADC_HOT_FRACTION_* in sfcw_engine.py --
@@ -179,10 +180,16 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
   // sizing the axis past where real data can ever land.
   const bigRangeMax = Math.max(0.5, Math.min(maxRange, 3));
   const captureTimeMs = numBuffers * BUFFER_TIME_MS;
-  // Per-step wait is (settleCount + numBuffers) buffer arrivals — see
-  // pi/radar/sfcw_engine.py _sweep_core. Real time tends to run a bit under this
-  // because RX callbacks overlap with per-step Python overhead.
-  const sweepTime = numSteps * (settleCount + numBuffers) * BUFFER_TIME_MS / 1000;
+  // Per-step time is a fixed overhead plus (1 + settleCount + numBuffers) buffer
+  // periods: the leading 1 is the structural period the settle gate always waits
+  // so a capture cannot straddle the retune (see sfcw_engine.py _sweep_core).
+  // PER_STEP_OVERHEAD_MS is dominated by the two bladerf_schedule_retune calls
+  // (~2.4 ms) plus the demod and the gate's arrival phase. Fitted to measurements
+  // through the running server on 2026-09-05: settleCount 0 -> 168.3 ms/sweep and
+  // settleCount 3 -> 231.1 ms at 51 steps, which this reproduces to 0.2 ms. The
+  // old formula omitted the overhead entirely and so read 84 ms against a real
+  // 210 ms.
+  const sweepTime = numSteps * (PER_STEP_OVERHEAD_MS + (1 + settleCount + numBuffers) * BUFFER_TIME_MS) / 1000;
 
   return (
     <>
@@ -246,13 +253,14 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
               value={settleCount}
               unit="buffers"
               onChange={(v) => { update('settleCount', v); sendParams({ settleCount: v }); }}
-              min={1}
+              min={0}
               max={30}
             />
           </div>
           <span className="text-[9px] text-[#333333] leading-tight px-1">
             {captureTimeMs.toFixed(2)} ms capture per step ({(numBuffers * BUFFER_SAMPLES).toLocaleString()} samples),
-            averaged over {numBuffers} buffer{numBuffers === 1 ? '' : 's'} — retune settle is {settleCount} buffers first
+            averaged over {numBuffers} buffer{numBuffers === 1 ? '' : 's'} — after the retune the gate always
+            waits one buffer so the capture cannot straddle it, plus {settleCount} buffer{settleCount === 1 ? '' : 's'} of extra settling
           </span>
         </div>
         <EditableField
