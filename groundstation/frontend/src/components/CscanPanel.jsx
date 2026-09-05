@@ -23,7 +23,7 @@ export default function CscanPanel({
   superFit, onCaptureSuperFit, onClearSuperFit,
   sharedScale, bgDiag, procParams, captureProgress,
   scaleScope, onScaleScopeChange, rowScales, showGate, onShowGateChange,
-  scaleLink, onScaleLinkChange, gridScales,
+  scaleLink, onScaleLinkChange, gridScales, liveDiag,
   roverConnected, roverStatus, sendRover, roverScan,
 }) {
   const {
@@ -1081,9 +1081,33 @@ export default function CscanPanel({
             )}
           </>
         )}
+        {/* "A background is loaded" and "the background was applied" are
+            different statements, and the Live Sweep trace is the one place the
+            difference was invisible -- it now carries this panel's subtraction,
+            so it has to report when it could not. */}
+        {liveDiag && (bgRef || bgModel || superFit) && (
+          <div
+            className={cn(
+              'px-2 py-1.5 rounded-lg border text-[9px] leading-relaxed',
+              !liveDiag.applied
+                ? 'bg-red-500/5 border-red-500/30 text-red-400'
+                : liveDiag.clamped
+                  ? 'bg-[#f59e0b]/5 border-[#f59e0b]/30 text-[#f59e0b]'
+                  : 'bg-[#22d3ee]/5 border-[#22d3ee]/30 text-[#22d3ee]',
+            )}
+          >
+            {!liveDiag.applied
+              ? `Live trace: NOT subtracted — ${liveDiag.reason}.`
+              : liveDiag.clamped
+                ? `Live trace: subtracted, but the model was CLAMPED — the live standoff is outside its captured span.`
+                : `Live trace: subtracted (${liveDiag.source === 'superfit'
+                    ? `Super Fit cell ${liveDiag.cell.ix},${liveDiag.cell.iy}`
+                    : liveDiag.source === 'model' ? 'model' : 'reference'}, ${liveDiag.mode}).`}
+          </div>
+        )}
         <div className="px-2 text-[9px] text-white/40 leading-relaxed">
           {superFit
-            ? 'Super Fit: each cell is subtracted from the reference captured at that same cell.'
+            ? 'Super Fit: each cell is subtracted from the reference captured at that same cell. The Live Sweep trace uses the reference for the cell about to be captured.'
             : bgModel
               ? 'Model background, inferred per cell from that cell’s own lidar standoff.'
               : bgRef

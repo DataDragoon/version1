@@ -106,6 +106,7 @@ export default function Sidebar({
   onBscanScaleLinkChange,
   cscanRowScales,
   cscanGridScales,
+  cscanLiveDiag,
   onBscanScaleRangeChange,
   sarBscanData,
   sarResult,
@@ -132,6 +133,10 @@ export default function Sidebar({
   onSarEpsilonRChange,
   sarWindowType,
   onSarWindowTypeChange,
+  sarAutoStandoff,
+  onSarAutoStandoffChange,
+  sarManualStandoffMm,
+  onSarManualStandoffChange,
   sarWallThickness,
   onSarWallThicknessChange,
   sarRefraction,
@@ -404,6 +409,7 @@ export default function Sidebar({
                   onScaleScopeChange={onBscanScaleScopeChange}
                   rowScales={cscanRowScales}
                   gridScales={cscanGridScales}
+                  liveDiag={cscanLiveDiag}
                   scaleLink={bscanScaleLink}
                   onScaleLinkChange={onBscanScaleLinkChange}
                   showGate={bscanShowGate}
@@ -453,6 +459,10 @@ export default function Sidebar({
                   onEpsilonRChange={onSarEpsilonRChange}
                   windowType={sarWindowType}
                   onWindowTypeChange={onSarWindowTypeChange}
+                  autoStandoff={sarAutoStandoff}
+                  onAutoStandoffChange={onSarAutoStandoffChange}
+                  manualStandoffMm={sarManualStandoffMm}
+                  onManualStandoffChange={onSarManualStandoffChange}
                   wallThickness={sarWallThickness}
                   onWallThicknessChange={onSarWallThicknessChange}
                   refraction={sarRefraction}

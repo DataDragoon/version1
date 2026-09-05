@@ -2,12 +2,14 @@ import { useState } from 'react';
 import { cn } from '@/lib/utils';
 import { Section, InfoTile } from './Sidebar';
 
-export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled, onBgEnabledChange, svdEnabled, svdK, svdStrength, onSvdEnabledChange, onSvdKChange, onSvdStrengthChange, scaleMode, onScaleModeChange, aperture, onApertureChange, coherent, onCoherentChange, dynRange, onDynRangeChange, maxDepth, onMaxDepthChange, epsilonR, onEpsilonRChange, windowType, onWindowTypeChange, wallThickness, onWallThicknessChange, refraction, onRefractionChange, viewMode, onViewModeChange, colormap, onColormapChange, onScanAction }) {
+export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled, onBgEnabledChange, svdEnabled, svdK, svdStrength, onSvdEnabledChange, onSvdKChange, onSvdStrengthChange, scaleMode, onScaleModeChange, aperture, onApertureChange, coherent, onCoherentChange, dynRange, onDynRangeChange, maxDepth, onMaxDepthChange, epsilonR, onEpsilonRChange, windowType, onWindowTypeChange, autoStandoff, onAutoStandoffChange, manualStandoffMm, onManualStandoffChange, wallThickness, onWallThicknessChange, refraction, onRefractionChange, viewMode, onViewModeChange, colormap, onColormapChange, onScanAction }) {
   const numPositions = bscanData ? bscanData.length : 0;
 
   // How many cells carry a lidar standoff. The back-projection uses each cell's own
-  // value; cells without one fall back to zero, so a partially-instrumented scan is
-  // silently mixing two conventions and the operator should be able to see that.
+  // value; cells without one are filled with the MEDIAN of those that have one (it was
+  // zero until 2026-09-04, which injected the full standoff as a path error at exactly
+  // the positions that knew least about themselves), so a partially-instrumented scan
+  // is still mixing a measurement with a guess and the operator should see that.
   //
   // NOTE the standoffN === 0 case used to fall through both tests and show NOTHING,
   // which is the worst of the three: a scan with no lidar at all reconstructs with
@@ -15,8 +17,19 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
   // the per-position standoff correction exists for. It is not hypothetical -- the
   // 3row* sets and 2_pipe_test2 are all lidar-less.
   const standoffN = sarResult ? sarResult.standoffN : null;
-  const standoffPartial = standoffN !== null && standoffN > 0 && standoffN < numPositions;
-  const standoffNone = standoffN === 0 && numPositions > 0;
+  const manual = sarResult ? sarResult.standoffSource === 'manual' : !autoStandoff;
+  // Both of these only mean anything about a lidar column, so neither fires in manual
+  // mode -- there every position carries the same entered value by construction.
+  const standoffPartial = !manual && standoffN !== null && standoffN > 0 && standoffN < numPositions;
+  const standoffNone = !manual && standoffN === 0 && numPositions > 0;
+
+  // What the recorded column actually looks like, shown next to the control rather than
+  // only in a warning. A scan whose min/median/max are millimetres apart needs no
+  // thought; one spanning half a metre is the whole diagnosis in one line.
+  const standoffStats = sarResult && sarResult.standoffMedianMm !== null
+    ? `${sarResult.standoffMinMm.toFixed(0)} / ${sarResult.standoffMedianMm.toFixed(0)} / `
+      + `${sarResult.standoffMaxMm.toFixed(0)} mm (min / median / max)`
+    : null;
 
   // The worker falls back to the incoherent path when the data carries no h_cal, and
   // the Mode buttons would otherwise keep claiming Coherent.
@@ -194,6 +207,48 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
           Snell at both faces — worth ~29° of two-way phase at wide angles, and it drops
           contributions no refracted ray can reach. Coherent mode only.
         </div>
+        {/* Standoff source. The back-projection adds each position's own standoff to
+            the path, which is what lets an imprecise rig focus at all -- corrected, it
+            survives 30 mm of scatter; uncorrected it needs 3 mm. But that only helps
+            when the column is NOISY. When the lidar is simply wrong -- shooting past
+            the target, as rebar1.json recorded on 32 of 43 cells -- no correction
+            recovers it, and the failure is loud: the reachable depth collapses and the
+            image becomes a depth-uniform smear. Manual substitutes one entered
+            standoff for the whole scan. */}
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            onClick={() => onAutoStandoffChange(!autoStandoff)}
+            className={cn(
+              'px-3 py-2 rounded-xl text-xs font-medium transition-all border',
+              autoStandoff
+                ? 'bg-[#22d3ee]/10 border-[#22d3ee]/30 text-[#22d3ee]'
+                : 'bg-amber-500/10 border-amber-500/30 text-amber-400'
+            )}
+          >
+            {autoStandoff ? '● Auto standoff' : 'Manual standoff'}
+          </button>
+          <EditableField
+            label="Standoff"
+            value={autoStandoff ? '—' : manualStandoffMm}
+            unit="mm"
+            onChange={onManualStandoffChange}
+            min={0}
+            max={5000}
+            disabled={autoStandoff}
+          />
+        </div>
+        <div className="px-1 text-[9px] text-[#555555] leading-relaxed">
+          <span className="text-[#888888]">Auto</span> uses each cell&rsquo;s own recorded
+          lidar standoff; cells without one are filled with the median of those that have
+          it. <span className="text-[#888888]">Manual</span> applies one entered standoff
+          to every position — use it when the lidar missed the wall, which no per-cell
+          correction can undo.
+          {standoffStats && (
+            <>
+              {' '}Recorded: {standoffStats}
+            </>
+          )}
+        </div>
         <div className="px-1 text-[9px] text-[#555555] leading-relaxed">
           {/* Deliberately not asserting a winner -- see the note in sar.worker.js: two
               measurements on the same scan disagreed about rectangular vs Hanning. */}
@@ -204,7 +259,10 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
         {standoffPartial && (
           <div className="px-1 text-[9px] text-amber-400/80 leading-relaxed">
             Only {standoffN}/{numPositions} cells have a lidar standoff — the rest are
-            treated as zero standoff.
+            filled with the median of those that do
+            {sarResult.standoffMedianMm !== null
+              ? ` (${sarResult.standoffMedianMm.toFixed(0)} mm)`
+              : ''}.
           </div>
         )}
         {standoffNone && (
@@ -213,16 +271,54 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
             against the wall. Uncorrected, focus needs the standoff stable to ~3 mm.
           </div>
         )}
+        {/* The one warning that matters on a scan like rebar1.json, and the reason the
+            Max Depth auto-fit is held off while it is lit: fitting to the collapsed
+            depth would clear the clip banner and leave nothing on screen explaining a
+            2 cm image. */}
+        {sarResult && sarResult.standoffSuspect && (
+          <div className="px-2 py-1.5 rounded-lg border border-red-500/30 bg-red-500/5 text-[9px] text-red-400 leading-relaxed">
+            {sarResult.standoffOverRange
+              ? `Recorded standoff reaches ${sarResult.standoffMaxMm.toFixed(0)} mm, at or beyond
+                 the ${(sarResult.apparentAvailable * 100).toFixed(1)} cm this sweep reaches — the
+                 claimed wall face is past the last range bin.`
+              : `Recorded standoff spans ${sarResult.standoffSpreadMm.toFixed(0)} mm across the
+                 aperture, against a sweep that reaches
+                 ${(sarResult.apparentAvailable * 100).toFixed(1)} cm — that is a lidar that
+                 stopped seeing the wall, not a rig that wandered.`}
+            {' '}The standoff correction cannot fix a wrong column — it is eating the depth
+            budget and defocusing the aperture. Switch to Manual standoff and enter the
+            standoff you measured; do not take it from this record, whose own median
+            {sarResult.standoffMedianMm !== null
+              ? ` (${sarResult.standoffMedianMm.toFixed(0)} mm)`
+              : ''} is part of what is being flagged. Max Depth auto-fit is held off
+            while this is lit.
+          </div>
+        )}
         {coherentDowngraded && (
           <div className="px-1 text-[9px] text-amber-400/80 leading-relaxed">
             Coherent is selected but this scan carries no h_cal — reconstructed
             incoherently, so there is no coherence pane and no layered ray.
           </div>
         )}
-        {sarResult && sarResult.depthClipped && (
-          <div className="px-1 text-[9px] text-amber-400/80 leading-relaxed">
-            Max Depth clipped to {(sarResult.depthMax * 100).toFixed(1)} cm — the sweep
-            does not reach further at εr {(sarResult.epsilonR ?? 1).toFixed(2)}.
+        {/* Always visible, not only while clipped. The auto-fit pulls Max Depth down to
+            this number and thereby clears `depthClipped`, so a banner that only appears
+            when clipped disappears exactly when the operator wants to know why the
+            image is shallow. */}
+        {sarResult && (
+          <div
+            className={cn(
+              'px-1 text-[9px] leading-relaxed',
+              sarResult.depthClipped ? 'text-amber-400/80' : 'text-[#555555]',
+            )}
+          >
+            Sweep reaches {(sarResult.apparentAvailable * 100).toFixed(1)} cm of apparent
+            range, so at εr {(sarResult.epsilonR ?? 1).toFixed(2)} and the{' '}
+            {sarResult.standoffAppliedMm.toFixed(0)} mm standoff actually applied
+            ({manual ? 'manual' : 'largest recorded'}), the deepest reconstructable depth is{' '}
+            {(sarResult.reachableDepth * 100).toFixed(1)} cm.
+            {sarResult.depthClipped
+              ? ` Max Depth is clipped to ${(sarResult.depthMax * 100).toFixed(1)} cm.`
+              : ''}
           </div>
         )}
       </Section>
@@ -384,11 +480,12 @@ export default function SarPanel({ bscanData, sarResult, sarProgress, bgEnabled,
   );
 }
 
-function EditableField({ label, value, unit, onChange, min, max }) {
+function EditableField({ label, value, unit, onChange, min, max, disabled }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
 
   const startEdit = () => {
+    if (disabled) return;
     setDraft(String(value));
     setEditing(true);
   };
@@ -407,13 +504,15 @@ function EditableField({ label, value, unit, onChange, min, max }) {
       className={cn(
         'relative flex flex-col gap-0.5 p-3 rounded-xl border',
         'transition-all duration-300',
-        editing
-          ? 'border-emerald-500/40 bg-emerald-500/5 cursor-text'
-          : 'border-white/8 bg-[#0a0a0a]/60 cursor-pointer hover:border-white/20 hover:bg-white/[0.02]',
+        disabled
+          ? 'border-white/5 bg-white/2 cursor-not-allowed opacity-40'
+          : editing
+            ? 'border-emerald-500/40 bg-emerald-500/5 cursor-text'
+            : 'border-white/8 bg-[#0a0a0a]/60 cursor-pointer hover:border-white/20 hover:bg-white/[0.02]',
       )}
     >
       <span className="text-[10px] font-medium uppercase tracking-wider text-[#555555]">{label}</span>
-      {editing ? (
+      {editing && !disabled ? (
         <div className="flex items-baseline gap-1">
           <input
             autoFocus

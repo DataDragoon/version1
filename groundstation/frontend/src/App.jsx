@@ -8,9 +8,9 @@ import { useBgModelWorker } from './hooks/useBgModelWorker';
 import { inferBgModel } from './lib/bgModelInfer';
 import { computeCaptureStats } from './lib/bgCaptureStats';
 import { computeRangeProfile } from './lib/rangeProfile';
-import { applyBscanBg, bgForStandoff, coherentMean } from './lib/bscanBg';
+import { applyBscanBg, bgForStandoff, backgroundFor, coherentMean } from './lib/bscanBg';
 import { computeSharedScale, computeRowScales, computeGridScales, bgDiagnostics } from './lib/cscanGrid';
-import { cellForIndex } from './lib/cscanGrid';
+import { cellForIndex, orderedCellForIndex, BG_STATUS, BG_STATUS_TEXT } from './lib/cscanGrid';
 import { useRoverScan } from './hooks/useRoverScan';
 import { DEFAULT_PARAMS as IMAGING_DEFAULT_PARAMS } from './lib/imagingEffects';
 
@@ -115,6 +115,37 @@ function runPhaseUnwindTest(samples, sfcwParams) {
     residuals,
     freqs,
     distances: samples.map(s => s.lidar_standoff_mm),
+  };
+}
+
+// Fold a background spectrum into one live sweep.
+//
+// Complex must write back into h_cal_real/imag: SfcwDisplay recomputes its own
+// range profile from those fields, so a result that replaces only
+// magnitudes/distances is silently discarded. Magnitude cannot be expressed as
+// a modified h_cal at all -- a dB difference is not a spectrum -- so the
+// background rides along and the display transforms both with whatever window
+// it currently has and differences the results, which is the only way the two
+// profiles are guaranteed to be built the same way.
+function applyBgToSweep(sfcwResult, bgReal, bgImag, subMode) {
+  const numSteps = sfcwResult.h_cal_real.length;
+  if (subMode === 'magnitude') {
+    return { ...sfcwResult, bg_h_cal_real: bgReal, bg_h_cal_imag: bgImag, bg_sub_mode: 'magnitude' };
+  }
+  const subReal = new Array(numSteps);
+  const subImag = new Array(numSteps);
+  for (let i = 0; i < numSteps; i++) {
+    subReal[i] = sfcwResult.h_cal_real[i] - bgReal[i];
+    subImag[i] = sfcwResult.h_cal_imag[i] - bgImag[i];
+  }
+  const rp = computeRangeProfile(subReal, subImag, numSteps, sfcwResult.step_size, sfcwResult.range_offset);
+  return {
+    ...sfcwResult,
+    h_cal_real: subReal,
+    h_cal_imag: subImag,
+    magnitudes: rp.magnitudes,
+    distances: rp.distances,
+    bg_sub_mode: 'complex',
   };
 }
 
@@ -606,6 +637,60 @@ export default function App() {
     [cscanProcessedData, bscanParams.gateStart, bscanParams.gateEnd, bscanParams.metric],
   );
 
+  // The Live Sweep trace at the top of the C-SCAN viewport, subtracted against
+  // THIS panel's background.
+  //
+  // It used to be handed processedSfcwResult -- the SFCW panel's background --
+  // so capturing a reference or loading a model here changed the grid and the
+  // B-scan under it and left the trace above them untouched, which is exactly
+  // the "a background is loaded" / "the background was applied" confusion the
+  // rest of this panel was instrumented to prevent.
+  //
+  // It resolves the source through the same backgroundFor() every grid cell
+  // goes through, so the trace cannot disagree with the cell it is about to
+  // become. Two things it must get right:
+  //   - the STANDOFF is the live one, not a stored cell's, because that is what
+  //     the next capture will be evaluated at;
+  //   - Super Fit is keyed by cell, so the trace is subtracted against the
+  //     reference for the cell ABOUT TO BE CAPTURED. bscanData.length is that
+  //     index in both scan modes (a rover raster resumes at capturedCount, so
+  //     its own index and this agree), and orderedCellForIndex maps it through
+  //     whichever snake is running.
+  const cscanLiveProcessed = useMemo(() => {
+    const noop = (reason, status) => ({ result: sfcwResult, diag: { applied: false, reason, status } });
+    if (!sfcwResult) return { result: sfcwResult, diag: null };
+    if (!sfcwResult.h_cal_real || !sfcwResult.h_cal_imag) return noop('sweep carries no h_cal');
+    if (!bgApplied) return noop('background subtraction is off');
+    if (!bscanBgRef && !bscanBgModel && !bscanSuperFit) return noop('no background selected');
+
+    const numSteps = sfcwResult.h_cal_real.length;
+    const cell = orderedCellForIndex(
+      bscanData.length, bscanParams.hCount, bscanParams.vCount, bscanParams.scanMode);
+    const pos = {
+      lidar_standoff_mm: sfcwStandoffMm,
+      grid_ix: cell.ix,
+      grid_iy: cell.iy,
+    };
+
+    const bg = backgroundFor(
+      { bgRef: bscanBgRef, bgModel: bscanBgModel, superFit: bscanSuperFit }, pos, numSteps);
+    if (!bg.bgReal) return noop(BG_STATUS_TEXT[bg.status] || bg.status, bg.status);
+
+    return {
+      result: applyBgToSweep(sfcwResult, bg.bgReal, bg.bgImag, bscanBgSubMode),
+      diag: {
+        applied: true,
+        status: bg.status,
+        clamped: bg.status === BG_STATUS.CLAMPED,
+        source: bscanSuperFit ? 'superfit' : bscanBgModel ? 'model' : 'ref',
+        mode: bscanBgSubMode,
+        standoffMm: sfcwStandoffMm,
+        cell,
+      },
+    };
+  }, [sfcwResult, bgApplied, bscanBgRef, bscanBgModel, bscanSuperFit, bscanBgSubMode,
+      sfcwStandoffMm, bscanData.length, bscanParams.hCount, bscanParams.vCount, bscanParams.scanMode]);
+
   const cscanBgDiag = useMemo(() => bgDiagnostics(cscanProcessedData), [cscanProcessedData]);
 
   // 2D Map state
@@ -634,6 +719,20 @@ export default function App() {
   // output grid. Only the second is a real parameter, and it belongs here: it
   // sets the extent and the cost of the reconstruction, not what a display shows.
   const [sarMaxDepth, setSarMaxDepth] = useState(70);
+  // Where the per-position standoff comes from. Auto (the default) reads each cell's
+  // own recorded lidar standoff, which is what makes an imprecise rig imageable --
+  // corrected, focus survives 30 mm of standoff scatter; uncorrected it needs 3 mm.
+  //
+  // But the lidar can be WRONG rather than noisy, and no correction recovers a scan
+  // from a wrong column. rebar1.json (2026-09-04) recorded ~670 mm on 32 of 43 cells
+  // while its strongest scatterer sits at ~0.41 m of apparent range -- 26 cm in FRONT
+  // of the claimed wall face. The lidar had been shooting past the target for most of
+  // the traverse. The consequence is not subtle: reachable depth collapsed from 26 cm
+  // to 2.8 cm and max coherence from 0.96 to 0.72, i.e. a depth-uniform smear.
+  //
+  // Turning this off substitutes one operator-entered standoff for the whole scan.
+  const [sarAutoStandoff, setSarAutoStandoff] = useState(true);
+  const [sarManualStandoffMm, setSarManualStandoffMm] = useState(0);
   // Relative permittivity of the wall. The SAR back-projection had NO velocity
   // parameter before 2026-09-03 and reconstructed at the speed of light in air, so
   // the hyperbola it matched had the wrong curvature and its depth axis read sqrt(er)
@@ -700,7 +799,9 @@ export default function App() {
     kaiserBeta: 3,
     wallThickness: sarWallThickness,
     refraction: sarRefraction,
-  }), [bscanParams.hStep, sarMaxDepth, sarAperture, sarCoherent, sfcwParams.startFreq, sarSvdEnabled, sarSvdK, sarSvdStrength, sarEpsilonR, sarWindowType, sarWallThickness, sarRefraction]);
+    autoStandoff: sarAutoStandoff,
+    manualStandoffMm: sarManualStandoffMm,
+  }), [bscanParams.hStep, sarMaxDepth, sarAperture, sarCoherent, sfcwParams.startFreq, sarSvdEnabled, sarSvdK, sarSvdStrength, sarEpsilonR, sarWindowType, sarWallThickness, sarRefraction, sarAutoStandoff, sarManualStandoffMm]);
   const { sarResult, sarProgress } = useSarWorker(sarBscanInput, sarParams);
 
   // Max Depth auto-fit. The field is TRUE depth below the wall face, so the 70 cm
@@ -713,6 +814,12 @@ export default function App() {
   useEffect(() => {
     if (!sarDepthAutoFitRef.current) return;
     if (!sarResult || !sarResult.depthClipped) return;
+    // A clip caused by a standoff column that cannot be right is NOT something to fit
+    // to. Fitting Max Depth down to the clipped value clears `depthClipped` on the next
+    // pass, so the amber banner that announced the collapse fires once and vanishes --
+    // leaving a 2 cm-deep image and nothing on screen saying why. Stay armed (do not
+    // clear the ref) so the fit still happens once the standoff is corrected.
+    if (sarResult.standoffSuspect) return;
     sarDepthAutoFitRef.current = false;
     // Floored, so the value it lands on cannot itself re-trip the clip.
     setSarMaxDepth(Math.max(1, Math.floor(sarResult.depthMax * 100)));
@@ -721,6 +828,19 @@ export default function App() {
   const handleSarMaxDepthChange = useCallback((v) => {
     sarDepthAutoFitRef.current = false;
     setSarMaxDepth(v);
+  }, []);
+
+  // Changing the standoff source or value moves the reachable depth, so it re-arms the
+  // fit for the same reason an import does: the previous Max Depth was fitted to a
+  // reachable depth that no longer applies.
+  const handleSarAutoStandoffChange = useCallback((v) => {
+    sarDepthAutoFitRef.current = true;
+    setSarAutoStandoff(v);
+  }, []);
+
+  const handleSarManualStandoffChange = useCallback((v) => {
+    sarDepthAutoFitRef.current = true;
+    setSarManualStandoffMm(v);
   }, []);
 
   // 2D Map uses the same processed B-scan as the main B-scan panel, optionally with its own SVD
@@ -788,35 +908,7 @@ export default function App() {
     // window it currently has and differences the results. Doing it that way keeps the
     // window / zero-pad / range-comp controls live and keeps both profiles built the
     // same way, which is the only way the difference means anything.
-    if (sfcwBgSubMode === 'magnitude') {
-      return {
-        result: { ...sfcwResult, bg_h_cal_real: bgReal, bg_h_cal_imag: bgImag,
-                  bg_sub_mode: 'magnitude' },
-        diag,
-      };
-    }
-
-    const subReal = new Array(numSteps);
-    const subImag = new Array(numSteps);
-    for (let i = 0; i < numSteps; i++) {
-      subReal[i] = sfcwResult.h_cal_real[i] - bgReal[i];
-      subImag[i] = sfcwResult.h_cal_imag[i] - bgImag[i];
-    }
-
-    const rp = computeRangeProfile(subReal, subImag, numSteps, sfcwResult.step_size, sfcwResult.range_offset);
-    // SfcwDisplay recomputes its own profile from h_cal_* (windowing/range comp),
-    // so the subtracted spectrum must replace them or the subtraction is discarded.
-    return {
-      result: {
-        ...sfcwResult,
-        h_cal_real: subReal,
-        h_cal_imag: subImag,
-        magnitudes: rp.magnitudes,
-        distances: rp.distances,
-        bg_sub_mode: 'complex',
-      },
-      diag,
-    };
+    return { result: applyBgToSweep(sfcwResult, bgReal, bgImag, sfcwBgSubMode), diag };
   }, [sfcwResult, sfcwBgModel, sfcwBgRef, sfcwStandoffMm, sfcwBgSubMode]);
 
   const processedSfcwResult = sfcwProcessed.result;
@@ -1619,6 +1711,7 @@ export default function App() {
         onBscanScaleLinkChange={setBscanScaleLink}
         cscanRowScales={cscanRowScales}
         cscanGridScales={cscanGridScales}
+        cscanLiveDiag={cscanLiveProcessed.diag}
         bscanBgSubMode={bscanBgSubMode}
         onBscanBgSubModeChange={setBscanBgSubMode}
         bscanSuperFit={bscanSuperFit}
@@ -1653,6 +1746,10 @@ export default function App() {
         onSarEpsilonRChange={setSarEpsilonR}
         sarWindowType={sarWindowType}
         onSarWindowTypeChange={setSarWindowType}
+        sarAutoStandoff={sarAutoStandoff}
+        onSarAutoStandoffChange={handleSarAutoStandoffChange}
+        sarManualStandoffMm={sarManualStandoffMm}
+        onSarManualStandoffChange={handleSarManualStandoffChange}
         sarWallThickness={sarWallThickness}
         onSarWallThicknessChange={setSarWallThickness}
         sarRefraction={sarRefraction}
@@ -1742,6 +1839,7 @@ export default function App() {
         bscanScaleLink={bscanScaleLink}
         cscanRowScales={cscanRowScales}
         cscanGridScales={cscanGridScales}
+        cscanLiveResult={cscanLiveProcessed.result}
         sarResult={sarResult}
         sarProgress={sarProgress}
         sarScaleMode={sarScaleMode}

@@ -301,24 +301,63 @@ self.onmessage = function (e) {
   const epsilonR = bscanParams.epsilonR > 0 ? bscanParams.epsilonR : 1;
   const n = Math.sqrt(epsilonR);
 
-  // Per-position standoff in metres, from each cell's own recorded lidar reading.
-  // Without it the back-projection assumes every antenna position sat exactly on the
-  // wall face, and a scan whose standoff wanders is defocused by the resulting phase
-  // error. Measured by injecting known scatter into a real scan and re-migrating both
-  // ways -- target coherence UNCORRECTED 0.591 flat -> 0.557 at 3 mm sigma -> 0.358 at
-  // 5 mm -> 0.156 at 10 mm, while CORRECTED it holds 0.591 all the way to 30 mm. The
-  // lidar is far better than it needs to be here: adding 0.5 mm of noise to the
-  // correction changed nothing. This is what lets the rig be imprecise in standoff.
-  const standoffs = [];
-  let standoffN = 0;
+  // Per-position standoff in metres. Two sources, chosen by bscanParams.autoStandoff:
+  //
+  //   auto (default) -- each cell's own recorded lidar reading. Without it the
+  //     back-projection assumes every antenna position sat exactly on the wall face,
+  //     and a scan whose standoff wanders is defocused by the resulting phase error.
+  //     Measured by injecting known scatter into a real scan and re-migrating both
+  //     ways -- target coherence UNCORRECTED 0.591 flat -> 0.557 at 3 mm sigma ->
+  //     0.358 at 5 mm -> 0.156 at 10 mm, while CORRECTED it holds 0.591 all the way
+  //     to 30 mm. The lidar is far better than it needs to be here: adding 0.5 mm of
+  //     noise to the correction changed nothing. This is what lets the rig be
+  //     imprecise in standoff.
+  //
+  //   manual -- one operator-entered standoff applied to every position. This exists
+  //     because the lidar can be WRONG rather than merely noisy, and when it is there
+  //     is no way to recover the scan from the recorded column. Diagnosed on
+  //     rebar1.json (2026-09-04): 32 of 43 cells recorded ~670 mm while the strongest
+  //     scatterer in the reconstruction sits at ~0.41 m of apparent range -- i.e. 26 cm
+  //     IN FRONT of the claimed wall face, which is impossible. The lidar had been
+  //     shooting past the target for most of the traverse and only caught it on cells
+  //     15-25 (170-222 mm). Forcing a consistent standoff took max coherence from 0.72
+  //     to 0.96 and the reachable depth from 2.8 cm to 26 cm.
+  const autoStandoff = bscanParams.autoStandoff !== false;
+  const manualStandoffM = Math.max(0, (bscanParams.manualStandoffMm || 0) / 1000);
+
+  // What the RECORD says, computed whichever source is active -- in manual mode the
+  // operator is choosing a number to replace these with, so they are exactly what needs
+  // to be on screen at that moment.
+  const known = [];
   for (let p = 0; p < numPositions; p++) {
     const mm = bscanData[p].lidar_standoff_mm;
-    if (mm === null || mm === undefined || !isFinite(mm)) {
-      standoffs.push(0);
-    } else {
-      standoffs.push(mm / 1000);
-      standoffN++;
+    if (mm !== null && mm !== undefined && isFinite(mm)) known.push(mm);
+  }
+  known.sort((a, b) => a - b);
+  const standoffN = known.length;
+  // Median, not mean, so one bad cell cannot drag the fill value.
+  const medianMm = known.length
+    ? (known.length % 2
+      ? known[(known.length - 1) / 2]
+      : 0.5 * (known[known.length / 2 - 1] + known[known.length / 2]))
+    : null;
+  const standoffMinMm = known.length ? known[0] : null;
+  const standoffMaxMm = known.length ? known[known.length - 1] : null;
+  const standoffSpreadMm = known.length ? standoffMaxMm - standoffMinMm : 0;
+
+  const standoffs = [];
+  if (autoStandoff) {
+    // Cells with no reading are filled with the median of those that have one. Zero was
+    // the old fallback and it is the wrong shape of guess: in a scan sitting at 670 mm
+    // it injects a 0.67 m path error at exactly the position that knew least about
+    // itself, which is far worse than assuming it sat where its neighbours did.
+    const fillM = (medianMm === null ? 0 : medianMm) / 1000;
+    for (let p = 0; p < numPositions; p++) {
+      const mm = bscanData[p].lidar_standoff_mm;
+      standoffs.push((mm === null || mm === undefined || !isFinite(mm)) ? fillM : mm / 1000);
     }
+  } else {
+    for (let p = 0; p < numPositions; p++) standoffs.push(manualStandoffM);
   }
   let maxStandoff = 0;
   for (let p = 0; p < numPositions; p++) if (standoffs[p] > maxStandoff) maxStandoff = standoffs[p];
@@ -338,6 +377,25 @@ self.onmessage = function (e) {
   const apparentAvailable = hasHcal
     ? profileMaxDist(numSteps, freqStepHz, rangeOffset)
     : distances[numBins - 1];
+
+  // Is the standoff column believable AGAINST THIS RECORD? Two tests, both cheap and
+  // both grounded in the sweep's own reach rather than in a taste threshold:
+  //
+  //   over range -- the claimed wall face sits at or beyond the last range bin, so the
+  //     sweep contains no wall and no target. Physically impossible for a scan that
+  //     produced a range profile at all.
+  //   spread -- the min-to-max standoff across the aperture eats more than a quarter
+  //     of the record's total reach. A real traverse varies by millimetres (the
+  //     2026-09-03 sartt.json scan held +/-1.5 mm; the worst tilted rover set managed
+  //     30 mm over a metre) and the correction exists precisely to absorb that. Half a
+  //     metre of spread is not a rig that wandered, it is a lidar that stopped seeing
+  //     the wall -- which is exactly what rebar1.json recorded.
+  //
+  // Flagged, not silently repaired. The operator has to decide what the standoff
+  // really was; the panel offers the manual override for saying so.
+  const standoffOverRange = maxStandoff >= apparentAvailable;
+  const standoffSuspect = autoStandoff
+    && (standoffOverRange || standoffSpreadMm / 1000 > 0.25 * apparentAvailable);
 
   // maxDepth is TRUE depth below the wall face now, not apparent range. Reaching
   // depth z needs apparent range standoff + n*z, so the record itself bounds how deep
@@ -591,6 +649,23 @@ self.onmessage = function (e) {
       epsilonR,
       windowType: bscanParams.windowType || 'rectangular',
       standoffN,
+      // Reported so the panel can say what the standoff column actually is, rather
+      // than only how many cells carried one. `reachableDepth` is the un-clipped
+      // bound: it stays visible even after Max Depth has been fitted down to it, so
+      // the number that explains a collapsed image does not disappear along with the
+      // clip warning that first announced it.
+      standoffSource: autoStandoff ? 'lidar' : 'manual',
+      standoffMinMm,
+      standoffMaxMm,
+      standoffMedianMm: medianMm,
+      standoffSpreadMm,
+      // What is actually being fed to the back-projection, which in manual mode is not
+      // any of the three above.
+      standoffAppliedMm: maxStandoff * 1000,
+      standoffOverRange,
+      standoffSuspect,
+      reachableDepth: reachable,
+      apparentAvailable,
       depthClipped,
       layered,
       wallThicknessCm: wallT * 100,

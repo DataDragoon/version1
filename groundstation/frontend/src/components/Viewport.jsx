@@ -59,6 +59,7 @@ export default function Viewport({
   bscanScaleLink,
   cscanRowScales,
   cscanGridScales,
+  cscanLiveResult,
   sarResult,
   sarProgress,
   sarScaleMode,
@@ -413,9 +414,14 @@ export default function Viewport({
                   stored cell's profile is recomputed with, and Avg is the number
                   of sweeps taken at each grid cell. R^n, FLOOR, CFAR and the Y
                   session/frame selector are hidden -- none of them feed the grid,
-                  so they could only disagree with the image below. */}
+                  so they could only disagree with the image below.
+
+                  The trace is THIS panel's background applied to the live sweep
+                  (cscanLiveResult), not the SFCW panel's -- the two panels hold
+                  separate references and models, and this one has to match the
+                  grid it sits above. */}
               <SfcwDisplay
-                sfcwResult={sfcwResult}
+                sfcwResult={cscanLiveResult}
                 sfcwProgress={sfcwProgress}
                 sfcwRunning={sfcwRunning}
                 rangeScale={bscanLiveRange}
