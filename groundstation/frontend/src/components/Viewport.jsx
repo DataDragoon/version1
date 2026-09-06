@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import { cn } from '@/lib/utils';
-import { Activity, Radio, Radar, ScanLine, Grid3x3, Map, Zap, Brain, FlaskConical, Move } from 'lucide-react';
+import { Activity, Radio, Radar, ScanLine, Grid3x3, Map, Zap, Brain, FlaskConical, Move, X } from 'lucide-react';
 import ImuDisplay from './ImuDisplay';
 import WaveformDisplay from './WaveformDisplay';
 import ReceiverDisplay from './ReceiverDisplay';
@@ -13,6 +13,7 @@ import MapDisplay from './MapDisplay';
 import BgModelDisplay from './BgModelDisplay';
 import ImagingDisplay from './ImagingDisplay';
 import RoverDisplay from './RoverDisplay';
+import { planViewScales } from '@/lib/cscanGrid';
 
 // What the automated raster is doing, for the badge over the plan view.
 const ROVER_PHASE_TEXT = {
@@ -56,6 +57,7 @@ export default function Viewport({
   bscanScaleRange,
   bscanScaleScope,
   bscanShowGate,
+  cscanProjection,
   bscanScaleLink,
   cscanRowScales,
   cscanGridScales,
@@ -87,7 +89,18 @@ export default function Viewport({
   const [bscanLiveRange, setBscanLiveRange] = useState({ min: 0, max: 0.3 });
   // Which C-scan cell the B-scan pane is showing the row for; null follows the
   // most recent capture.
+  // Null means the C-scan plan view has the whole viewport to itself, which is
+  // the default: the grid is the image, and the B-scan is a detail view of one
+  // row of it that the operator opens by clicking a cell and closes again.
   const [selectedCell, setSelectedCell] = useState(null);
+  // The plan view's current layout, published every frame so the B-scan pane
+  // below can put each position under the grid cell it came from.
+  const cscanLayoutRef = useRef(null);
+  const publishCscanLayout = useRef((L) => { cscanLayoutRef.current = L; }).current;
+  // The viewport itself -- everything right of the sidebar. To-scale placement
+  // is measured from this element's top-left corner, so the projected grid does
+  // not move when the Live Sweep pane appears or a row's B-scan opens.
+  const cscanRootRef = useRef(null);
   // Called unconditionally, before any of the per-panel early returns -- hooks cannot
   // live inside those branches. Idles to null whenever the SFCW pane is not the one up.
   const sweepRate = useSweepRate(sfcwResult, activePanel === 'sfcw' && (sfcwRunning || !!sfcwResult));
@@ -367,21 +380,24 @@ export default function Viewport({
   if (activePanel === 'cscan') {
     const showLiveSweep = sfcwRunning || sfcwResult;
 
-    // The cell driving the B-scan pane: whatever was clicked, else the last
-    // capture. A selection is dropped once the grid shrinks past it.
-    const last = bscanData.length > 0 ? bscanData[bscanData.length - 1] : null;
+    // The cell driving the B-scan pane. Only an explicit click opens it -- there
+    // is deliberately no fall-back to the last capture, because the plan view is
+    // the panel's main image and a row detail that opened itself would take a
+    // third of it away unasked. A selection is dropped once the grid shrinks
+    // past it, which closes the pane.
     const inGrid = selectedCell
       && selectedCell.ix < bscanParams.hCount && selectedCell.iy < bscanParams.vCount;
-    const activeCell = (inGrid ? selectedCell : null)
-      || (last && last.grid_ix != null ? { ix: last.grid_ix, iy: last.grid_iy } : null);
+    const activeCell = inGrid ? selectedCell : null;
+    const rowOpen = !!activeCell;
 
     // One row of the raster, laid out left-to-right regardless of which way the
     // snake swept it. Data with no grid indices (an imported linear scan) is
     // shown whole.
     const hasGrid = bscanData.some(p => p.grid_iy != null);
-    const rowData = (hasGrid && activeCell)
-      ? bscanData.filter(p => p.grid_iy === activeCell.iy).sort((a, b) => a.grid_ix - b.grid_ix)
-      : bscanData;
+    const rowData = !rowOpen ? []
+      : hasGrid
+        ? bscanData.filter(p => p.grid_iy === activeCell.iy).sort((a, b) => a.grid_ix - b.grid_ix)
+        : bscanData;
     const rowLabel = (hasGrid && activeCell)
       ? `B-Scan · Row ${activeCell.iy + 1}`
       : 'B-Scan';
@@ -398,12 +414,16 @@ export default function Viewport({
     // gated cell values, so the two panes' colour bars stop agreeing -- both
     // say so on screen. The B-scan always keeps the bin-domain population; it
     // draws bins, and there is nothing gated about them to scale within.
-    const unlinked = bscanScaleLink === 'independent' && !!cscanGridScales;
-    const cscanScaleGlobal = unlinked ? cscanGridScales.global : cscanSharedScale;
-    const cscanScaleRows = unlinked ? cscanGridScales.rows : cscanRowScales;
+    const planScales = planViewScales(bscanScaleLink, cscanGridScales, cscanSharedScale, cscanRowScales,
+      bscanParams.focusEnabled);
+    const cscanScaleGlobal = planScales.global;
+    const cscanScaleRows = planScales.rows;
+    // Focusing forces the plan view onto its own population, so both panes are
+    // told the link that is actually in force rather than the one on the toggle.
+    const effectiveLink = planScales.effectiveLink;
 
     return (
-      <div className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
+      <div ref={cscanRootRef} className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
         {/* Live sweep range profile (top) — shown during a C-scan session */}
         {showLiveSweep && (
           <div className="relative flex flex-col border-b border-white/5" style={{ flex: '0 0 32%' }}>
@@ -442,9 +462,15 @@ export default function Viewport({
           </div>
         )}
 
-        {/* C-scan plan view (left) + the selected row's B-scan (right) */}
-        <div className="flex min-h-0" style={{ flex: '1 1 0%' }}>
-          <div className="relative flex flex-col min-w-0 border-r border-white/5" style={{ flex: '1.35 1 0%' }}>
+        {/* The plan view is the panel's image and holds the whole area until a
+            cell is clicked; the row's B-scan then opens UNDER it, rotated 90
+            degrees anticlockwise so its position axis runs the same way as the
+            grid's and lands under the same columns. Stacked rather than
+            side-by-side because a raster is usually much wider than it is tall:
+            the detail view then costs a strip of height instead of a third of
+            the width, and the grid keeps its scale. */}
+        <div className="flex flex-col min-h-0" style={{ flex: '1 1 0%' }}>
+          <div className="relative flex flex-col min-w-0" style={{ flex: '1 1 0%' }}>
             <PaneHeader icon={Grid3x3} label="C-Scan Grid" active={bscanData.length > 0} color="cyan" />
             <div className="flex-1 min-h-0 relative overflow-hidden">
               {bscanData.length > 0 && (
@@ -481,18 +507,29 @@ export default function Viewport({
                 sharedScale={cscanScaleGlobal}
                 rowScales={cscanScaleRows}
                 scaleScope={bscanScaleScope}
-                scaleLink={bscanScaleLink}
+                scaleLink={effectiveLink}
                 subMode={bscanBgSubMode}
                 nextIndex={roverScan?.active ? roverScan.index : bscanData.length}
                 selectedCell={activeCell}
-                onSelectCell={setSelectedCell}
+                onSelectCell={(c) => setSelectedCell(prev =>
+                  (prev && prev.ix === c.ix && prev.iy === c.iy) ? null : c)}
                 scanMode={bscanParams.scanMode}
+                projection={cscanProjection}
+                onLayout={publishCscanLayout}
+                rootRef={cscanRootRef}
               />
             </div>
           </div>
 
-          <div className="relative flex flex-col min-w-0" style={{ flex: '1 1 0%' }}>
-            <PaneHeader icon={ScanLine} label={rowLabel} active={rowData.length > 0} color="cyan" />
+          {rowOpen && (
+          <div className="relative flex flex-col min-w-0 border-t border-white/5" style={{ flex: '0 0 38%' }}>
+            <PaneHeader
+              icon={ScanLine}
+              label={rowLabel}
+              active={rowData.length > 0}
+              color="cyan"
+              action={{ icon: X, title: 'Close row — back to full-screen grid', onClick: () => setSelectedCell(null) }}
+            />
             <div className="flex-1 min-h-0 relative overflow-hidden">
               <BscanDisplay
                 scanData={rowData}
@@ -505,17 +542,20 @@ export default function Viewport({
                 scaleRange={bscanScaleRange}
                 sharedScale={bscanScale}
                 scaleScope={bscanScaleScope}
-                scaleLink={bscanScaleLink}
+                scaleLink={effectiveLink}
                 showGate={bscanShowGate}
                 subMode={bscanBgSubMode}
+                orientation="vertical"
+                alignRef={cscanLayoutRef}
               />
               {rowData.length === 0 && (
                 <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                  <span className="text-xs text-[#333333] uppercase tracking-widest font-medium">No scan data</span>
+                  <span className="text-xs text-[#333333] uppercase tracking-widest font-medium">Row not captured yet</span>
                 </div>
               )}
             </div>
           </div>
+          )}
         </div>
       </div>
     );
@@ -617,7 +657,7 @@ function useSweepRate(result, active) {
   return rate;
 }
 
-function PaneHeader({ icon: Icon, label, active, color, meta }) {
+function PaneHeader({ icon: Icon, label, active, color, meta, action }) {
   const colorMap = {
     orange: { accent: '#D1855C', to: '#E5A986' },
     cyan:   { accent: '#22d3ee', to: '#67e8f9' },
@@ -657,6 +697,16 @@ function PaneHeader({ icon: Icon, label, active, color, meta }) {
               Active
             </span>
           </div>
+        )}
+        {action && (
+          <button
+            type="button"
+            title={action.title}
+            onClick={action.onClick}
+            className="p-1 -mr-1 rounded-md text-white/40 hover:text-white hover:bg-white/10 transition-colors"
+          >
+            <action.icon size={13} strokeWidth={2} />
+          </button>
         )}
       </div>
     </div>

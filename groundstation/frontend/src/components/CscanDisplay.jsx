@@ -1,5 +1,5 @@
 import { useRef, useEffect, useState } from 'react';
-import { orderedCellForIndex, buildCscanGrid, BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
+import { orderedCellForIndex, buildCscanGrid, cscanLayout, BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
 
 const BG = '#000000';
 const EMPTY_FILL = '#0d0d0d';
@@ -19,34 +19,6 @@ function jet(t) {
     Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 2)))),
     Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 1)))),
   ];
-}
-
-// Plan-view geometry: the grid keeps its physical aspect ratio inside the plot
-// box, so a wide-and-short sweep looks wide and short.
-function layout(w, h, params) {
-  const pad = { top: 24, bottom: 38, left: 52, right: 64 };
-  const plotW = w - pad.left - pad.right;
-  const plotH = h - pad.top - pad.bottom;
-
-  const hCount = Math.max(1, params.hCount);
-  const vCount = Math.max(1, params.vCount);
-  // A single line in an axis still needs a finite cell size to draw.
-  const cellSpanX = params.hStep > 0 ? params.hStep : 1;
-  const cellSpanY = params.vStep > 0 ? params.vStep : 1;
-  const spanX = hCount * cellSpanX;
-  const spanY = vCount * cellSpanY;
-  const scale = Math.min(plotW / spanX, plotH / spanY);
-
-  const gridW = spanX * scale;
-  const gridH = spanY * scale;
-  const originX = pad.left + (plotW - gridW) / 2;
-  // Vertical grows upward: iy = 0 sits at the bottom of the grid box.
-  const originY = pad.top + (plotH + gridH) / 2;
-
-  return {
-    pad, plotW, plotH, scale, gridW, gridH, originX, originY,
-    cellW: cellSpanX * scale, cellH: cellSpanY * scale,
-  };
 }
 
 function cellRect(ix, iy, L) {
@@ -69,11 +41,27 @@ function snakeOrderOf(cell, hCount) {
   return cell.iy * hCount + (cell.iy % 2 === 0 ? cell.ix : hCount - 1 - cell.ix) + 1;
 }
 
-function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink) {
-  if (!canvas) return;
+// Where this canvas sits inside the viewport (the whole area right of the
+// sidebar). To-scale placement is measured from the viewport, so that the grid
+// holds still on the wall when the Live Sweep pane appears or a row opens and
+// the canvas itself moves.
+function canvasOffsetIn(rootRef, rect) {
+  const root = rootRef && rootRef.current;
+  if (!root) return { x: 0, y: 0 };
+  const r = root.getBoundingClientRect();
+  return { x: rect.left - r.left, y: rect.top - r.top };
+}
+
+function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless) {
+  // `isConnected` is false for a frame or two while the projector window is
+  // being torn down, and drawing into a canvas whose document is going away
+  // throws in some browsers.
+  if (!canvas || !canvas.isConnected) return;
   const ctx = canvas.getContext('2d');
   const rect = canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
+  // From the canvas's OWN window: the projector portal draws into a canvas in
+  // a second window, which can be on a display with a different pixel ratio.
+  const dpr = (canvas.ownerDocument.defaultView || window).devicePixelRatio || 1;
   canvas.width = rect.width * dpr;
   canvas.height = rect.height * dpr;
   ctx.scale(dpr, dpr);
@@ -84,7 +72,12 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   ctx.fillRect(0, 0, w, h);
   if (w < 80 || h < 80) return;
 
-  const L = layout(w, h, params);
+  const L = cscanLayout(w, h, params, projection, canvasOffsetIn(rootRef, rect));
+  // Published so the B-scan pane below can put each position under the grid
+  // cell it was captured at. A ref, not state: both canvases redraw every
+  // frame anyway, and re-rendering the tree at 60 Hz to share four numbers
+  // would be the expensive way to do it.
+  if (onLayout) onLayout(L);
   const { hStep, vStep, gateStart, gateEnd, metric } = params;
   const grid = buildCscanGrid(scanData, params);
   const total = grid.hCount * grid.vCount;
@@ -147,6 +140,14 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
     return (db - lim.min) / (lim.max - lim.min);
   };
 
+  // Everything positional is clipped to the plot box: at a to-scale setting
+  // the grid can be far larger than the pane, and painting outside would run
+  // over the axes and the colour bar.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(L.clip.x, L.clip.y, L.clip.w, L.clip.h);
+  ctx.clip();
+
   // Cells
   for (let iy = 0; iy < grid.vCount; iy++) {
     for (let ix = 0; ix < grid.hCount; ix++) {
@@ -196,31 +197,56 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
     }
   }
 
-  // Snake path through the cells already captured — makes the raster order,
-  // and any hole left by an undo, visible at a glance.
-  if (grid.filled > 1 && L.cellW > 6 && L.cellH > 6) {
+  // Chromeless is the projector's image: cells, the frame that bounds them and
+  // the next-cell marker, and nothing else. Axes, titles, the colour bar, the
+  // capture path and the hover readout are all instruments for reading the plan
+  // view on a monitor -- projected onto the wall they would be light falling on
+  // brick beside the measurement, and the labels would be in the wrong place
+  // anyway once the grid is positioned by hand.
+  //
+  // The order the captured cells were actually visited in, taken from each
+  // cell's own capture index rather than re-derived from `scanMode`.
+  //
+  // Re-deriving it was wrong for any record whose capture mode is not the one
+  // currently selected -- which is the normal case for imported data, because
+  // import deliberately does not restore `scanMode` (it is a live control, not
+  // data). A rover grid reviewed in manual mode had its path drawn backwards
+  // and its START marker on the bottom-left corner when the raster had really
+  // begun at the top-left. `scanMode` still drives the NEXT-cell marker, which
+  // is a statement about a capture that has not happened yet.
+  const captureOrder = grid.cells
+    .map((cell, idx) => (cell ? { idx, order: cell.order } : null))
+    .filter(Boolean)
+    .sort((a, b) => a.order - b.order);
+  const cellOf = (idx) => ({ ix: idx % grid.hCount, iy: Math.floor(idx / grid.hCount) });
+
+  // Path through the cells already captured — makes the raster order, and any
+  // hole left by an undo, visible at a glance.
+  if (!chromeless && grid.filled > 1 && L.cellW > 6 && L.cellH > 6) {
     ctx.strokeStyle = '#ffffff33';
     ctx.lineWidth = 1;
     ctx.setLineDash([3, 3]);
     ctx.beginPath();
-    let started = false;
-    for (let i = 0; i < total; i++) {
-      const { ix, iy } = orderedCellForIndex(i, grid.hCount, grid.vCount, scanMode);
-      if (iy >= grid.vCount || iy < 0) break;
-      if (!grid.cells[iy * grid.hCount + ix]) continue;
+    captureOrder.forEach((e, n) => {
+      const { ix, iy } = cellOf(e.idx);
       const r = cellRect(ix, iy, L);
       const cx = r.x + r.w / 2;
       const cy = r.y + r.h / 2;
-      if (!started) { ctx.moveTo(cx, cy); started = true; } else ctx.lineTo(cx, cy);
-    }
+      if (n === 0) ctx.moveTo(cx, cy); else ctx.lineTo(cx, cy);
+    });
     ctx.stroke();
     ctx.setLineDash([]);
   }
 
-  // Start marker on whichever corner the active raster begins from: bottom-left
-  // by hand, top-left under the rover (which snakes downwards instead).
-  {
-    const r = cellRect(0, scanMode === 'rover' ? grid.vCount - 1 : 0, L);
+  // Start marker on the cell the raster actually began at. With nothing
+  // captured yet there is no fact to read, so it falls back to where the
+  // SELECTED mode would start: top-left under the rover (which snakes
+  // downwards), bottom-left by hand.
+  if (!chromeless) {
+    const startCell = captureOrder.length > 0
+      ? cellOf(captureOrder[0].idx)
+      : { ix: 0, iy: scanMode === 'rover' ? grid.vCount - 1 : 0 };
+    const r = cellRect(startCell.ix, startCell.iy, L);
     ctx.strokeStyle = '#4aff8a88';
     ctx.lineWidth = 1;
     ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
@@ -248,7 +274,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   }
 
   // Selected cell — this is the row/trace the B-scan pane is showing
-  if (selected && selected.ix < grid.hCount && selected.iy < grid.vCount) {
+  if (!chromeless && selected && selected.ix < grid.hCount && selected.iy < grid.vCount) {
     const r = cellRect(selected.ix, selected.iy, L);
     ctx.strokeStyle = '#ffffff';
     ctx.lineWidth = 1.5;
@@ -260,6 +286,11 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   ctx.lineWidth = 1;
   ctx.strokeRect(L.originX, L.originY - L.gridH, L.gridW, L.gridH);
 
+  ctx.restore();
+
+  // Everything past here is chrome for reading the image on a monitor.
+  if (chromeless) return;
+
   // Axis ticks at cell centres, thinned so labels never collide
   ctx.font = '9px monospace';
   ctx.fillStyle = '#555555';
@@ -267,13 +298,17 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   const xEvery = Math.max(1, Math.ceil(grid.hCount / Math.max(1, Math.floor(L.gridW / 34))));
   for (let ix = 0; ix < grid.hCount; ix += xEvery) {
     const r = cellRect(ix, 0, L);
-    ctx.fillText((ix * hStep).toFixed(hStep % 1 === 0 ? 0 : 1), r.x + r.w / 2, L.originY + 14);
+    const cx = r.x + r.w / 2;
+    if (cx < L.clip.x || cx > L.clip.x + L.clip.w) continue;
+    ctx.fillText((ix * hStep).toFixed(hStep % 1 === 0 ? 0 : 1), cx, L.originY + 14);
   }
   const yEvery = Math.max(1, Math.ceil(grid.vCount / Math.max(1, Math.floor(L.gridH / 16))));
   ctx.textAlign = 'right';
   for (let iy = 0; iy < grid.vCount; iy += yEvery) {
     const r = cellRect(0, iy, L);
-    ctx.fillText((iy * vStep).toFixed(vStep % 1 === 0 ? 0 : 1), L.originX - 6, r.y + r.h / 2 + 3);
+    const cy = r.y + r.h / 2;
+    if (cy < L.clip.y || cy > L.clip.y + L.clip.h) continue;
+    ctx.fillText((iy * vStep).toFixed(vStep % 1 === 0 ? 0 : 1), Math.max(6, Math.min(L.originX, L.pad.left)) - 6, cy + 3);
   }
 
   // Axis titles
@@ -291,13 +326,31 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   ctx.fillStyle = '#22d3ee';
   ctx.font = 'bold 10px monospace';
   ctx.textAlign = 'left';
+  // Focusing is named in the title because it changes what the colours ARE --
+  // a back-projected aperture sum rather than this cell's own gated profile --
+  // and the B-scan pane beside it is deliberately NOT focused.
+  const focusTag = params.focusEnabled ? ` · FOCUS ×${params.focusAperture}` : '';
   ctx.fillText(
-    `C-SCAN (${String(metric).toUpperCase()} @ ${gateStart}-${gateEnd} cm${isDiff ? ' · Δ MAG' : ''})`,
+    `C-SCAN (${String(metric).toUpperCase()} @ ${gateStart}-${gateEnd} cm${isDiff ? ' · Δ MAG' : ''}${focusTag})`,
     L.pad.left, 14);
   ctx.fillStyle = '#444444';
   ctx.font = '9px monospace';
   ctx.textAlign = 'right';
   ctx.fillText(`${grid.filled} / ${total} cells`, w - L.pad.right, 14);
+
+  // A to-scale grid is a measurement claim about the projected image, so it is
+  // labelled with the constant it is drawn at, and flagged when the grid is
+  // bigger than the pane can show (the field above is clipped, not shrunk --
+  // shrinking it would be exactly the silent re-scaling this mode avoids).
+  if (L.toScale) {
+    ctx.font = 'bold 9px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = L.overflows ? '#f59e0b' : '#4aff8a';
+    ctx.fillText(
+      `TO SCALE · ${L.scale.toFixed(2)} px/cm @ ${(L.originX + L.canvasOffset.x).toFixed(0)},`
+      + `${(L.originY - L.gridH + L.canvasOffset.y).toFixed(0)} px${L.overflows ? ' · CLIPPED' : ''}`,
+      L.pad.left + L.plotW / 2, 14);
+  }
 
   // Colour bar. Under per-row scaling there is no single range that describes
   // the image, so it shows the SELECTED row's -- the one the B-scan pane beside
@@ -340,7 +393,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   // Anything but the plain shared scale is named, because every one of these
   // means a colour here is not a colour on the B-scan beside it.
   const tag = manual ? 'MANUAL' : [
-    unlinked ? 'OWN SCALE · GATED' : null,
+    unlinked ? (params.focusEnabled ? 'OWN SCALE · FOCUSED' : 'OWN SCALE · GATED') : null,
     perRow ? `PER ROW ${(selected ? selected.iy : 0) + 1}` : null,
   ].filter(Boolean).join(' · ');
   if (tag) {
@@ -390,7 +443,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
 export default function CscanDisplay({
   scanData, params, capturing, sfcwProgress, scaleMode, scaleRange,
   nextIndex, selectedCell, onSelectCell, scanMode, sharedScale, subMode,
-  rowScales, scaleScope, scaleLink,
+  rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless,
 }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
@@ -399,25 +452,55 @@ export default function CscanDisplay({
 
   useEffect(() => {
     let start = null;
+    // Frames are driven by the canvas's OWN window. For the panel that is this
+    // window and nothing changes; for the projector portal it is the output
+    // window, which matters because a browser throttles requestAnimationFrame
+    // on a page it considers hidden -- so driving the projected image from the
+    // control window would freeze the wall the moment the operator switched
+    // tabs or minimised, which is a thing they will do mid-session.
+    let win = window;
     const render = (t) => {
+      const canvas = canvasRef.current;
+      if (canvas && canvas.ownerDocument.defaultView) win = canvas.ownerDocument.defaultView;
       if (start === null) start = t;
       // Breathing highlight on the next target cell, only while a capture is pending.
       const pulse = capturing ? 0.5 + 0.5 * Math.sin((t - start) / 180) : 0;
-      drawCscan(canvasRef.current, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink);
-      animRef.current = requestAnimationFrame(render);
+      drawCscan(canvas, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless);
+      if (win.closed) return;
+      animRef.current = win.requestAnimationFrame(render);
     };
-    animRef.current = requestAnimationFrame(render);
-    return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
-  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink]);
+    animRef.current = win.requestAnimationFrame(render);
+    return () => {
+      // Scheduled on whatever `win` was at the time, which is the same object
+      // this reads; an id from the other window would simply not match and
+      // cancelling an unknown id is a no-op either way.
+      if (animRef.current && !win.closed) win.cancelAnimationFrame(animRef.current);
+    };
+  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless]);
 
   const pick = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    const L = layout(rect.width, rect.height, params);
+    const L = cscanLayout(rect.width, rect.height, params, projection, canvasOffsetIn(rootRef, rect));
     return cellAt(
       e.clientX - rect.left, e.clientY - rect.top, L,
       Math.max(1, params.hCount), Math.max(1, params.vCount),
     );
   };
+
+  // The projector instance is output, not a control surface: no progress bar,
+  // no pointer interaction, and inline styles rather than utility classes,
+  // because it renders into a second document whose stylesheet is a clone and
+  // should not be depended on for the geometry of the image itself.
+  if (chromeless) {
+    return (
+      <div style={{ position: 'absolute', inset: 0, background: '#000' }}>
+        <canvas
+          ref={canvasRef}
+          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col w-full h-full">
