@@ -449,3 +449,24 @@ export function cscanLayout(w, h, params, projection, canvasOffset) {
       || originY - gridH < clip.y - 0.5 || originY > clip.y + clip.h + 0.5),
   };
 }
+
+// Which population the PLAN VIEW's dynamic colour limits come from.
+//
+// Linked, both panes read one set of limits over every bin of every cell, so a
+// colour means the same dB in the grid and in the B-scan beside it. Unlinked,
+// the grid scales within its own GATED cell values instead -- the only way to
+// keep contrast when the gate is narrowed onto a quiet depth -- and the two
+// colour bars stop agreeing, which both of them say on screen.
+//
+// Shared so the panel, the B-scan pane and the projector window cannot pick
+// differently; three copies of this choice would drift, and the projected
+// image disagreeing with the monitor is exactly the failure that would not be
+// noticed until it was on the wall.
+export function planViewScales(scaleLink, gridScales, sharedScale, rowScales) {
+  const unlinked = scaleLink === 'independent' && !!gridScales;
+  return {
+    unlinked,
+    global: unlinked ? gridScales.global : sharedScale,
+    rows: unlinked ? gridScales.rows : rowScales,
+  };
+}

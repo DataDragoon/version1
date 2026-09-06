@@ -1078,8 +1078,10 @@ resolved from the capture index at capture time in the `sfcw_result` handler (vi
 `bscanParamsRef`), so editing the grid afterwards never relabels existing cells. Lidar
 standoff is captured per cell exactly as before.
 
-**Display.** The viewport is Live Sweep (top) over C-Scan Grid (left) + the selected
-row's B-scan (right). The grid is a plan view holding the physical aspect ratio, colour =
+**Display.** The viewport is Live Sweep (top) over the C-Scan Grid, which holds the
+whole remaining area on its own; clicking a cell opens that row's B-scan UNDER it,
+rotated 90 degrees anticlockwise and aligned to the grid's columns (2026-09-06, see
+"C-scan plan view" below). The grid is a plan view holding the physical aspect ratio, colour =
 `gatedIntensity()` over the depth gate (peak / energy / mean), drawn live as cells fill.
 Uncaptured cells are outlined and empty; a cell captured with no range bin inside the gate
 is mid-grey, distinct from uncaptured. The next target pulses cyan, the snake path is
@@ -2651,6 +2653,286 @@ Two things worth keeping in mind about what was left behind:
 - It also fixed a latent bug: `targetShifts={rowData.map(() => 0)}` built a fresh array
   every render, so that effect's dependency changed identity every render and tore down and
   restarted the rAF loop each time. It now re-runs only when something real changes.
+
+## C-scan plan view: full-screen grid, rotated row detail, to-scale projection (2026-09-06)
+
+Three changes aimed at projecting the plan view back onto the wall it was swept
+over.
+
+### The grid owns the viewport; the B-scan is a detail view you open
+
+`selectedCell` (local to `Viewport.jsx`) starts null and **no longer falls back
+to the last captured cell**, so the plan view holds the whole area until a cell
+is clicked. Clicking opens the row; clicking the same cell again, or the X in
+the pane header (`PaneHeader` gained an optional `action`), closes it. Losing
+the selection off the edge of a shrunk grid closes it too.
+
+The empty-state text in that pane changed with it: it now says "Row not
+captured yet", because the pane can only be open on a chosen row, and "No scan
+data" was describing a state it can no longer be in.
+
+### The row's B-scan opens BELOW, rotated 90 degrees anticlockwise
+
+Not beside. Rotating anticlockwise sends the old left edge (bin 0) to the bottom
+and the old top edge (position 0) to the left, so **depth runs bottom-to-top and
+position runs left-to-right** -- the same axis, same direction, and (see below)
+the same pixels as the grid's horizontal axis directly above it. Stacked rather
+than side-by-side because a raster is usually far wider than it is tall: the
+detail view then costs a strip of height (38%) instead of a third of the width,
+and the grid keeps its scale.
+
+**`BscanDisplay` is now written against two slot functions rather than two
+painters.** `makeGeom()` returns `binSlot` / `rowSlot` plus `cell` / `rowBand` /
+`binBand` / `binLine` / `rowLine` / `profilePoint`, and every draw call goes
+through them; `orientation` picks the mapping. Duplicating the painter was the
+obvious alternative and was rejected -- the two images would have drifted apart
+on the next change. Two consequences that are easy to get wrong if this is
+edited:
+
+- **`profilePoint` is orientation-independent by construction.** The
+  anticlockwise rotation sends "up" to "left", so `perp = slot.a + span -
+  norm*span` is the value axis in BOTH orientations. Do not "fix" the vertical
+  case by negating it.
+- **The gate's near end swaps.** Bin 0 is at the bottom when vertical, so the
+  gate's START label belongs at the LOWER edge and END at the upper. The shading
+  is computed from `min`/`max` over the two end slots rather than assuming which
+  is which.
+
+`orientation` defaults to `'horizontal'`, which is byte-for-byte the old image;
+the C-scan panel is the only caller and passes `'vertical'`.
+
+### Column alignment: the two panes share one layout, via a ref
+
+The old `layout()` moved out of `CscanDisplay.jsx` into `lib/cscanGrid.js` as
+`cscanLayout(w, h, params, projection)` (+ `CSCAN_PAD`). The plan view writes its
+computed layout into a ref every frame (`onLayout`), and the B-scan reads it on
+its own frame (`alignRef`) and places each position at `originX + grid_ix*cellW`.
+**A ref, not state** -- both canvases already redraw at 60 Hz, so re-rendering
+the tree to share four numbers would be the expensive way to do it, and it is
+the same pattern `sfcwDynamicScale` uses.
+
+Alignment engages only when every drawn position carries a `grid_ix` (an
+imported linear scan has none and falls back to even spacing), and the pane says
+`ALIGNED` in its title when it is on. Two cases worth knowing:
+
+- **Columns are keyed on `grid_ix`, never on capture order.** A half-captured
+  row would otherwise slide left, and manual/rover snake in opposite directions
+  anyway.
+- **The background reference row gets its own slot just left of the grid**, not
+  a column in it -- as row 0 of an evenly-spread list it would shift every real
+  column along by one. The plot clip is widened to include it.
+
+### To-scale projection, and explicit placement
+
+`cscanProjection = { toScale, pxPerCm, leftPx, topPx }` in `App.jsx`, persisted
+to `localStorage.cscan_to_scale` / `cscan_px_per_cm` / `cscan_left_px` /
+`cscan_top_px`, edited in the C-scan panel's **Projection** section (toggle,
+px/cm field with -5/-1/+1/+5% trim, Left/Top fields with +-1/+-10 px nudges).
+Default off, 8 px/cm at 60, 80 px.
+
+On, the grid is drawn at exactly `pxPerCm` screen pixels per centimetre with its
+TOP-LEFT corner at exactly `(leftPx, topPx)`. **The point of both is that the
+mapping stops depending on the pane size** -- fitted, centred layout re-derives
+itself from the box it is in, so opening a row's B-scan or resizing the window
+silently moves everything, which is exactly what makes an aligned projection
+drift. The operator tunes scale against the projector's zoom and offset against
+its aim until the grid lands on the real geometry, then leaves both.
+
+**`leftPx` / `topPx` are measured from the top-left of the VIEWPORT -- the whole
+area right of the sidebar -- not of the C-scan canvas, and that distinction is
+the entire reason they hold still.** `cscanLayout` takes a `canvasOffset` (the
+canvas's position inside `Viewport`'s root element, passed as `rootRef` and read
+per frame from `getBoundingClientRect`) and subtracts it, so when the Live Sweep
+pane appears or a row's B-scan opens, the canvas moves under the grid and the
+grid does not move on the wall. Measured from the canvas instead, every pane
+change would slide the projected image -- the same failure as fitted scaling,
+by a different route. Verified: the placement is invariant across a canvas
+offset of 30 px and one of 230 px.
+
+The offsets apply **only** to scale; fitted mode ignores them and stays centred.
+
+**Clipping.** To scale the clip box is the WHOLE CANVAS, not the padded plot
+box -- reserving axis margins there would silently forbid placements the
+operator asked for. Fitted, it is the plot box as before. `L.clip` carries
+whichever, and the axis ticks cull against it. **A grid that falls outside is
+CLIPPED, not re-fitted**, and the title says
+`TO SCALE · n px/cm @ x,y px · CLIPPED`; `overflows` now means "any part is
+outside the box", so it catches a grid pushed off an edge by its placement or by
+a pane change, not only one that is too big. Re-fitting would be the silent
+re-scaling this mode exists to avoid.
+
+**The BG reference column switches sides.** Aligned, it sits just left of the
+grid -- unless the grid is placed hard against the left edge, where there is no
+room and clamping it into the margin would put it on top of data column 0; it
+then goes to the right of the last column instead. The B-scan's plot clip is
+widened to whichever side it landed on. Found by the checks below, not by eye.
+
+### Projector output window (2026-09-06)
+
+**There is no browser API that "sends a view to a display".** Screen sharing is
+CAPTURE and this is OUTPUT; `getDisplayMedia` is the wrong direction and cannot
+help. The closest primitive is the **Window Management API**
+(`window.getScreenDetails()`, Chrome, behind a `window-management` permission
+prompt that requires a user gesture): it enumerates the attached displays, and a
+window can then be opened on one of them and full-screened there.
+`components/ProjectorWindow.jsx` exports `listDisplays()` for the enumeration --
+called from the panel's click handler, because of the gesture requirement -- and
+the component itself owns the window.
+
+Where the API is unavailable (Firefox, Safari, Chrome with the permission
+denied) **there is no way to learn a second display exists at all.** That is not
+an error path to fix; `listDisplays()` returns `null`, a normal popup opens on
+the current screen, and the panel says to drag it across and press F11.
+
+**The content is a React PORTAL, not a second app.** The projector reads the
+same props as the panel -- same grid, same colour limits (`planViewScales()` is
+shared by both so a third copy of that choice cannot drift), same to-scale
+placement -- so there is no message channel, no serialisation of the grid, and
+no way for the wall to disagree with the monitor. Everything the operator
+changes appears on the wall on the next frame. The popup document gets a clone
+of the app's `<style>` / `<link rel=stylesheet>` nodes, cloned rather than
+re-linked because in dev Vite injects styles with no URL to point at.
+
+Three things that are easy to get wrong and are already handled:
+
+- **`devicePixelRatio` must come from the CANVAS's window, not `window`.** The
+  projector can be on a display with a different ratio, and reading the control
+  window's would size the backing store wrongly. `drawCscan` now reads
+  `canvas.ownerDocument.defaultView.devicePixelRatio`.
+- **So must `requestAnimationFrame`.** A browser throttles rAF on a page it
+  considers hidden, so driving the projected image from the control window would
+  freeze the wall the moment the operator switched tabs or minimised -- which
+  they will do mid-session. `CscanDisplay`'s loop schedules on the canvas's own
+  window and bails if that window has closed.
+- **The offsets measure from the PROJECTOR's corner there.** `rootRef` is the
+  projector window's own container, so `leftPx` / `topPx` place the grid inside
+  the projector window exactly as they place it inside the viewport on the
+  monitor. Same numbers, same meaning, different surface.
+
+`chromeless` on `CscanDisplay` is the projected image: cells, the frame that
+bounds them, and the next-cell marker. Axes, titles, the colour bar, the capture
+path, the START marker and the hover readout are instruments for reading the
+plan view on a monitor -- projected they would be light falling on brick beside
+the measurement, and their positions are meaningless once the grid is placed by
+hand anyway. That instance also has no pointer interaction and uses inline
+styles rather than utility classes, since it renders into a document whose
+stylesheet is a clone.
+
+State lives in `App.jsx` (`cscanProjector`), **not in `Viewport`**, so switching
+to another panel does not tear down a window that is currently lighting a wall.
+A blocked popup comes back through the same `onClose` channel flagged
+`'blocked'` rather than needing a second prop.
+
+**A POPUP DOES NOT SURVIVE StrictMode's double-invoke, and this broke the whole
+feature under `npm run dev` while the production build worked (fixed
+2026-09-06).** `main.jsx` wraps the app in `<StrictMode>`, so in development
+React mounts every effect, tears it down, and mounts it again. Naively that is
+open → close → open, and **the second open is refused**: the click's user
+activation is spent on the first one. Instrumented in a real Chrome:
+
+    window.open #1 -> a window
+    window.open #2 -> null          // popup blocker
+    panel -> "The browser blocked the popup"
+
+So the projector never opened at all in dev, and the panel blamed the browser's
+popup settings -- which is what made it look like a random browser problem
+rather than a bug here, and why it did not show up in the production-build
+tests. **Anything opening a window, requesting a device, or taking a
+one-shot user gesture in an effect has this hazard; test it against the DEV
+server, not just `vite build`.**
+
+Fixed by never closing across a remount: the window is held in a module-scope
+record (module scope so it outlives both the remount and an HMR module reload),
+the effect *reclaims* it instead of opening a second, and the close is deferred
+by a tick so a remount inside that tick cancels it. A genuine unmount has no
+remount to cancel it, so the window still closes -- verified close-then-reopen
+does exactly two `window.open` calls for two sessions, with none blocked.
+
+Two related hardenings went in with it, both cases where a throw would have left
+an empty black window with no way to close it from the panel:
+
+- **`setContainer` now happens BEFORE the fullscreen request.**
+  `requestFullscreen` documents a rejected promise, but a bad `screen` member is
+  a synchronous TypeError, and a throw there aborted the effect with the portal
+  never mounted and no cleanup registered.
+- **Fullscreen falls back.** `{screen}` is tried first (that is what puts it on
+  the projector rather than on whichever display the window touches); on any
+  failure, plain fullscreen still lands on the display the window was opened on.
+- **A window opened by NAME can be one that already exists** -- after an HMR
+  reload the module record is gone but the window is not -- so the document is
+  furnished only if it has no `[data-projector-root]` yet. Without that it
+  collected a second root and another copy of the stylesheet on every hot
+  reload.
+
+**Relative controls must use the updater form.** `setCscanProjection` accepts a
+value OR a function and composes updaters within a tick through a ref. The nudge
+buttons are relative, so a burst of clicks before React re-renders would
+otherwise all read the same stale value: measured, **four +10 px presses moved
+the grid 10 px, not 40**, before this. localStorage is written in the setter
+rather than inside a state updater, which React is free to call twice.
+
+### START and the capture path come from the DATA, not from `scanMode`
+
+`CscanDisplay` used to draw the START marker and the dashed raster path by
+re-deriving the visit order from the panel's current `scanMode`. That is wrong
+for any record whose capture mode is not the one currently selected -- **which
+is the normal case for imported data, because import deliberately does not
+restore `scanMode` (it is a live control, not data).** A rover grid reviewed in
+the default manual mode therefore had its path drawn backwards and its START
+marker on the BOTTOM-left corner when the raster had really begun at the
+top-left.
+
+Both now read each cell's own capture index (`order`, already on every cell from
+`buildCscanGrid`): START is the cell with the lowest one, the path is the cells
+sorted by it. That is ground truth rather than an inference, and it survives a
+hole left by an undo. `scanMode` still drives the pulsing NEXT-cell marker,
+which is a statement about a capture that has not happened yet and so has no
+data to read.
+
+`cellForIndex` (manual, bottom-left) and `roverCellForIndex` (rover, top-left)
+are unchanged -- the raster orders were never the problem, only the display's
+guess at which one produced the record on screen.
+
+### Verification
+
+`cscanLayout` and `makeGeom` are pure and were exercised head-first from node
+(70 checks: fit mode reproduces the original arithmetic; to-scale is exact and
+survives a pane-height change while fit mode does not; overflow is flagged not
+shrunk; bin 0 lands at the bottom and row 0 at the left with bins tiling to
+1e-9; the horizontal mapping is unchanged; every aligned column lands on its
+grid cell to 1e-9, including a partly-captured row and one with a BG row; a
+non-grid record refuses to align; crosshair inversion round-trips in both
+orientations; to-scale placement lands exactly where asked and is invariant to
+the canvas moving while fitted mode ignores it; overflow flags a grid pushed off
+any edge, including by a pane change; the BG column clears every data column on
+both sides; and START/path land on the true first capture for rover and manual
+data alike, in a partial raster and with a hole in it).
+
+The projector is browser plumbing that no head-first check can reach, so it was
+driven in a real headless Chrome over the DevTools protocol (17 checks: the
+button is gated on to-scale; clicking it opens a window titled `C-Scan
+Projection`; the portal mounts a canvas there, with the stylesheet cloned in and
+the backing store matching THAT window's `devicePixelRatio`; the grid is
+actually painted -- 30,450 non-black pixels, read back with `getImageData`, not
+merely a canvas being present; the far corner stays black, i.e. the colour bar
+and axis titles really are gone; nudging Left on the panel moves the projected
+image by exactly the same number of pixels; closing from the panel closes the
+window; and no console errors throughout). **That live-drive check is what
+caught the stale-closure nudge bug** -- it read +10 where +40 was asked for.
+
+The same harness, pointed at a running `vite` dev server with
+`--screen-info={0,0 1600x900}{1600,0 1280x720}` and CDP
+`Browser.grantPermissions(['windowManagement'])`, is what reproduced the
+StrictMode popup failure and confirmed the fix -- **two emulated displays plus a
+real dev server is the configuration that finds these; the dist build with one
+screen finds none of them.** A real 147-position export
+(`cscan_2026-09-06T06-04-30-909Z.json`, 21x7, v6) was imported through the panel
+by attaching it to the file input with `DOM.setFileInputFiles`, and the
+projected canvas read back 234,084 colour-mapped pixels, so the check covers
+real data reaching the second window and not just an empty grid.
+
+There is still no test runner in this repo, so all of these were throwaway
+scripts. `vite build` passes.
 
 ## Five-scan A/B on the new rig: the raster does not see a deep pipe (2026-09-02)
 

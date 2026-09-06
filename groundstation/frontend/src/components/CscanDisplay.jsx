@@ -52,11 +52,16 @@ function canvasOffsetIn(rootRef, rect) {
   return { x: rect.left - r.left, y: rect.top - r.top };
 }
 
-function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef) {
-  if (!canvas) return;
+function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless) {
+  // `isConnected` is false for a frame or two while the projector window is
+  // being torn down, and drawing into a canvas whose document is going away
+  // throws in some browsers.
+  if (!canvas || !canvas.isConnected) return;
   const ctx = canvas.getContext('2d');
   const rect = canvas.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
+  // From the canvas's OWN window: the projector portal draws into a canvas in
+  // a second window, which can be on a display with a different pixel ratio.
+  const dpr = (canvas.ownerDocument.defaultView || window).devicePixelRatio || 1;
   canvas.width = rect.width * dpr;
   canvas.height = rect.height * dpr;
   ctx.scale(dpr, dpr);
@@ -192,6 +197,13 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
     }
   }
 
+  // Chromeless is the projector's image: cells, the frame that bounds them and
+  // the next-cell marker, and nothing else. Axes, titles, the colour bar, the
+  // capture path and the hover readout are all instruments for reading the plan
+  // view on a monitor -- projected onto the wall they would be light falling on
+  // brick beside the measurement, and the labels would be in the wrong place
+  // anyway once the grid is positioned by hand.
+  //
   // The order the captured cells were actually visited in, taken from each
   // cell's own capture index rather than re-derived from `scanMode`.
   //
@@ -210,7 +222,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
 
   // Path through the cells already captured — makes the raster order, and any
   // hole left by an undo, visible at a glance.
-  if (grid.filled > 1 && L.cellW > 6 && L.cellH > 6) {
+  if (!chromeless && grid.filled > 1 && L.cellW > 6 && L.cellH > 6) {
     ctx.strokeStyle = '#ffffff33';
     ctx.lineWidth = 1;
     ctx.setLineDash([3, 3]);
@@ -230,7 +242,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   // captured yet there is no fact to read, so it falls back to where the
   // SELECTED mode would start: top-left under the rover (which snakes
   // downwards), bottom-left by hand.
-  {
+  if (!chromeless) {
     const startCell = captureOrder.length > 0
       ? cellOf(captureOrder[0].idx)
       : { ix: 0, iy: scanMode === 'rover' ? grid.vCount - 1 : 0 };
@@ -262,7 +274,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   }
 
   // Selected cell — this is the row/trace the B-scan pane is showing
-  if (selected && selected.ix < grid.hCount && selected.iy < grid.vCount) {
+  if (!chromeless && selected && selected.ix < grid.hCount && selected.iy < grid.vCount) {
     const r = cellRect(selected.ix, selected.iy, L);
     ctx.strokeStyle = '#ffffff';
     ctx.lineWidth = 1.5;
@@ -275,6 +287,9 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   ctx.strokeRect(L.originX, L.originY - L.gridH, L.gridW, L.gridH);
 
   ctx.restore();
+
+  // Everything past here is chrome for reading the image on a monitor.
+  if (chromeless) return;
 
   // Axis ticks at cell centres, thinned so labels never collide
   ctx.font = '9px monospace';
@@ -424,7 +439,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
 export default function CscanDisplay({
   scanData, params, capturing, sfcwProgress, scaleMode, scaleRange,
   nextIndex, selectedCell, onSelectCell, scanMode, sharedScale, subMode,
-  rowScales, scaleScope, scaleLink, projection, onLayout, rootRef,
+  rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless,
 }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
@@ -433,16 +448,31 @@ export default function CscanDisplay({
 
   useEffect(() => {
     let start = null;
+    // Frames are driven by the canvas's OWN window. For the panel that is this
+    // window and nothing changes; for the projector portal it is the output
+    // window, which matters because a browser throttles requestAnimationFrame
+    // on a page it considers hidden -- so driving the projected image from the
+    // control window would freeze the wall the moment the operator switched
+    // tabs or minimised, which is a thing they will do mid-session.
+    let win = window;
     const render = (t) => {
+      const canvas = canvasRef.current;
+      if (canvas && canvas.ownerDocument.defaultView) win = canvas.ownerDocument.defaultView;
       if (start === null) start = t;
       // Breathing highlight on the next target cell, only while a capture is pending.
       const pulse = capturing ? 0.5 + 0.5 * Math.sin((t - start) / 180) : 0;
-      drawCscan(canvasRef.current, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef);
-      animRef.current = requestAnimationFrame(render);
+      drawCscan(canvas, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless);
+      if (win.closed) return;
+      animRef.current = win.requestAnimationFrame(render);
     };
-    animRef.current = requestAnimationFrame(render);
-    return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
-  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef]);
+    animRef.current = win.requestAnimationFrame(render);
+    return () => {
+      // Scheduled on whatever `win` was at the time, which is the same object
+      // this reads; an id from the other window would simply not match and
+      // cancelling an unknown id is a no-op either way.
+      if (animRef.current && !win.closed) win.cancelAnimationFrame(animRef.current);
+    };
+  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless]);
 
   const pick = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();
@@ -452,6 +482,21 @@ export default function CscanDisplay({
       Math.max(1, params.hCount), Math.max(1, params.vCount),
     );
   };
+
+  // The projector instance is output, not a control surface: no progress bar,
+  // no pointer interaction, and inline styles rather than utility classes,
+  // because it renders into a second document whose stylesheet is a clone and
+  // should not be depended on for the geometry of the image itself.
+  if (chromeless) {
+    return (
+      <div style={{ position: 'absolute', inset: 0, background: '#000' }}>
+        <canvas
+          ref={canvasRef}
+          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col w-full h-full">

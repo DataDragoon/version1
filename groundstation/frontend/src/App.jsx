@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect, useMemo, useReducer } from 'r
 import { useWebSocket } from './hooks/useWebSocket';
 import Sidebar from './components/Sidebar';
 import Viewport from './components/Viewport';
+import CscanDisplay from './components/CscanDisplay';
 import { svdFilter } from './lib/svd';
 import { useSarWorker } from './hooks/useSarWorker';
 import { useBgModelWorker } from './hooks/useBgModelWorker';
@@ -9,10 +10,11 @@ import { inferBgModel } from './lib/bgModelInfer';
 import { computeCaptureStats } from './lib/bgCaptureStats';
 import { computeRangeProfile } from './lib/rangeProfile';
 import { applyBscanBg, bgForStandoff, backgroundFor, coherentMean } from './lib/bscanBg';
-import { computeSharedScale, computeRowScales, computeGridScales, bgDiagnostics } from './lib/cscanGrid';
+import { computeSharedScale, computeRowScales, computeGridScales, bgDiagnostics, planViewScales } from './lib/cscanGrid';
 import { cellForIndex, orderedCellForIndex, BG_STATUS, BG_STATUS_TEXT } from './lib/cscanGrid';
 import { useRoverScan } from './hooks/useRoverScan';
 import { DEFAULT_PARAMS as IMAGING_DEFAULT_PARAMS } from './lib/imagingEffects';
+import ProjectorWindow from './components/ProjectorWindow';
 
 const SPEED_OF_LIGHT = 299792458;
 
@@ -478,12 +480,30 @@ export default function App() {
       topPx: num('cscan_top_px', 80),
     };
   });
+  // The projector output window: `null` when closed, otherwise the display it
+  // was opened on (or `{}` when the operator has to place it by hand because
+  // the browser will not enumerate displays). Held in App rather than in the
+  // C-scan viewport so switching to another panel does not tear down a window
+  // that is currently lighting up a wall.
+  const [cscanProjector, setCscanProjector] = useState(null);
+  const cscanProjectorRootRef = useRef(null);
+
+  // Takes a value OR an updater, like setState, and composes updaters within a
+  // single tick through the ref. The nudge buttons are relative (+10 px, -1%),
+  // so a burst of clicks before React re-renders would otherwise all read the
+  // same stale value and land as one nudge -- measured: four +10 presses moved
+  // the grid 10 px, not 40. localStorage is written here rather than inside the
+  // state updater, which React is free to call twice.
+  const cscanProjectionRef = useRef(cscanProjection);
+  cscanProjectionRef.current = cscanProjection;
   const setCscanProjection = useCallback((next) => {
-    localStorage.setItem('cscan_to_scale', String(!!next.toScale));
-    localStorage.setItem('cscan_px_per_cm', String(next.pxPerCm));
-    localStorage.setItem('cscan_left_px', String(next.leftPx));
-    localStorage.setItem('cscan_top_px', String(next.topPx));
-    setCscanProjectionState(next);
+    const v = typeof next === 'function' ? next(cscanProjectionRef.current) : next;
+    cscanProjectionRef.current = v;
+    localStorage.setItem('cscan_to_scale', String(!!v.toScale));
+    localStorage.setItem('cscan_px_per_cm', String(v.pxPerCm));
+    localStorage.setItem('cscan_left_px', String(v.leftPx));
+    localStorage.setItem('cscan_top_px', String(v.topPx));
+    setCscanProjectionState(v);
   }, []);
   // 'linked' (both panes off one population of bins, so a colour means one dB
   // in both) or 'independent' (the plan view scales within its own gated cell
@@ -675,6 +695,14 @@ export default function App() {
       metric: bscanParams.metric,
     }),
     [cscanProcessedData, bscanParams.gateStart, bscanParams.gateEnd, bscanParams.metric],
+  );
+
+  // Which of those the plan view actually draws with. Shared with the viewport
+  // (which makes the same call) so the projector cannot end up on a different
+  // colour scale from the monitor it is being aimed by.
+  const cscanPlanScales = useMemo(
+    () => planViewScales(bscanScaleLink, cscanGridScales, cscanSharedScale, cscanRowScales),
+    [bscanScaleLink, cscanGridScales, cscanSharedScale, cscanRowScales],
   );
 
   // The Live Sweep trace at the top of the C-SCAN viewport, subtracted against
@@ -1749,6 +1777,8 @@ export default function App() {
         onBscanShowGateChange={setBscanShowGate}
         cscanProjection={cscanProjection}
         onCscanProjectionChange={setCscanProjection}
+        cscanProjector={cscanProjector}
+        onCscanProjectorChange={setCscanProjector}
         bscanScaleLink={bscanScaleLink}
         onBscanScaleLinkChange={setBscanScaleLink}
         cscanRowScales={cscanRowScales}
@@ -1904,6 +1934,38 @@ export default function App() {
         imagingEffect={imagingEffect}
         imagingParams={imagingParams}
       />
+
+      {/* The projected image. A portal into a second window, so it reads the
+          same props the panel does -- there is no copy of the grid, of the
+          colour limits or of the placement to keep in step. `rootRef` is that
+          window's own container, which is what makes the to-scale Left/Top
+          offsets measure from the projector's top-left corner rather than from
+          this window's viewport. */}
+      {cscanProjector && !cscanProjector.error && (
+        <ProjectorWindow
+          target={cscanProjector.target}
+          rootRef={cscanProjectorRootRef}
+          onClose={(reason) => setCscanProjector(reason === 'blocked' ? { error: 'blocked' } : null)}
+        >
+          <CscanDisplay
+            chromeless
+            scanData={cscanProcessedData}
+            params={bscanParams}
+            scaleMode={bscanScaleMode}
+            scaleRange={bscanScaleRange}
+            sharedScale={cscanPlanScales.global}
+            rowScales={cscanPlanScales.rows}
+            scaleScope={bscanScaleScope}
+            scaleLink={bscanScaleLink}
+            subMode={bscanBgSubMode}
+            capturing={bscanCapturing}
+            nextIndex={roverScan.active ? roverScan.index : cscanProcessedData.length}
+            scanMode={bscanParams.scanMode}
+            projection={cscanProjection}
+            rootRef={cscanProjectorRootRef}
+          />
+        </ProjectorWindow>
+      )}
     </div>
   );
 }

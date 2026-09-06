@@ -13,6 +13,7 @@ import MapDisplay from './MapDisplay';
 import BgModelDisplay from './BgModelDisplay';
 import ImagingDisplay from './ImagingDisplay';
 import RoverDisplay from './RoverDisplay';
+import { planViewScales } from '@/lib/cscanGrid';
 
 // What the automated raster is doing, for the badge over the plan view.
 const ROVER_PHASE_TEXT = {
@@ -413,9 +414,9 @@ export default function Viewport({
     // gated cell values, so the two panes' colour bars stop agreeing -- both
     // say so on screen. The B-scan always keeps the bin-domain population; it
     // draws bins, and there is nothing gated about them to scale within.
-    const unlinked = bscanScaleLink === 'independent' && !!cscanGridScales;
-    const cscanScaleGlobal = unlinked ? cscanGridScales.global : cscanSharedScale;
-    const cscanScaleRows = unlinked ? cscanGridScales.rows : cscanRowScales;
+    const planScales = planViewScales(bscanScaleLink, cscanGridScales, cscanSharedScale, cscanRowScales);
+    const cscanScaleGlobal = planScales.global;
+    const cscanScaleRows = planScales.rows;
 
     return (
       <div ref={cscanRootRef} className="flex-1 flex flex-col h-screen overflow-hidden bg-black">

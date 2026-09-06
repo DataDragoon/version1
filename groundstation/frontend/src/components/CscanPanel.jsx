@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { cn } from '@/lib/utils';
 import { Section, InfoTile } from './Sidebar';
 import { orderedCellForIndex, gridStats, gridRoverExtent, BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
+import { listDisplays } from './ProjectorWindow';
 
 const LIDAR_AVG_WINDOW = 20;
 
@@ -24,7 +25,7 @@ export default function CscanPanel({
   sharedScale, bgDiag, procParams, captureProgress,
   scaleScope, onScaleScopeChange, rowScales, showGate, onShowGateChange,
   scaleLink, onScaleLinkChange, gridScales, liveDiag,
-  projection, onProjectionChange,
+  projection, onProjectionChange, projector, onProjectorChange,
   roverConnected, roverStatus, sendRover, roverScan,
 }) {
   const {
@@ -40,6 +41,9 @@ export default function CscanPanel({
   const [lidarAvg, setLidarAvg] = useState(null);
   const [modelList, setModelList] = useState(null);
   const [modelListOpen, setModelListOpen] = useState(false);
+  // Displays offered for the projector window; null when the picker is closed.
+  const [displays, setDisplays] = useState(null);
+  const [projectorNote, setProjectorNote] = useState(null);
 
   useEffect(() => {
     if (lidarMm == null) return;
@@ -85,14 +89,39 @@ export default function CscanPanel({
   // Plan-view scale and placement, defaulted so the panel still renders if the
   // prop is absent.
   const proj = projection || { toScale: false, pxPerCm: 8, leftPx: 60, topPx: 80 };
-  const nudgeScale = (f) => onProjectionChange({
-    ...proj,
-    pxPerCm: Math.min(200, Math.max(0.2, Math.round(proj.pxPerCm * f * 1000) / 1000)),
-  });
-  const nudgePlace = (key, d) => onProjectionChange({
-    ...proj,
-    [key]: Math.round((proj[key] + d) * 10) / 10,
-  });
+  // Relative, so they go through the updater form -- clicking faster than React
+  // re-renders must compose rather than collapse to a single step.
+  const nudgeScale = (f) => onProjectionChange(p => ({
+    ...p,
+    pxPerCm: Math.min(200, Math.max(0.2, Math.round(p.pxPerCm * f * 1000) / 1000)),
+  }));
+  const nudgePlace = (key, d) => onProjectionChange(p => ({
+    ...p,
+    [key]: Math.round((p[key] + d) * 10) / 10,
+  }));
+
+  // Display picker for the projector window. `listDisplays()` needs a user
+  // gesture (it is what prompts for the window-management permission), so it
+  // runs on the click rather than on mount -- and it returns null wherever the
+  // browser will not enumerate displays at all, which is not an error, just the
+  // case where the operator has to drag the window across themselves.
+  const openProjector = async () => {
+    setProjectorNote(null);
+    const displays = await listDisplays();
+    if (!displays || displays.length < 2) {
+      // Nothing to choose between: either the API is unavailable, or this
+      // machine has one screen and the projector is not attached yet.
+      setDisplays(null);
+      onProjectorChange({ target: displays && displays.length === 1 ? displays[0] : null });
+      if (!displays) {
+        setProjectorNote('This browser will not list displays — drag the window to the projector and press F11. Chrome can list them if you allow window management.');
+      } else if (displays.length < 2) {
+        setProjectorNote('Only one display detected. Connect the projector, then reopen to pick it.');
+      }
+      return;
+    }
+    setDisplays(displays);
+  };
   const gridFull = captured >= stats.total;
 
   // ── Rover mode ────────────────────────────────────────────────────────
@@ -918,6 +947,78 @@ export default function CscanPanel({
               : '—'}
           />
         </div>
+
+        {/* Projector output. A second window holding the grid and nothing
+            else, opened on a chosen display and full-screened there. It reads
+            the same scale and placement as the pane above, so this section
+            stays the control surface while the wall shows the result. */}
+        <div className="px-1 pt-1 text-[9px] font-medium uppercase tracking-wider text-[#555555]">
+          Projector output
+        </div>
+        {projector && projector.error === 'blocked' ? null : projector ? (
+          <>
+            <button
+              onClick={() => onProjectorChange(null)}
+              className="w-full px-3 py-2 rounded-lg text-xs font-medium transition-all border bg-[#f59e0b]/10 border-[#f59e0b]/40 text-[#f59e0b]"
+            >
+              ● Close projector window
+            </button>
+            <div className="px-2 text-[9px] text-white/40 leading-relaxed">
+              Showing on <span className="text-white/70">{projector.target ? projector.target.label : 'a free window'}</span>.
+              Click inside that window for full screen. Scale and Left/Top above
+              drive it live — they are measured from ITS top-left corner, so tune
+              them here while watching the wall.
+            </div>
+          </>
+        ) : displays ? (
+          <>
+            <div className="px-2 text-[9px] text-white/40 leading-relaxed">
+              Pick the display the projector is on:
+            </div>
+            {displays.map(d => (
+              <button
+                key={d.id}
+                onClick={() => { setDisplays(null); onProjectorChange({ target: d }); }}
+                className="w-full px-3 py-2 rounded-lg text-left text-xs font-medium transition-all border bg-white/5 border-white/10 text-white/70 hover:text-white hover:border-white/25"
+              >
+                {d.label}
+                <span className="ml-2 text-[9px] font-mono text-white/35">
+                  {d.width}×{d.height}{d.isInternal ? ' · built-in' : ''}
+                </span>
+              </button>
+            ))}
+            <button
+              onClick={() => setDisplays(null)}
+              className="w-full px-3 py-1.5 rounded-lg text-[10px] font-medium border bg-transparent border-white/10 text-white/40 hover:text-white/70"
+            >
+              Cancel
+            </button>
+          </>
+        ) : (
+          <button
+            onClick={openProjector}
+            disabled={!proj.toScale}
+            className={cn(
+              'w-full px-3 py-2 rounded-lg text-xs font-medium transition-all border',
+              proj.toScale
+                ? 'bg-[#4aff8a]/10 border-[#4aff8a]/30 text-[#4aff8a] hover:border-[#4aff8a]/60'
+                : 'bg-[#0a0a0a]/40 border-white/5 text-white/20 cursor-not-allowed',
+            )}
+          >
+            Open projector view…
+          </button>
+        )}
+        {projector && projector.error === 'blocked' && (
+          <div className="px-2 py-1.5 rounded-lg bg-[#ff4d6d]/5 border border-[#ff4d6d]/30 text-[9px] text-[#ff4d6d] leading-relaxed">
+            The browser blocked the popup. Allow pop-ups for this page, then try
+            again.
+          </div>
+        )}
+        {projectorNote && (
+          <div className="px-2 py-1.5 rounded-lg bg-[#f59e0b]/5 border border-[#f59e0b]/30 text-[9px] text-[#f59e0b] leading-relaxed">
+            {projectorNote}
+          </div>
+        )}
 
         <div className="px-2 text-[9px] text-white/40 leading-relaxed">
           To scale draws the plan view at exactly this many screen pixels per
