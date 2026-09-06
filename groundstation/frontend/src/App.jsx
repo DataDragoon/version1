@@ -407,6 +407,20 @@ export default function App() {
   // held, so `lidar_n` and `lidar_std` recorded on each sweep would be fiction.
   const lidarAccumRef = useRef([]);
   const lidarLastSeqRef = useRef(null);
+  // Most recent GENUINELY-FRESH reading and when it arrived. Needed because the
+  // sweep period (65 ms at the 2048-sample RX buffer, 2026-09-06) is now SHORTER
+  // than the TF-LC02's own update period (~60-90 ms internally, 11-17 Hz
+  // measured), so whether any given sweep window contains a fresh reading is a
+  // phase race -- lidar_n === 0 on a large fraction of sweeps is now the normal,
+  // healthy state, not a fault. Verified live while diagnosing the flapping
+  // "standoff is stale" warning: the sensor was delivering a perfectly clean
+  // 16.2 fresh readings/s with zero seq gaps while the warning strobed at the
+  // sweep rate. A sweep with no fresh reading falls back to this one if it is
+  // younger than LIDAR_CARRY_MS; lidar_n stays 0 for that sweep (the count of
+  // fresh readings is provenance and must stay honest), only the standoff is
+  // carried. Older than LIDAR_CARRY_MS means the lidar has actually gone quiet
+  // (several missed periods), and the standoff goes null exactly as before.
+  const lidarLastFreshRef = useRef(null); // { mm, t }
   // Roll/pitch accumulated over the same window (Phase 0.2). Recorded so it is
   // possible to test later whether the background depends on pose as well as
   // standoff -- cheap to capture now, impossible to backfill.
@@ -963,6 +977,7 @@ export default function App() {
       if (seq === undefined || seq === null || seq !== lidarLastSeqRef.current) {
         lidarLastSeqRef.current = seq;
         lidarAccumRef.current.push(msg.lidar);
+        lidarLastFreshRef.current = { mm: msg.lidar, t: performance.now() };
       }
     }
     // Pose from the gravity vector. accel is body-frame [forward, left, up] in
@@ -1017,9 +1032,24 @@ export default function App() {
       // near zero means the standoff is stale, not that the model is wrong.
       const accum = lidarAccumRef.current;
       const lidarN = accum.length;
+      // No fresh reading this sweep is NORMAL at 15 Hz sweeps against an
+      // 11-17 Hz lidar (see lidarLastFreshRef above) -- carry the last fresh
+      // reading forward if it is recent, so the standoff (and everything that
+      // consumes it, the BG-model inference especially) does not strobe
+      // null/non-null at the sweep rate. lidar_n is NOT inflated by the carry.
+      // ~11-16 lidar periods. Was 400 ms, raised 2026-09-06: bursts of invalid
+      // reads (TF-LC02 error_code != 0 at a poor target angle -- documented at
+      // 30-40% of reads on this bench) can outlast 400 ms, and the warning was
+      // still flapping. Carrying a reading this old is safe for what consumes
+      // it: the lidar's own zero-drift is ~1 mm over MINUTES, so a 1 s-old
+      // reading on a static or slowly-moving rig is still sub-mm.
+      const LIDAR_CARRY_MS = 1000;
+      const fresh = lidarLastFreshRef.current;
+      const carried = lidarN === 0 && fresh !== null
+        && (performance.now() - fresh.t) < LIDAR_CARRY_MS;
       const avgLidarMm = lidarN > 0
         ? accum.reduce((s, v) => s + v, 0) / lidarN
-        : null;
+        : (carried ? fresh.mm : null);
       const lidarStd = lidarN > 1
         ? Math.sqrt(accum.reduce((s, v) => s + (v - avgLidarMm) ** 2, 0) / (lidarN - 1))
         : null;

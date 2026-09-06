@@ -39,19 +39,26 @@ function geometryMismatch(bgModel, lidarOffsetMm, params) {
   return out.length ? { fields: out } : null;
 }
 
-// Must match pi/radar/sfcw_engine.py: _start_tx_rx() captures n = 4096 samples
-// per buffer at the 10 Msps set in _configure_hardware().
-//
-// This was silently only HALF true until 2026-08-29. libbladeRF counts sync_rx's
-// num_samples as the total across both channels in RX_X2, so _rx_loop_dual was getting
-// 2048 samples per channel per buffer, not 4096 -- a buffer was 0.205 ms of signal, and
-// settle_count = 10 bought 2.05 ms of retune settling rather than the 4.10 ms everything
-// here assumed. bladerf_driver.py now requests num_samples * 2, so a buffer really is
-// 4096 samples / 0.41 ms and these numbers are finally what they claim to be.
-const BUFFER_SAMPLES = 4096;
+// Must match pi/radar/sfcw_engine.py: RX_BUFFER_SAMPLES (the per-channel RX
+// buffer, which is the clock every settle/capture wait is expressed in) and
+// DEMOD_SAMPLES (how many of those samples the demod actually correlates).
+// They differ on purpose: 2048 keeps the sync_rx request an exact multiple of
+// libbladeRF's DMA buffer -- measured 2048 samples/channel, and a request that
+// does not divide it detaches buffer ARRIVAL time from buffer CONTENT, which
+// blinds the settle gate and corrupts steps (S_repeat 34 -> 17 dB when 2000 was
+// tried directly) -- while 2000 puts exactly 20.000 cycles of the 100 kHz tone
+// in the demod window, so LO leakage at DC lands on an exact null of the
+// rectangular window's sinc. See the long comment above RX_BUFFER_SAMPLES in
+// sfcw_engine.py.
+const BUFFER_SAMPLES = 2048;      // RX_BUFFER_SAMPLES -- timing
+const DEMOD_SAMPLES = 2000;       // DEMOD_SAMPLES -- samples used per capture
 const SAMPLE_RATE = 10_000_000;
 const BUFFER_TIME_MS = (BUFFER_SAMPLES / SAMPLE_RATE) * 1000;
-const PER_STEP_OVERHEAD_MS = 2.89;
+// Retune + demod + gate arrival phase, per step. Re-fitted 2026-09-06 against
+// the Nios II/f firmware: 85.3 ms at 51 steps / settle 0 / 1 buffer with the
+// 4096-sample buffer gives (85.3/51 - 2*0.4096) = 0.85 ms; the old 2.89 was
+// fitted to the pre-Nios II/f retune and read 189 ms against a real 85.
+const PER_STEP_OVERHEAD_MS = 0.85;
 
 // SC16_Q11 full scale, and the fraction above which the AD9361 RX path compresses
 // enough to matter. Mirrors ADC_FULL_SCALE / ADC_HOT_FRACTION_* in sfcw_engine.py --
@@ -64,6 +71,14 @@ const ADC_HOT = { rx1: 0.75, rx2: 0.40 };
 // vs 45.0 dB at 169 counts. The good window is wide but it does have both edges.
 const ADC_COLD_COUNTS = 60;
 
+// Stale-standoff warning timing. LIDAR_CARRY_MS mirrors App.jsx (how long a
+// last-fresh lidar reading is carried forward before the standoff goes null);
+// STALE_DEBOUNCE_MS is how long the standoff must stay null before the warning
+// is shown at all. Both exist because at 15 Hz sweeps a per-sweep warning
+// strobes -- see the comment at the warning slot in the Standoff section.
+const LIDAR_CARRY_MS = 1000;      // must match App.jsx
+const STALE_DEBOUNCE_MS = 2000;
+
 export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcwStatus, sendSdr, params, onParamsChange, coherenceResult, adcPeak, rangeScale, onRangeScaleChange, scaleRange, onScaleRangeChange, getDynamicScale, lidarMm, bgModel, bgRef, bgCapturing, onCaptureBg, onLoadBgModel, onClearBg, bgSubMode, onBgSubModeChange,
   bgDiag, bgStats, onResetBgStats, lidarProvenance, lidarOffsetMm, onLidarOffsetChange }) {
   const { startFreq, stopFreq, stepSize, numBuffers, settleCount, tx1Gain, rx1Gain, tx2Gain, rx2Gain, rangeOffset } = params;
@@ -72,6 +87,20 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
   const [lidarAvg, setLidarAvg] = useState(null);
   const [modelList, setModelList] = useState(null);
   const [modelListOpen, setModelListOpen] = useState(false);
+
+  // Debounce for the stale-standoff warning. Computed during render rather than
+  // in an effect: lidarProvenance is state that updates on every sweep (~15 Hz),
+  // so the render cadence is the clock, and a ref carries when the null run
+  // began. No timer is needed -- and if sweeps stop arriving, the display
+  // simply freezes in its current state, which is the right behaviour.
+  const lidarStaleSinceRef = useRef(null);
+  let lidarStaleVisible = false;
+  if (lidarProvenance && lidarProvenance.lidar_standoff_mm === null) {
+    if (lidarStaleSinceRef.current === null) lidarStaleSinceRef.current = performance.now();
+    lidarStaleVisible = performance.now() - lidarStaleSinceRef.current > STALE_DEBOUNCE_MS;
+  } else {
+    lidarStaleSinceRef.current = null;
+  }
 
   useEffect(() => {
     if (coherenceResult) setCoherenceRunning(false);
@@ -243,7 +272,7 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
             <EditableField
               label="Buffers"
               value={numBuffers}
-              unit="x4096 smp"
+              unit="x2048 smp"
               onChange={(v) => { update('numBuffers', v); sendParams({ numBuffers: v }); }}
               min={1}
               max={64}
@@ -258,7 +287,7 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
             />
           </div>
           <span className="text-[9px] text-[#333333] leading-tight px-1">
-            {captureTimeMs.toFixed(2)} ms capture per step ({(numBuffers * BUFFER_SAMPLES).toLocaleString()} samples),
+            {captureTimeMs.toFixed(2)} ms capture per step ({(numBuffers * DEMOD_SAMPLES).toLocaleString()} samples demodulated),
             averaged over {numBuffers} buffer{numBuffers === 1 ? '' : 's'} — after the retune the gate always
             waits one buffer so the capture cannot straddle it, plus {settleCount} buffer{settleCount === 1 ? '' : 's'} of extra settling
           </span>
@@ -308,11 +337,27 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
               value={lidarProvenance?.lidar_n != null ? String(lidarProvenance.lidar_n) : '—'}
             />
           </div>
-          {lidarProvenance?.lidar_n === 0 && (
-            <div className="px-2 text-[9px] text-red-400/80 leading-relaxed">
-              No lidar readings arrived during that sweep — the standoff is stale.
-            </div>
-          )}
+          {/* Warn on a genuinely dead standoff, not on lidar_n === 0: at 15 Hz
+              sweeps the sweep period is shorter than the TF-LC02's own ~60-90 ms
+              update period, so individual sweeps routinely and healthily contain
+              zero fresh readings (App.jsx carries the last fresh reading forward
+              for up to 1 s). Two more rules, both from the warning flapping in
+              practice (2026-09-06):
+              - The slot below is ALWAYS rendered at a fixed height, so the
+                warning appearing can never reflow the controls under it. A
+                warning that shifts the layout at the sweep rate makes the whole
+                panel flicker, which is worse than the condition it reports.
+              - The warning is debounced: it shows only after the standoff has
+                been continuously null for STALE_DEBOUNCE_MS. A brief null (a
+                burst of invalid lidar returns at a bad target angle) fixes
+                itself; only a sustained one is worth an operator's attention. */}
+          <div className="px-2 h-4 text-[9px] leading-relaxed">
+            {lidarStaleVisible && (
+              <span className="text-red-400/80">
+                No lidar reading for over {(LIDAR_CARRY_MS + STALE_DEBOUNCE_MS) / 1000} s — the standoff is stale.
+              </span>
+            )}
+          </div>
           <EditableField
             label="Lidar→antenna offset"
             value={lidarOffsetMm}

@@ -3572,3 +3572,170 @@ configuration gave 2/399 in one block and 0/1499 in another. That is the same tr
 the 2026-08-23 `settle_count` regression ship. Use >=1200 sweeps, prefer the per-step robust-z
 (51x more samples per sweep), and best of all use `SFCW_DIAG` to test the *mechanism* rather
 than the rate.
+
+## RX buffer 4096 -> 2048/channel, demod 2000: sweep 85.3 -> 65.5 ms (2026-09-06)
+
+`sfcw_engine.py` now carries TWO constants where one number used to do three jobs:
+`RX_BUFFER_SAMPLES = 2048` (per-channel RX buffer -- the clock the settle gate and
+the sweep-time arithmetic run on) and `DEMOD_SAMPLES = 2000` (how many of those
+samples the demod correlates). Landed and validated: **65.5 ms / 15.3 Hz** at 51
+steps, settle 0, num_buffers 1 (was 85.3), timing brackets 0.08 ms. The long comment
+above the constants is the authoritative version of everything below.
+
+**Why 2000 is demodulated, not 2048.** The demod is a rectangular-window correlation,
+so rejection of anything off-tone is a sinc with nulls every sample_rate/N. At
+N=2000, `cw_offset*N/sample_rate = 20.000` exactly -- DC (LO leakage) and every odd
+harmonic land ON nulls. N=2048 puts DC almost exactly BETWEEN nulls (~24 dB worse),
+and 4096's -60 dB was luck (40.96 cycles). Verified at runtime before changing:
+`cw_offset` is exactly 100000 and `sample_rate` exactly 10000000 on the wire. Any
+future N must keep `cw_offset*N/sample_rate` an integer (multiples of 100 at this
+plan). The 48 unused samples cost 0.10 dB of processing gain -- nothing.
+
+**Why the buffer is 2048 and a direct n=2000 was catastrophic (tried twice now, do
+not try again).** libbladeRF's sync layer serves `sync_rx` requests out of whole DMA
+buffers and carries the remainder forward. `sync_config(buffer_size=4096)` counts
+TOTAL samples across both RX_X2 channels -- **measured: the DMA quantum is 2048
+samples/channel (0.2048 ms), pinned by the RX gap mode sitting at 0.2046-0.2048 ms
+when n=2000's computed buf_period said 0.2000.** A request that does not divide the
+DMA buffer (4000 total vs 4096) leaves a leftover that walks 96 samples per call, so
+the returned data lags its own ARRIVAL time by up to a full buffer period -- and
+arrival time is the only thing the settle gate can see. The gate's core invariant
+("gap ~= BP proves the buffer is fresh, because a non-empty ring cannot produce a
+full-period gap") is simply void under misalignment: the gate read locked=100% and
+margin-never-negative while accepting stale pre-retune IQ. Measured signature of the
+naive n=2000: 65.9 ms (timing perfect), S_repeat 16.5 dB, 42/499 visibly corrupted,
+worst z 451, corrupted cells' margins indistinguishable from clean ones -- and only
+28.2% of gaps within 2% of the computed buf_period vs 79.3% at n=4096. **More
+settle_count can never fix this class of failure; raising it to chase a corruption
+that SFCW_DIAG shows margin-clean is chasing the wrong mechanism.** Rule:
+`RX_BUFFER_SAMPLES` must stay a multiple of 2048 (request a whole number of DMA
+buffers), and `buf_period` in `_sweep_core` derives from `_rx_buffer_samples`, never
+a literal.
+
+**Aligned-build validation (2x1200 + 2x1200, bracketed by stock 4096 pairs).** Gate:
+gaps unimodal at exactly 0.2048 ms, 95% in the lockstep band (96.3% at 4096), locked
+99.98-100%, capture margin min +8.0 to +11.6 us and 0.00% negative (stock: +9.2 us).
+Quality: see the caveat below for why aggregate S_repeat could not be used; on the
+episode-robust floor metric the aligned blocks read 34.4/35.3/34.5/35.7 dB against
+stock 35.2/35.3 (before) and 36.0/36.8 (after) -- a ~0.8 dB mean gap inside the
+stock floor's own 1.6 dB same-session drift. Discrete corruption after the same
+trim: aligned 0.020-0.043% of cells in the final pair, better than every stock block
+that day (0.00-0.16%). `SfcwPanel.jsx` carries `BUFFER_SAMPLES = 2048`,
+`DEMOD_SAMPLES = 2000`, and `PER_STEP_OVERHEAD_MS` re-fitted 2.89 -> 0.85 (the 2.89
+predates the Nios II/f firmware and read 189 ms against a real 85).
+
+**The TX2->RX2 loopback was NOT healthy during any of this, and aggregate S_repeat
+was unusable all session -- the brief's own >=35 dB-stable precondition never held.**
+Whole-block S_repeat wandered 12.6-35.1 dB across every configuration INCLUDING
+stock 4096, driven by discrete episodes: for seconds at a time ONE frequency step
+carries 94-99.9% of the sweep-to-sweep difference energy (step 13 / 2.78 GHz twice
+in stock controls; step 7 / 2.42 GHz -- ISM band -- in the worst aligned block;
+step 45 / 4.7 GHz once), with gate diagnostics pristine throughout. One 100-sweep
+window at 3.9 dB drags a whole 1200-sweep block's energy-weighted aggregate into the
+teens while the other 1600 sweeps sit at 33-36 dB. **Metric that survives this:
+windowed S_repeat (100 sweeps) with the 2 worst steps per window excluded, plus
+robust-z rates under the same trim.** Bench action outstanding: reseat/replace the
+loopback and re-run a stock-vs-2048 A/B on a healthy reference before trusting any
+absolute S_repeat from 2026-09-06.
+
+**The flapping "standoff is stale" warning was sweep-rate arithmetic, not a lidar
+fault -- fixed in App.jsx.** The warning fired on `lidar_n === 0` (no fresh
+`lidar_seq` during that sweep). The TF-LC02 updates internally at 11-17 Hz (61-90 ms
+period, 16.2 Hz measured healthy during the flapping, zero seq gaps); once the sweep
+period dropped to 65-85 ms, whether a sweep window catches a fresh reading is a phase
+race, so the flag strobed at the sweep rate -- and worse, those sweeps recorded a
+NULL standoff, which would strobe the BG-model inference on and off. Fix: the last
+fresh reading is carried forward for up to `LIDAR_CARRY_MS = 400` ms when a sweep
+sees none, `lidar_n` stays an honest 0 for such sweeps (provenance counts fresh
+readings only, and "check lidar_n before blaming the model" still works), and the
+panel warning now fires on `lidar_standoff_mm === null` -- i.e. several missed lidar
+periods, an actually-quiet sensor -- instead of on every unlucky sweep window.
+
+## The 15 Hz -> 7 Hz dips were an asyncio thread-safety bug, not the radar (2026-09-06)
+
+**Symptom:** after the RX buffer change took the sweep to 15.3 Hz, the GUI mostly
+read 15 Hz but "randomly kept dropping to 7 Hz for a bit before recovering", and
+occasional corrupted sweeps persisted.
+
+**Root cause: `sdr_server.py` fed `asyncio.Queue` from worker THREADS.**
+`_sfcw_callback` runs on the SFCW sweep thread and `_rx_callback` on the driver's
+RX thread; both did a bare `put_nowait`. `asyncio.Queue` is not thread-safe, and
+the part that bites is not a corrupted queue -- **a put from a foreign thread
+never WAKES the event loop.** The waiting `get()` future is completed only through
+the loop's own `call_soon`, so the loop stayed asleep in its selector and
+`_sfcw_broadcast_loop` was advanced only by its own
+`wait_for(..., timeout=0.1)` -- i.e. **the broadcast ran at ~10 Hz regardless of
+sweep rate**, and the 8-deep drop-oldest queue silently discarded the surplus.
+
+Measured with the engine at 15.57 Hz, using a client that did **no JSON parsing at
+all** (so client backpressure and the 2.6 KB payload are both excluded):
+received **10.90 sweeps/s, 30.0% lost, 42.7% of deltas an exact 2x multiple** (the
+signature of a dropped sweep). A run of dropped sweeps halves the GUI's 12-sweep
+rolling median -- which is exactly the "drops to 7 Hz" report (worst window 7.8 Hz,
+203/636 windows >1.5x base).
+
+**Why it appeared only now:** at the old 85 ms/sweep the engine ran at 11.7 Hz,
+close enough to the ~10 Hz poll that the loss was small. The buffer change to
+15.3 Hz opened the gap and made it obvious. **The bug was always there.**
+
+**Fix:** `_post()` hands items to the loop with `loop.call_soon_threadsafe`, which
+writes the loop's self-pipe and wakes it immediately; the drop-oldest `_offer()`
+then runs on the loop thread where the queue is actually safe. Both callbacks use
+it. Measured after: **15.54/s received, 0.5% lost, 0.0% dropped, p90 64.9 ms
+against a 64.3 ms median, 0/899 slow rolling windows.** The dips are gone.
+
+**Any future producer feeding these queues from a thread must use `_post`, never
+`put_nowait`.** The failure is silent and looks like a radar problem.
+
+### Residual corruption: the gate could still capture an unproven buffer
+
+Separately, `_sweep_core`'s drain loop was bounded by a COUNT
+(`MAX_BACKLOG_DRAIN = 24`) and, on exhausting it, **fell through and captured
+`_rx_latest` anyway** -- a buffer it had just failed to prove current, i.e. the
+stale pre-retune IQ the gate exists to reject. Measured on this rig, the RX thread
+is descheduled for up to **50.9 ms** at a time; the stall-then-drain signature is
+exact (a stall of N buffer periods is followed by N near-zero-gap buffers emptying
+libbladeRF's 16-deep ring), and a sustained starvation burst can burn 24 drains
+across several stall/drain cycles without ever catching a clean full-period gap.
+
+**Waiting longer is always safe here** -- the retune has already happened, so a
+late buffer is still at the correct frequency; only an EARLY one is wrong. So the
+drain is now bounded by wall time (`STALL_GIVEUP_S = 0.25`, 5x the worst stall
+observed) instead of a buffer count, converting a rare corrupt step into a rare
+slow one. `MAX_BACKLOG_DRAIN` is retained only as the reference backlog depth and
+is deliberately no longer a loop bound.
+
+Measured over 70 s per stage, both fixes in (corrupted = adjacent-sweep complex
+correlation < 0.999):
+
+| | before | after |
+|---|---|---|
+| alone | 5.32% corrupted, worst z 155, 172/758 slow windows | **0.46%, worst z 26, 0/1072** |
+| +3 clients | 3.64%, worst z 665, 160/758 slow windows | **2.05%, worst z 249, 0/1063** |
+
+Note the dropped sweeps were also INFLATING the corruption metric: with 30% lost,
+two "adjacent" received sweeps were often two sweeps apart in time, so they
+decorrelated more and tripped the 0.999 bar. Worst z 26 alone means no hard
+retune corruption at all. The residual under client load is concentrated in the
+known RF-flaky steps 11-16 (2.66-3.20 GHz) and is the marginal TX2->RX2 loopback,
+not the gate -- reseat it before chasing this further.
+
+### UI cannot override the RX buffer size -- checked
+
+Asked whether a stale groundstation build could push 4096 back. It cannot:
+`sendSfcwParams()` sends only `start/stop/step`, `num_buffers`, `settle_count`,
+the four gains and `range_offset`, and `SFCWEngine.set_params` has no buffer-size
+key at all. **`num_buffers` is the COUNT of buffers averaged per step (default 1),
+not their size** -- an easy misread. `RX_BUFFER_SAMPLES` is Pi-side only, so a
+stale UI is purely cosmetic (a wrong "x4096 smp" label and sweep-time estimate).
+
+### Lidar stale warning: no longer shifts the layout, and fires far less
+
+The warning slot is now ALWAYS rendered at a fixed height, so the warning
+appearing can never reflow the controls beneath it -- a warning that shifts the
+layout at the sweep rate makes the whole panel flicker, which is worse than the
+condition it reports. It is also debounced (`STALE_DEBOUNCE_MS = 2000`) on top of
+the carry window (`LIDAR_CARRY_MS`, raised 400 -> 1000 ms), so a brief burst of
+invalid returns at a poor target angle -- documented at 30-40% of TF-LC02 reads on
+this bench -- no longer surfaces at all. Only a standoff that has been null
+continuously for ~3 s is reported.

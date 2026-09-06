@@ -26,6 +26,11 @@ class SDRServer:
         self.sfcw_queue = asyncio.Queue(maxsize=8)
         self._broadcast_task = None
         self._sfcw_broadcast_task = None
+        # The event loop, captured in start(). Both queues are fed from FOREIGN
+        # THREADS -- _sfcw_callback from the SFCW sweep thread and _rx_callback
+        # from the driver's RX thread -- and asyncio.Queue is NOT thread-safe.
+        # See _sfcw_callback for what that cost.
+        self._loop = None
 
     async def start(self):
         try:
@@ -39,6 +44,7 @@ class SDRServer:
         self.sfcw._ensure_master_quick_tune_table()
         print(f"[sdr] SFCW master quick_tune table ready")
         print(f"[sdr] Starting WebSocket server on port {PORT}")
+        self._loop = asyncio.get_running_loop()
         self._broadcast_task = asyncio.create_task(self._broadcast_loop())
         self._sfcw_broadcast_task = asyncio.create_task(self._sfcw_broadcast_loop())
 
@@ -251,18 +257,57 @@ class SDRServer:
         params['running'] = self.sfcw.running
         return params
 
-    def _sfcw_callback(self, data):
+    @staticmethod
+    def _offer(queue, item):
+        """put_nowait with drop-oldest. MUST run on the event loop thread."""
         try:
-            self.sfcw_queue.put_nowait(data)
+            queue.put_nowait(item)
         except asyncio.QueueFull:
             try:
-                self.sfcw_queue.get_nowait()
+                queue.get_nowait()
             except asyncio.QueueEmpty:
                 pass
             try:
-                self.sfcw_queue.put_nowait(data)
+                queue.put_nowait(item)
             except asyncio.QueueFull:
                 pass
+
+    def _post(self, queue, item):
+        """Hand an item from a worker THREAD to the event loop.
+
+        This is `call_soon_threadsafe`, not a bare `put_nowait`, and that is the
+        whole point. `asyncio.Queue` is not thread-safe, and the part that bites
+        is not a corrupted queue -- it is that a put from a foreign thread never
+        WAKES the event loop. The waiting `get()` future is only completed via
+        the loop's own `call_soon`, so a producer thread's put leaves the loop
+        asleep in its selector until something else happens to wake it.
+        `_sfcw_broadcast_loop` waits with `wait_for(..., timeout=0.1)`, so what
+        actually woke it was that timeout: the broadcast ran at ~10 Hz no matter
+        how fast the radar swept.
+
+        Measured 2026-09-06, with the engine at 15.57 Hz: a client that did no
+        JSON parsing at all still received only 10.90 sweeps/s -- 30% lost, and
+        42.7% of its inter-sweep deltas were an exact 2x multiple (the signature
+        of a dropped sweep), while the 8-deep queue silently discarded the rest.
+        To an operator that is "mostly 15 Hz, randomly dropping to ~7 Hz for a
+        bit" -- the rolling median halves whenever a run of sweeps is dropped.
+        It only became obvious after the RX buffer change took the sweep from
+        11.7 Hz to 15.3 Hz: at 11.7 Hz the engine was close enough to the 10 Hz
+        poll for the loss to stay small.
+
+        call_soon_threadsafe writes to the loop's self-pipe, so the loop wakes
+        immediately and the queue is served at the rate the radar produces.
+        """
+        loop = self._loop
+        if loop is None:            # pre-start callback; nothing to broadcast to yet
+            return
+        try:
+            loop.call_soon_threadsafe(self._offer, queue, item)
+        except RuntimeError:        # loop already closed during shutdown
+            pass
+
+    def _sfcw_callback(self, data):
+        self._post(self.sfcw_queue, data)
 
     async def _sfcw_broadcast_loop(self):
         while True:
@@ -334,18 +379,9 @@ class SDRServer:
         self.clients -= dead
 
     def _rx_callback(self, rx1_iq, rx2_iq):
-        pair = (rx1_iq, rx2_iq)
-        try:
-            self.rx_queue.put_nowait(pair)
-        except asyncio.QueueFull:
-            try:
-                self.rx_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                self.rx_queue.put_nowait(pair)
-            except asyncio.QueueFull:
-                pass
+        # Same foreign-thread handoff as _sfcw_callback -- this one runs on the
+        # driver's RX thread. Same bug, same fix; see _post.
+        self._post(self.rx_queue, (rx1_iq, rx2_iq))
 
     def _channel_vis(self, iq):
         """Time-domain preview + FFT magnitudes for one channel's raw interleaved IQ."""

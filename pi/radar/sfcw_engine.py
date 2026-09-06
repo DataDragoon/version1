@@ -63,9 +63,93 @@ MAX_QUICK_TUNE_PROFILES = 256  # NUM_BBP_FASTLOCK_PROFILES, fpga_common/bladerf2
 # 0). Tried: mean gap measures 0.4097 ms against a nominal 0.4096, and that 24 ppm
 # accumulates to a 19 ms phantom lag within seconds. The gap band is drift-free
 # because it never integrates.
+# MAX_BACKLOG_DRAIN is DELIBERATELY NOT a cap on the drain loop any more -- see
+# the long comment at the drain in _sweep_core. Capping the drain by a COUNT and
+# then capturing anyway on exhaustion was the residual-corruption path (fixed
+# 2026-09-06). It is kept only as the reference "how deep can the backlog
+# legitimately be" figure: libbladeRF's ring is 16 buffers, so anything past this
+# is a starvation burst rather than ordinary backlog.
 MAX_BACKLOG_DRAIN = 24
+# Wall-clock budget for reaching lockstep after the settle deadline. The drain is
+# bounded by this instead of by a buffer count, because a late buffer is still at
+# the correct frequency (the retune already happened) while an unproven one may
+# not be -- so waiting is always the safe direction. 5x the worst RX-thread
+# deschedule measured on this rig (50.9 ms).
+STALL_GIVEUP_S = 0.25
 LOCKSTEP_LO = 0.8
 LOCKSTEP_HI = 1.2
+
+# RX buffer geometry. These are TWO different numbers on purpose -- see below.
+#
+# RX_BUFFER_SAMPLES is how many samples per channel one RX buffer delivers, and
+# it sets the clock the whole settle gate is expressed in: at settle_count = 0 a
+# step waits one buffer period before the capture and then captures one, so the
+# per-step cost is 2 * RX_BUFFER_SAMPLES / sample_rate. Halving it from 4096 to
+# 2048 is worth 0.41 ms/step = 21 ms on a 51-step sweep (85.6 -> ~65 ms).
+#
+# It MUST stay an exact divisor-multiple of the DMA buffer libbladeRF is
+# configured with in bladerf_driver.py's sync_config (buffer_size=4096), and
+# that is the whole reason the demod length is a separate constant. _rx_loop_dual
+# asks sync_rx for RX_BUFFER_SAMPLES * 2 (RX_X2 counts the request as the total
+# across both channels), so the request is 4096 -- exactly one DMA buffer, the
+# same clean alignment 4096/8192 had.
+#
+# What happens without that alignment is not subtle and it is what killed an
+# earlier attempt to set this to 2000 directly. sync_rx serves a request out of
+# whole DMA buffers and carries the remainder forward, so a request that does not
+# divide the DMA buffer leaves a leftover that GROWS by (DMA - request) every
+# call: at 4000 against 4096 the leftover walks 96 samples per call until, 43
+# calls later, a request is served entirely from leftover and returns instantly.
+# The data stays contiguous, so this is invisible to any correctness check -- but
+# the returned samples end up to a full buffer period BEHIND the arrival that
+# delivered them, and the arrival time is the only thing the settle gate can see.
+# The gate reasons "this buffer arrived at T >= t_retune + buf_period, so its
+# contents cover [T - buf_period, T], which starts at or after the retune". Under
+# a walking leftover that reasoning is false by up to a whole period, so the
+# capture straddles or entirely precedes the retune and holds the PREVIOUS
+# frequency's IQ. Measured: S_repeat 33.8/36.6 dB -> 21.3/17.5 dB and 4/7
+# corrupted sweeps per 1199 -> 183/233. That is far too large to be the ~3 dB of
+# processing gain lost by shortening the correlation, and it is why the fix is
+# alignment, not a longer settle.
+#
+# All of this was confirmed by direct measurement (SFCW_DIAG, 2026-09-06) before
+# this pair of constants was chosen:
+#   - DMA quantum: at n=2000 the dominant RX gap sits at 0.2046-0.2048 ms, NOT
+#     the 0.2000 ms buf_period computes -- 0.2048 ms is exactly 2048 samples per
+#     channel, so sync_config's buffer_size=4096 counts TOTAL samples in RX_X2
+#     and the quantum is 2048/channel. RX_BUFFER_SAMPLES must therefore be a
+#     multiple of 2048. Only 28.2% of gaps fell within 2% of the computed
+#     buf_period, against 79.3% at n=4096.
+#   - The gate was BLIND to the failure, exactly as predicted: locked = 100.00%,
+#     capture margin never negative (min +8.1 us, same as n=4096's +9.2 us), and
+#     the corrupted cells' margins were indistinguishable from the clean ones
+#     (median 185.4 us both). More settle_count could never have fixed this --
+#     the gate gates on arrival, and arrival had stopped tracking content.
+#   - Reproduced collapse: 65.9 ms/sweep (timing exactly as intended) with
+#     S_repeat 16.5 dB and 42/499 visibly corrupted, against a same-day n=4096
+#     bracket of 28.8-35.1 dB and ~35/1199.
+#
+# DEMOD_SAMPLES is how many of those samples _sweep_core correlates against the
+# reference tone, and it is 2000 rather than 2048 for an unrelated reason. The
+# demod is mean(iq * exp(-j2pi*cw_offset*t)) over N samples -- a rectangular
+# window -- so its rejection of anything that is not the tone is a sinc with
+# nulls every sample_rate/N. LO leakage sits at DC, cw_offset away from the tone,
+# so the rejection of DC is set by how many whole tone cycles fit the window:
+#   N = 4096 -> 40.96 cycles, DC lands near a null by luck   -> about -60 dB
+#   N = 2048 -> 20.48 cycles, DC lands almost exactly BETWEEN -> about -36 dB
+#   N = 2000 -> 20.00 cycles, DC lands ON a null (as does every odd harmonic)
+# 2048 would therefore have been 24 dB worse at rejecting LO leakage, which is
+# the worst case available. The condition is that cw_offset * N / sample_rate be
+# an integer -- at 10 Msps and 100 kHz that is any multiple of 100. Verified at
+# runtime before making the change: the server reports cw_offset exactly 100000
+# and sample_rate exactly 10000000, both plain ints feeding both the TX waveform
+# and this tone, so 2000 gives 20.000 cycles and not 20.000-ish.
+#
+# Dropping the 48 unused samples costs 10*log10(2048/2000) = 0.10 dB of
+# processing gain, against a within-step noise term already 70.8 dB down on a
+# system limited at ~40 dB. It is free.
+RX_BUFFER_SAMPLES = 2048
+DEMOD_SAMPLES = 2000
 
 
 # Diagnostics for the settle gate, off unless SFCW_DIAG names a path prefix.
@@ -721,8 +805,12 @@ class SFCWEngine:
             self._diag_gaps_n = 0
             self._diag_steps = np.zeros((DIAG_MAX_STEPS, 8), dtype=np.float64)
             self._diag_steps_n = 0
-        n = 4096
-        t = np.arange(n, dtype=np.float64) / self.driver.sample_rate
+        n = RX_BUFFER_SAMPLES
+        self._rx_buffer_samples = n
+        # The tone is DEMOD_SAMPLES long, not n -- see the constants above. The
+        # demod slices each buffer down to this length, so the two must agree.
+        self._demod_int16 = DEMOD_SAMPLES * 2
+        t = np.arange(DEMOD_SAMPLES, dtype=np.float64) / self.driver.sample_rate
         self._ref_tone = np.exp(-1j * 2 * np.pi * self.driver.cw_offset * t)
         self._ref_tone_scaled = self._ref_tone / 2047.0
         # complex64 copy for the hot demod path in _sweep_core. float32 pairs view
@@ -856,13 +944,17 @@ class SFCWEngine:
 
         use_qt = qt_rx is not None
         ref_tone_c64 = self._ref_tone_c64
+        demod_int16 = self._demod_int16
         rx_cond = self._rx_cond
         stop_event = self._stop_event
 
         dropped_steps = 0
         backlog_drained = 0
         lockstep_misses = 0
-        buf_period = 4096.0 / float(self.driver.sample_rate)
+        # Derived from the buffer actually in use, never a second literal: the
+        # settle gate is expressed entirely in buffer periods, so a stale
+        # constant here silently mis-scales the deadline AND the lockstep band.
+        buf_period = float(self._rx_buffer_samples) / float(self.driver.sample_rate)
         settle_s = settle_count * buf_period
         lo_gap = LOCKSTEP_LO * buf_period
         hi_gap = LOCKSTEP_HI * buf_period
@@ -947,9 +1039,32 @@ class SFCWEngine:
                         break
                     rx_cond.wait(timeout=rem)
 
+                # Drain to lockstep, bounded by WALL TIME rather than by a count
+                # of drained buffers. The count budget (MAX_BACKLOG_DRAIN = 24)
+                # was the residual-corruption path, found 2026-09-06: on
+                # exhausting it the loop fell straight through and captured
+                # `_rx_latest` ANYWAY -- a buffer the gate had just failed to
+                # prove current, i.e. exactly the stale pre-retune IQ the whole
+                # gate exists to reject. Measured on this rig: the RX thread is
+                # descheduled for up to 50.9 ms at a time (confirmed by the
+                # stall-then-drain signature -- a stall of N buffer periods is
+                # followed by exactly N near-zero-gap buffers emptying
+                # libbladeRF's 16-deep ring), and a sustained starvation burst
+                # can burn 24 drains across several stall/drain cycles without
+                # ever catching a clean full-period gap.
+                #
+                # Waiting longer is ALWAYS safe for correctness here: the retune
+                # has already happened, so a late buffer is still at the right
+                # frequency -- only an EARLY one is wrong. So the right trade is
+                # to convert a rare corrupt step into a rare slow one, which is
+                # what an operator asked for ("corrupted values still randomly
+                # come in"). STALL_GIVEUP_S is 5x the worst stall observed;
+                # reaching it means something far outside normal contention, and
+                # only then is an unproven buffer used rather than hanging.
                 drains = 0
                 locked = False
-                while drains < MAX_BACKLOG_DRAIN:
+                stall_deadline = deadline + STALL_GIVEUP_S
+                while True:
                     # Test what is already in hand before waiting for more. The
                     # wall-clock sleep above usually overshoots into a buffer that
                     # already qualifies, and unconditionally waiting for the NEXT
@@ -960,18 +1075,21 @@ class SFCWEngine:
                         break
                     last_seq = self._rx_seq
                     while self._rx_seq <= last_seq:
-                        if not rx_cond.wait(timeout=1.0):
+                        rem = stall_deadline - time.perf_counter()
+                        if rem <= 0:
+                            break
+                        if not rx_cond.wait(timeout=rem):
                             break
                     if self._rx_seq <= last_seq:
-                        break
+                        break          # gave up waiting: nothing new before the deadline
                     drains += 1
                     backlog_drained += 1
                 if not locked:
-                    # Never reached lockstep inside the ring's depth. The capture
-                    # below is taken anyway (a dropped step punches a zero into
-                    # h_cal, which corrupts the IFFT just as badly) but it is
-                    # counted, because a nonzero count here means the RX thread is
-                    # being starved for longer than the ring can absorb.
+                    # Only reachable now by blowing the wall-clock budget, not by
+                    # a mere burst of backlog. A nonzero count here means the RX
+                    # thread was starved for longer than STALL_GIVEUP_S, which is
+                    # a system problem (contention), not a radar one -- and this
+                    # step's data should be treated as suspect.
                     lockstep_misses += 1
 
                 sig_bufs = []
@@ -1012,12 +1130,23 @@ class SFCWEngine:
                 acc_s = 0j
                 acc_r = 0j
                 for sb, rb in zip(sig_bufs, ref_bufs):
-                    acc_s += np.dot(sb.astype(np.float32).view(np.complex64), ref_tone_c64)
-                    acc_r += np.dot(rb.astype(np.float32).view(np.complex64), ref_tone_c64)
-                    p1 = max(int(sb.max()), -int(sb.min()))
+                    # Slice to the tone's length before the view. The buffer is
+                    # RX_BUFFER_SAMPLES long because that is what keeps the RX
+                    # arrivals aligned to libbladeRF's DMA buffer; the correlation
+                    # is DEMOD_SAMPLES long because that is what puts LO leakage on
+                    # an exact null of the rectangular window's sinc. The slice is
+                    # of a contiguous int16 array from the front, so the astype is
+                    # one pass and the complex64 view is still free. adc_peak is
+                    # taken on the same slice, so it describes exactly the samples
+                    # h_cal was computed from.
+                    sbu = sb[:demod_int16]
+                    rbu = rb[:demod_int16]
+                    acc_s += np.dot(sbu.astype(np.float32).view(np.complex64), ref_tone_c64)
+                    acc_r += np.dot(rbu.astype(np.float32).view(np.complex64), ref_tone_c64)
+                    p1 = max(int(sbu.max()), -int(sbu.min()))
                     if p1 > adc_peak_rx1:
                         adc_peak_rx1 = p1
-                    p2 = max(int(rb.max()), -int(rb.min()))
+                    p2 = max(int(rbu.max()), -int(rbu.min()))
                     if p2 > adc_peak_rx2:
                         adc_peak_rx2 = p2
                 nsamp = len(ref_tone_c64)
