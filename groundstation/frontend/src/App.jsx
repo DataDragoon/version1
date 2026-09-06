@@ -423,6 +423,11 @@ export default function App() {
     gateStart: 2,
     gateEnd: 70,
     metric: 'peak',
+    // Plan-view focusing (SAFT), per row. Same kind of setting as metric and
+    // the gate -- it changes how a record is reduced to a colour, not the
+    // record -- so it lives here and rides along in the export.
+    focusEnabled: false,
+    focusAperture: 7,
     // How the raster is driven. 'manual' is the hand-held original: the
     // operator places the head and presses Capture, snaking up from the
     // bottom-left. 'rover' hands the same grid to the gantry, which rasters it
@@ -693,16 +698,21 @@ export default function App() {
       gateStart: bscanParams.gateStart,
       gateEnd: bscanParams.gateEnd,
       metric: bscanParams.metric,
+      hStep: bscanParams.hStep,
+      focusEnabled: bscanParams.focusEnabled,
+      focusAperture: bscanParams.focusAperture,
     }),
-    [cscanProcessedData, bscanParams.gateStart, bscanParams.gateEnd, bscanParams.metric],
+    [cscanProcessedData, bscanParams.gateStart, bscanParams.gateEnd, bscanParams.metric,
+      bscanParams.hStep, bscanParams.focusEnabled, bscanParams.focusAperture],
   );
 
   // Which of those the plan view actually draws with. Shared with the viewport
   // (which makes the same call) so the projector cannot end up on a different
   // colour scale from the monitor it is being aimed by.
   const cscanPlanScales = useMemo(
-    () => planViewScales(bscanScaleLink, cscanGridScales, cscanSharedScale, cscanRowScales),
-    [bscanScaleLink, cscanGridScales, cscanSharedScale, cscanRowScales],
+    () => planViewScales(bscanScaleLink, cscanGridScales, cscanSharedScale, cscanRowScales,
+      bscanParams.focusEnabled),
+    [bscanScaleLink, cscanGridScales, cscanSharedScale, cscanRowScales, bscanParams.focusEnabled],
   );
 
   // The Live Sweep trace at the top of the C-SCAN viewport, subtracted against
@@ -1505,6 +1515,7 @@ export default function App() {
                 const {
                   stepSize, numPositions, maxDepth, wallThickness,
                   hCount, hStep, vCount, vStep, gateStart, gateEnd, metric,
+                  focusEnabled, focusAperture,
                 } = imported.params;
                 // v3 and earlier called it wallThickness. It is no longer a
                 // C-scan parameter at all -- it only ever bounded SAR's
@@ -1522,6 +1533,8 @@ export default function App() {
                   ...(gateStart != null && { gateStart }),
                   ...(gateEnd != null && { gateEnd }),
                   ...(metric != null && { metric }),
+                  ...(focusEnabled != null && { focusEnabled }),
+                  ...(focusAperture != null && { focusAperture }),
                 }));
               }
             }
@@ -1956,7 +1969,7 @@ export default function App() {
             sharedScale={cscanPlanScales.global}
             rowScales={cscanPlanScales.rows}
             scaleScope={bscanScaleScope}
-            scaleLink={bscanScaleLink}
+            scaleLink={cscanPlanScales.effectiveLink}
             subMode={bscanBgSubMode}
             capturing={bscanCapturing}
             nextIndex={roverScan.active ? roverScan.index : cscanProcessedData.length}

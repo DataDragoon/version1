@@ -326,8 +326,12 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   ctx.fillStyle = '#22d3ee';
   ctx.font = 'bold 10px monospace';
   ctx.textAlign = 'left';
+  // Focusing is named in the title because it changes what the colours ARE --
+  // a back-projected aperture sum rather than this cell's own gated profile --
+  // and the B-scan pane beside it is deliberately NOT focused.
+  const focusTag = params.focusEnabled ? ` · FOCUS ×${params.focusAperture}` : '';
   ctx.fillText(
-    `C-SCAN (${String(metric).toUpperCase()} @ ${gateStart}-${gateEnd} cm${isDiff ? ' · Δ MAG' : ''})`,
+    `C-SCAN (${String(metric).toUpperCase()} @ ${gateStart}-${gateEnd} cm${isDiff ? ' · Δ MAG' : ''}${focusTag})`,
     L.pad.left, 14);
   ctx.fillStyle = '#444444';
   ctx.font = '9px monospace';
@@ -389,7 +393,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   // Anything but the plain shared scale is named, because every one of these
   // means a colour here is not a colour on the B-scan beside it.
   const tag = manual ? 'MANUAL' : [
-    unlinked ? 'OWN SCALE · GATED' : null,
+    unlinked ? (params.focusEnabled ? 'OWN SCALE · FOCUSED' : 'OWN SCALE · GATED') : null,
     perRow ? `PER ROW ${(selected ? selected.iy : 0) + 1}` : null,
   ].filter(Boolean).join(' · ');
   if (tag) {

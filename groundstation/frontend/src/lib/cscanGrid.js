@@ -1,3 +1,5 @@
+import { saftFocusedProfile, metricOnProfile, gateDepths } from './saft';
+
 // C-scan grid geometry.
 //
 // A C-scan is a rectangular raster of B-scan positions over the wall. Capture
@@ -123,21 +125,97 @@ export const BG_STATUS_TEXT = {
   [BG_STATUS.NO_SUPERFIT_CELL]: 'INVALID — no Super Fit reference for this cell',
 };
 
+// ── Per-cell values, focused or not ────────────────────────────────────────
+//
+// ONE function producing the number every plan-view cell is coloured by, used
+// by buildCscanGrid (which draws them) and by computeGridScales (which sets the
+// colour limits from them). They used to call gatedIntensity separately; with
+// focusing in the picture that duplication would mean the grid could be drawn
+// with values the scale was not computed from, which is silently a wrong image
+// rather than a crash.
+//
+// FOCUSING IS PER ROW, and only along the row. A C-scan row is a line of
+// positions at one height, which is exactly the geometry lib/saft.js's
+// back-projection assumes; rows are focused independently of each other and
+// never contribute across rows. That is deliberate rather than a simplification
+// -- CLAUDE.md's 2026-08-30 rover diagnosis measured the vertical axis to be a
+// completely different animal from the horizontal one (moving 200 mm sideways
+// costs a few dB of background correlation, moving 150 mm up destroys it
+// entirely, because the standoff walks ~10 mm), so summing across rows would be
+// combining traces that do not describe the same wall.
+//
+// Neighbours are addressed by GRID COLUMN, not by position in the array, so a
+// row with holes in it (an undone cell, a partial raster) still gets the right
+// spacing instead of closing the gap up.
+//
+// A cell whose background failed contributes to nothing: it is un-subtracted
+// and sits 20-30 dB above its neighbours, so letting it into an aperture would
+// smear that error across every cell within half an aperture of it.
+export function computeCellValues(scanData, params) {
+  const gateStartM = params.gateStart / 100;
+  const gateEndM = params.gateEnd / 100;
+  const { metric } = params;
+  const out = new Array(scanData.length).fill(-Infinity);
+  const focus = !!params.focusEnabled && params.focusAperture >= 1;
+
+  if (!focus) {
+    for (let i = 0; i < scanData.length; i++) {
+      const pos = scanData[i];
+      if (!pos) continue;
+      out[i] = gatedIntensity(pos.magnitudes, pos.distances, gateStartM, gateEndM, metric);
+    }
+    return out;
+  }
+
+  const stepM = (params.hStep > 0 ? params.hStep : 1) / 100;
+  const halfAp = Math.floor(params.focusAperture / 2);
+
+  const rows = new Map();
+  for (let i = 0; i < scanData.length; i++) {
+    const pos = scanData[i];
+    if (!pos || !pos.magnitudes || !pos.distances) continue;
+    if (bgFailed(pos.bg_status)) continue;
+    const iy = pos.grid_iy != null ? pos.grid_iy : 0;
+    let row = rows.get(iy);
+    if (!row) { row = []; rows.set(iy, row); }
+    row.push({
+      i,
+      n: pos.grid_ix != null ? pos.grid_ix : i,
+      magnitudes: pos.magnitudes,
+      distances: pos.distances,
+    });
+  }
+
+  for (const traces of rows.values()) {
+    traces.sort((a, b) => a.n - b.n);
+    // The depth axis is the record's own, so a gate that falls outside it gives
+    // no depths and every cell in the row reads "outside gate" -- the same
+    // answer gatedIntensity gives, rather than a focused image of nothing.
+    const depths = gateDepths(traces[0].distances, gateStartM, gateEndM);
+    if (depths.length === 0) continue;
+    for (let k = 0; k < traces.length; k++) {
+      out[traces[k].i] = metricOnProfile(
+        saftFocusedProfile(traces, k, depths, stepM, halfAp), metric);
+    }
+  }
+  return out;
+}
+
 // Fill the grid with gated intensities. Returns a hCount x vCount array indexed
 // [iy * hCount + ix], holding null where nothing has been captured yet. A cell
 // that was captured but has no range bin inside the gate keeps its entry with a
 // non-finite value, so the display can tell "empty" from "gated out"; a cell
 // whose background failed is flagged invalid and contributes to no scale.
 export function buildCscanGrid(scanData, params) {
-  const { hCount, vCount, gateStart, gateEnd, metric } = params;
+  const { hCount, vCount } = params;
   const h = Math.max(1, hCount);
   const v = Math.max(1, vCount);
   const cells = new Array(h * v).fill(null);
-  const gateStartM = gateStart / 100;
-  const gateEndM = gateEnd / 100;
 
   let min = Infinity;
   let max = -Infinity;
+
+  const values = computeCellValues(scanData, params);
 
   for (let i = 0; i < scanData.length; i++) {
     const pos = scanData[i];
@@ -149,9 +227,7 @@ export function buildCscanGrid(scanData, params) {
     if (cell.ix < 0 || cell.ix >= h || cell.iy < 0 || cell.iy >= v) continue;
 
     const invalid = bgFailed(pos.bg_status);
-    const value = invalid
-      ? NaN
-      : gatedIntensity(pos.magnitudes, pos.distances, gateStartM, gateEndM, metric);
+    const value = invalid ? NaN : values[i];
     cells[cell.iy * h + cell.ix] = { value, pos, order: i, invalid, status: pos.bg_status };
     if (invalid || !isFinite(value)) continue;
     if (value < min) min = value;
@@ -276,16 +352,16 @@ export function computeRowScales(scanData) {
 // inside the gate are skipped, not floored: they are drawn as "gated out" in
 // their own colour and have no value to contribute.
 export function computeGridScales(scanData, params) {
-  const gateStartM = params.gateStart / 100;
-  const gateEndM = params.gateEnd / 100;
-  const { metric } = params;
   const all = [];
   const byRow = new Map();
+  // The same values the grid draws, focusing included -- see computeCellValues.
+  const values = computeCellValues(scanData, params);
 
-  for (const pos of scanData) {
+  for (let i = 0; i < scanData.length; i++) {
+    const pos = scanData[i];
     if (!pos || !pos.magnitudes || !pos.distances) continue;
     if (bgFailed(pos.bg_status)) continue;
-    const v = gatedIntensity(pos.magnitudes, pos.distances, gateStartM, gateEndM, metric);
+    const v = values[i];
     if (!isFinite(v)) continue;
     all.push(v);
     const iy = pos.grid_iy != null ? pos.grid_iy : 0;
@@ -462,10 +538,19 @@ export function cscanLayout(w, h, params, projection, canvasOffset) {
 // differently; three copies of this choice would drift, and the projected
 // image disagreeing with the monitor is exactly the failure that would not be
 // noticed until it was on the wall.
-export function planViewScales(scaleLink, gridScales, sharedScale, rowScales) {
-  const unlinked = scaleLink === 'independent' && !!gridScales;
+// `focused` forces the unlinked population whatever the toggle says. A focused
+// cell value is a back-projected SUM over an aperture, not a bin of any
+// profile, so it is systematically above the bin-domain limits the linked scale
+// is built from -- linked, every cell would saturate at the top of the colormap
+// the moment focus was switched on. The B-scan pane is NOT focused (focusing is
+// a plan-view reduction, not a change to the records), so it keeps the bin
+// scale and the two genuinely disagree; `effectiveLink` is what both displays
+// are given so they say so.
+export function planViewScales(scaleLink, gridScales, sharedScale, rowScales, focused) {
+  const unlinked = !!gridScales && (focused || scaleLink === 'independent');
   return {
     unlinked,
+    effectiveLink: unlinked ? 'independent' : 'linked',
     global: unlinked ? gridScales.global : sharedScale,
     rows: unlinked ? gridScales.rows : rowScales,
   };

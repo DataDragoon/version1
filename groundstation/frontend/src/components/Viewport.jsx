@@ -414,9 +414,13 @@ export default function Viewport({
     // gated cell values, so the two panes' colour bars stop agreeing -- both
     // say so on screen. The B-scan always keeps the bin-domain population; it
     // draws bins, and there is nothing gated about them to scale within.
-    const planScales = planViewScales(bscanScaleLink, cscanGridScales, cscanSharedScale, cscanRowScales);
+    const planScales = planViewScales(bscanScaleLink, cscanGridScales, cscanSharedScale, cscanRowScales,
+      bscanParams.focusEnabled);
     const cscanScaleGlobal = planScales.global;
     const cscanScaleRows = planScales.rows;
+    // Focusing forces the plan view onto its own population, so both panes are
+    // told the link that is actually in force rather than the one on the toggle.
+    const effectiveLink = planScales.effectiveLink;
 
     return (
       <div ref={cscanRootRef} className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
@@ -503,7 +507,7 @@ export default function Viewport({
                 sharedScale={cscanScaleGlobal}
                 rowScales={cscanScaleRows}
                 scaleScope={bscanScaleScope}
-                scaleLink={bscanScaleLink}
+                scaleLink={effectiveLink}
                 subMode={bscanBgSubMode}
                 nextIndex={roverScan?.active ? roverScan.index : bscanData.length}
                 selectedCell={activeCell}
@@ -538,7 +542,7 @@ export default function Viewport({
                 scaleRange={bscanScaleRange}
                 sharedScale={bscanScale}
                 scaleScope={bscanScaleScope}
-                scaleLink={bscanScaleLink}
+                scaleLink={effectiveLink}
                 showGate={bscanShowGate}
                 subMode={bscanBgSubMode}
                 orientation="vertical"

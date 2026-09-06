@@ -2934,6 +2934,70 @@ real data reaching the second window and not just an empty grid.
 There is still no test runner in this repo, so all of these were throwaway
 scripts. `vite build` passes.
 
+## C-scan plan-view focusing, per row (2026-09-06)
+
+A **Focus (SAFT)** section on the C-scan panel -- a toggle and an aperture
+slider, the same two controls the 2D Map has. It changes how each cell is
+reduced to a COLOUR and nothing else: the B-scan pane's traces are drawn exactly
+as recorded, focused or not (verified in a browser -- toggling focus changes the
+plan view's pixels and leaves the B-scan's image untouched).
+
+**The kernel is shared, not copied.** `lib/saft.js` now holds
+`interpMagnitudeAtRange`, `saftFocusedProfile`, `metricOnProfile` and
+`gateDepths`, lifted out of `MapDisplay.jsx`; the 2D Map calls the same
+functions. This is the same rule CFAR and the window functions follow -- two
+copies of a focusing kernel would drift, and the failure would be invisible,
+because both images would still look plausible while disagreeing about where a
+target is. **The lift is bit-identical**: 945 values compared across
+peak/energy/mean x aperture 3..21 x three gates on a real row, worst delta 0.
+
+**Focusing is PER ROW and only along the row.** A C-scan row is a line of
+positions at one height, which is the geometry the back-projection assumes; rows
+are focused independently and never contribute to each other. That is a physical
+decision, not a simplification -- the 2026-08-30 rover diagnosis measured the
+two axes to be completely different animals (200 mm sideways costs a few dB of
+background correlation, 150 mm up destroys it, because the standoff walks
+~10 mm), so summing across rows would combine traces that do not describe the
+same wall. Verified: adding 30 dB to one row moves that row's 21 cells and
+**zero cells anywhere else**.
+
+Three things that are easy to get wrong and are handled:
+
+- **Neighbours are addressed by GRID COLUMN, not by array position.** A row with
+  a hole in it -- an undone cell, a partial raster -- would otherwise close the
+  gap up and give every later column the wrong offset. Verified: with two
+  columns removed, a cell whose aperture clears the gap is bit-identical to the
+  full-row result, and one whose aperture spans it changes.
+- **A background-failed cell is excluded from every aperture.** It is
+  un-subtracted and sits 20-30 dB above its neighbours, so letting it in would
+  smear that error across every cell within half an aperture. Verified: its
+  neighbours change (it is dropped) but do not absorb its level.
+- **`computeCellValues()` is the single source of the number a cell is coloured
+  by**, used by `buildCscanGrid` (which draws them) and `computeGridScales`
+  (which sets the limits from them). They each called `gatedIntensity`
+  separately before; with focusing in the picture that duplication would let the
+  grid be drawn with values the scale was not computed from -- a wrong image
+  rather than a crash.
+
+**Focusing forces the plan view onto its own colour scale**, whatever the
+linked/unlinked toggle says (`planViewScales(..., focused)` returns an
+`effectiveLink` both displays are given). A focused value is a back-projected
+SUM over an aperture, not a bin of any profile: measured on the 21x7 bench scan
+it runs **12.7 dB above** the unfocused bin-domain maximum, so on the linked
+scale every cell would saturate at the top of the colormap the instant focus was
+switched on. The B-scan pane is not focused, so the two panes genuinely disagree
+and both label it -- the plan view's colour bar reads `OWN SCALE · FOCUSED` and
+the title carries `FOCUS ×N`.
+
+`focusEnabled` / `focusAperture` live in `bscanParams` beside `metric` and the
+gate -- they are the same kind of setting, "how a record becomes a colour" --
+so they ride along in the export and are restored on import.
+
+**What it is not:** incoherent, magnitude-domain back-projection, exactly what
+the 2D Map has always done. It reads the magnitude profiles already on screen
+and knows nothing about phase, permittivity or refraction, so it is not the SAR
+panel's reconstruction and should not be compared to one.
+
 ## Five-scan A/B on the new rig: the raster does not see a deep pipe (2026-09-02)
 
 Five 20x1 rover C-scans of one 1 m patch of brick wall, 50 mm pitch, `avgCount: 1`,

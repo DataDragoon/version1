@@ -1,4 +1,5 @@
 import { useRef, useEffect, useCallback, useState } from 'react';
+import { saftFocusedProfile, metricOnProfile, gateDepths as gateDepthsIn } from '@/lib/saft';
 
 const BG = '#000000';
 
@@ -9,18 +10,6 @@ function jet(t) {
     Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 2)))),
     Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 1)))),
   ];
-}
-
-function interpMagnitudeAtRange(mags, dists, targetRange) {
-  if (targetRange < dists[0] || targetRange > dists[dists.length - 1]) return -Infinity;
-  let lo = 0, hi = dists.length - 1;
-  while (lo < hi - 1) {
-    const mid = (lo + hi) >> 1;
-    if (dists[mid] <= targetRange) lo = mid;
-    else hi = mid;
-  }
-  const t = (targetRange - dists[lo]) / (dists[hi] - dists[lo] + 1e-15);
-  return mags[lo] + t * (mags[hi] - mags[lo]);
 }
 
 function computeMapData(bscanData, gateStart, gateEnd, metric, focusEnabled, focusAperture, stepSize) {
@@ -35,15 +24,13 @@ function computeMapData(bscanData, gateStart, gateEnd, metric, focusEnabled, foc
   const refDists = bscanData.find(p => p.distances)?.distances;
   if (!refDists) return null;
 
-  const gateIndices = [];
-  for (let j = 0; j < refDists.length; j++) {
-    if (refDists[j] >= gateStartM && refDists[j] <= gateEndM) {
-      gateIndices.push(j);
-    }
-  }
-  if (gateIndices.length === 0) return null;
+  const gateDepths = gateDepthsIn(refDists, gateStartM, gateEndM);
+  if (gateDepths.length === 0) return null;
 
-  const gateDepths = gateIndices.map(j => refDists[j]);
+  // A linear scan's capture index IS its position along the line, so `n` is the
+  // array index and the offsets below come out exactly as they did before this
+  // was shared with the C-scan.
+  const traces = bscanData.map((p, i) => ({ magnitudes: p.magnitudes, distances: p.distances, n: i }));
 
   const intensities = [];
 
@@ -57,38 +44,11 @@ function computeMapData(bscanData, gateStart, gateEnd, metric, focusEnabled, foc
       }
       intensities.push(applyMetric(pos.magnitudes, pos.distances, gateStartM, gateEndM, metric));
     } else {
-      // Focused SAFT: sum weighted contributions from neighbors at geometric range
-      // Weight by (d/R)² — obliquity factor that naturally tapers steep angles
-      // where the antenna has no gain and geometric lookups hit unrelated clutter
+      // Focused: back-project the neighbours within the aperture, then apply the
+      // same metric over the focused profile. See lib/saft.js.
       const halfAp = Math.floor(focusAperture / 2);
-      const focusedProfile = new Float64Array(gateDepths.length);
-
-      for (let di = 0; di < gateDepths.length; di++) {
-        const d = gateDepths[di];
-        if (d < 1e-6) continue;
-        let weightedSum = 0;
-
-        for (let ni = i - halfAp; ni <= i + halfAp; ni++) {
-          if (ni < 0 || ni >= numPositions) continue;
-          const neighbor = bscanData[ni];
-          if (!neighbor.magnitudes || !neighbor.distances) continue;
-
-          const dx = (ni - i) * stepM;
-          const R = Math.sqrt(dx * dx + d * d);
-          const obliquity = (d * d) / (R * R);
-
-          const mag = interpMagnitudeAtRange(neighbor.magnitudes, neighbor.distances, R);
-          if (mag > -Infinity) {
-            const linear = Math.pow(10, mag / 20);
-            weightedSum += linear * obliquity;
-          }
-        }
-
-        focusedProfile[di] = weightedSum > 0 ? 20 * Math.log10(weightedSum + 1e-12) : -Infinity;
-      }
-
-      // Apply metric over the focused profile
-      intensities.push(applyMetricOnArray(focusedProfile, metric));
+      intensities.push(metricOnProfile(
+        saftFocusedProfile(traces, i, gateDepths, stepM, halfAp), metric));
     }
   }
 
@@ -126,34 +86,6 @@ function applyMetric(mags, dists, gateStartM, gateEndM, metric) {
   return value;
 }
 
-function applyMetricOnArray(profile, metric) {
-  let value = -Infinity;
-  if (metric === 'peak') {
-    for (let i = 0; i < profile.length; i++) {
-      if (profile[i] > value) value = profile[i];
-    }
-  } else if (metric === 'energy') {
-    let sum = 0, count = 0;
-    for (let i = 0; i < profile.length; i++) {
-      if (profile[i] > -Infinity) {
-        const linear = Math.pow(10, profile[i] / 20);
-        sum += linear * linear;
-        count++;
-      }
-    }
-    if (count > 0) value = 10 * Math.log10(sum / count + 1e-12);
-  } else if (metric === 'mean') {
-    let sum = 0, count = 0;
-    for (let i = 0; i < profile.length; i++) {
-      if (profile[i] > -Infinity) {
-        sum += profile[i];
-        count++;
-      }
-    }
-    if (count > 0) value = sum / count;
-  }
-  return value;
-}
 
 function drawMap(canvas, bscanData, crosshair, params) {
   if (!canvas) return;

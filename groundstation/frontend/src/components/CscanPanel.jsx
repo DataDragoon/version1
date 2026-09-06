@@ -30,6 +30,7 @@ export default function CscanPanel({
 }) {
   const {
     hStep, hCount, vStep, vCount, gateStart, gateEnd, metric,
+    focusEnabled, focusAperture,
     scanMode, roverOriginRightMm, roverOriginBelowMm, roverSettleMs,
   } = params;
 
@@ -780,6 +781,54 @@ export default function CscanPanel({
           {showGate
             ? 'Two cyan lines on the B-scan mark the gate edges and everything outside them is dimmed — what stays bright is exactly the bins each plan-view cell is built from. Drag the sliders and watch it move.'
             : 'Markers hidden. The gate still decides every plan-view cell value — this toggle only stops drawing it.'}
+        </div>
+      </Section>
+
+      {/* Plan-view focusing. Same synthetic-aperture kernel the 2D Map uses
+          (lib/saft.js, one implementation), applied to each grid ROW on its
+          own -- a row is a line of positions at one height, which is the
+          geometry the back-projection assumes. It reduces each cell to a
+          colour differently; it does not touch the B-scan pane, whose traces
+          stay exactly as recorded. */}
+      <Section label="Focus (SAFT)">
+        <button
+          onClick={() => update('focusEnabled', !focusEnabled)}
+          disabled={hCount < 3}
+          className={cn(
+            'w-full px-3 py-2 rounded-lg text-xs font-medium transition-all border',
+            hCount < 3
+              ? 'bg-white/2 border-white/5 text-white/20 cursor-not-allowed'
+              : focusEnabled
+                ? 'bg-purple-500/10 border-purple-500/30 text-purple-400'
+                : 'bg-white/5 border-white/10 text-white/70 hover:bg-white/10 hover:text-white'
+          )}
+        >
+          {focusEnabled ? '● Focus ON' : 'Focus OFF'}
+        </button>
+        {focusEnabled && (
+          <>
+            <SliderRow
+              label="Aperture (neighbours)"
+              value={focusAperture}
+              unit=""
+              min={3}
+              max={Math.max(3, hCount)}
+              step={2}
+              onChange={(v) => update('focusAperture', v)}
+              accent="amber"
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <InfoTile label="Span" value={`${((focusAperture - 1) * hStep).toFixed(0)} cm`} />
+              <InfoTile label="Rows focused" value={`${vCount} × independently`} />
+            </div>
+          </>
+        )}
+        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
+          {hCount < 3
+            ? 'Needs at least 3 columns — focusing sums a row’s neighbours.'
+            : focusEnabled
+              ? 'Each cell is back-projected from its own row: every neighbour within the aperture is read at the geometric range to each gated depth and summed, tapered by an obliquity weight. Rows never contribute to each other — the vertical axis decorrelates far faster than the horizontal one on this rig, so traces a row apart do not describe the same wall. Neighbours are addressed by grid column, so a gap left by an undo keeps its spacing. Colour limits switch to the focused values, because a summed aperture is no longer a bin of any profile — the B-scan pane below is NOT focused and both panes say so.'
+              : 'Off, each cell is just its own range profile reduced over the gate. On, each row is focused along itself, which sharpens a target that spans several columns and suppresses returns that do not line up on a hyperbola.'}
         </div>
       </Section>
 
