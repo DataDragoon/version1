@@ -4220,6 +4220,42 @@ tolerance and overflow DROPS samples with no flag in SC16_Q11.
   backlog at 36 Hz. An earlier gate that read it as "loss" at a 0.5% threshold **rejected
   every sweep**; do not lower it without understanding that distinction.
 
+### Fallbacks are EXPECTED, and must not re-prime or spam (2026-09-07)
+
+Measured on the shipped code over 2500 sweeps: **1.36% of sweeps fall back**, essentially
+all of them the span gate refusing a lattice that came up one boundary short. That is the
+gate working -- each one produces a correct standard sweep -- and the operator sees no
+corruption. Two things about that path were wrong and are fixed:
+
+- **A transient failure must NOT invalidate the priming.** `fallback()` used to always set
+  `_nios_primed = False` (inherited from `fpga_branch`, where the only failure it
+  contemplated was "this firmware has no sweep support"). The NIOS still holds a perfectly
+  good copy of the grid after a mis-aligned capture, so re-priming is waste -- and worse,
+  it walks 51 retunes over USB, which disturbs the very next capture and turned single
+  fallbacks into RUNS of them. That is what the operator saw as three-in-a-row. `fallback()`
+  now takes `reprime=` and only the CAPABILITY failures (EXEC rejected / counter dead /
+  prime refused / no profiles) set it. Measured after: **34 fallbacks in 2500 sweeps, run
+  lengths all exactly 1 -- the cascade is gone.**
+- **The log is rate-limited** (`_log_nios_fallback`, `NIOS_FALLBACK_LOG_PERIOD_S = 30`).
+  At 36 Hz a 1.4% rate is a line every 3 s, which buries the one message a real failure
+  would print -- the same trap the `_sweep_core` unpack bug fell into, where the operator
+  learned to ignore a recurring line. First of a run prints in full; the rest are
+  summarised every 30 s with a rate. Verified against a fake clock: 45 fallbacks over 90 s
+  produce 3 lines, not 90.
+
+Residual mis-slice rate, split by flavour over 1800 sweeps: **nios 1770/1771 correctly
+aligned, fallback 29/29**. The single outlier is not a clean rotation -- its best
+correlation is 0.83 where a genuine one-step rotation scores ~0.999 -- so it is one
+disturbed capture, not an alignment error.
+
+**If the fallback rate ever needs lowering**, the cause is a missing boundary at one END of
+the lattice, and the recovery is already measured but NOT implemented: the EXEC front
+matter (the ~1940-sample pair) sits 3.190 periods ahead of step 1 with std 0.0055, and is
+detectable in ~90% of sweeps, so it can identify the first lattice member's absolute step
+index even when the span is short. It is worth ~1% of throughput, so it was left out to
+keep the shipped path small; anything added there must fail safe (recover or fall back,
+never guess).
+
 ### Still open / cautions
 
 - The GUI's sweep-time estimate and Settle field describe the standard sweep; in nios mode

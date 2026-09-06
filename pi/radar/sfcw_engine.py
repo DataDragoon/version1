@@ -186,6 +186,8 @@ NIOS_MIN_DWELL = 4096
 # within ~35 ms of EXEC, so a capped capture still contains the whole train;
 # _rx_capture simply stops appending at the cap and harvest proceeds normally.
 NIOS_BULK_MAX_BUFFERS = 1220
+# How often a run of fallbacks is summarised on stdout (seconds).
+NIOS_FALLBACK_LOG_PERIOD_S = 30.0
 
 BLADERF_RX = libbladeRF.BLADERF_RX
 
@@ -428,6 +430,9 @@ class SFCWEngine:
         self._nios_unavailable = False
         self._last_sweep_core = 'standard'
         self._nios_fallbacks = 0
+        self._nios_fb_window_start = None
+        self._nios_fb_window_count = 0
+        self._nios_sweeps_since = 0
         self._nios_last_span_ok = None
         self._bulk_capture = False
         self._bulk_rx1 = []
@@ -1042,6 +1047,37 @@ class SFCWEngine:
     # docs/nios_sweep.md for the protocol and the firmware side.
     # ------------------------------------------------------------------
 
+    def _log_nios_fallback(self, reason):
+        """Report fallbacks without drowning stdout.
+
+        A fallback is EXPECTED at a low rate -- it is the span gate refusing an
+        ambiguous sweep and taking a correct slower one instead, by design. At
+        36 Hz even a 1% rate is a line every three seconds, which buries the
+        one message a real failure would print (exactly the trap the
+        `_sweep_core` unpack bug fell into: an operator trained to ignore a
+        recurring line). So the first of a run is printed in full, and the rest
+        are summarised on a timer with a rate.
+        """
+        now = time.time()
+        first = self._nios_fb_window_start is None
+        if first:
+            self._nios_fb_window_start = now
+            self._nios_fb_window_count = 0
+        self._nios_fb_window_count += 1
+        elapsed = now - self._nios_fb_window_start
+        if first or elapsed >= NIOS_FALLBACK_LOG_PERIOD_S:
+            if first:
+                print(f"[sfcw] NIOS sweep: {reason} — one standard sweep "
+                      f"used instead")
+            else:
+                pct = 100.0 * self._nios_fb_window_count / max(1, self._nios_sweeps_since)
+                print(f"[sfcw] NIOS sweep: {self._nios_fb_window_count} fallbacks "
+                      f"in the last {elapsed:.0f}s ({pct:.1f}% of sweeps); "
+                      f"most recent: {reason}")
+            self._nios_fb_window_start = now
+            self._nios_fb_window_count = 0
+            self._nios_sweeps_since = 0
+
     def _nios_command(self, cmd, arg=0):
         """Send a sweep command as a sentinel timestamp in a retune2 packet.
 
@@ -1649,33 +1685,48 @@ class SFCWEngine:
         window is set by nios_dwell/nios_settle in SAMPLES, not buffers.
         """
         num_steps = len(freqs)
+        self._nios_sweeps_since += 1
         if self._stop_event.is_set():
             # THREE values, like _sweep_core's own early return -- see the
             # comment there for the unpack bug this shape prevents.
             return None, 0, None
 
-        def fallback(reason):
+        def fallback(reason, reprime=False):
+            """Take one standard sweep instead of this one, and say why.
+
+            `reprime` separates the two very different reasons we get here:
+
+            - A TRANSIENT failure (the step lattice came up short, the capture
+              was cut off, a harvest timed out). The NIOS still holds a
+              perfectly good copy of the frequency grid, so tearing that down
+              is pure waste -- and worse than waste: re-priming walks 51
+              retunes over USB, which disturbs the timing of the very next
+              capture and can turn one fallback into a run of them. Leave the
+              priming alone; the next sweep almost always aligns.
+            - A CAPABILITY failure (EXEC rejected, sample counter dead, prime
+              refused). The firmware may not be the sweep firmware at all, in
+              which case it treated our sentinels as ordinary scheduled
+              retunes and queued them; those never fire and would fill the
+              16-deep queue, so the queue is cleared and the grid re-primed.
+            """
             self._nios_last_score = -1.0
             self._last_sweep_core = 'fallback'
             self._nios_fallbacks += 1
             self._nios_discard_inflight()
-            print(f"[sfcw] NIOS sweep: {reason} — falling back to standard")
-            self._nios_primed = False
-            # Firmware without sweep support does not recognise the sentinels,
-            # so it treats them as ordinary scheduled retunes and enqueues
-            # them. Those entries never fire and would fill the 16-deep queue,
-            # so clear it before handing back to the standard sweep.
-            self._nios_clear_queue()
+            self._log_nios_fallback(reason)
+            if reprime:
+                self._nios_primed = False
+                self._nios_clear_queue()
             return self._sweep_core(freqs, qt_rx, qt_tx, num_buffers,
                                     settle_count, progress_cb)
 
         if qt_rx is None or qt_tx is None:
-            return fallback("no quick-tune profiles")
+            return fallback("no quick-tune profiles", reprime=True)
 
         key = (int(freqs[0]), int(freqs[-1]), num_steps)
         if not self._nios_primed or self._nios_primed_key != key:
             if not self._nios_prime(freqs, qt_rx, qt_tx):
-                return fallback("priming failed")
+                return fallback("priming failed", reprime=True)
 
         dwell = int(self.nios_dwell)
         settle = int(self.nios_settle)
@@ -1710,7 +1761,7 @@ class SFCWEngine:
                           "to re-enable.")
                     return fallback("EXEC rejected, or the sample counter is "
                                     "not running — is the rx.vhd tamer change "
-                                    "in this FPGA image?")
+                                    "in this FPGA image?", reprime=True)
 
             harvested = self._nios_harvest(inflight)
             if harvested is None:
@@ -1720,7 +1771,7 @@ class SFCWEngine:
             if self.nios_pipeline:
                 self._nios_inflight = self._nios_launch(units, num_steps, dwell)
         except Exception as e:
-            return fallback(f"exec failed: {e}")
+            return fallback(f"exec failed: {e}", reprime=True)
 
         rx1_bufs, rx2_bufs, bulk_start = harvested
         round_trip = inflight['round_trip']
