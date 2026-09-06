@@ -151,6 +151,54 @@ LOCKSTEP_HI = 1.2
 RX_BUFFER_SAMPLES = 2048
 DEMOD_SAMPLES = 2000
 
+# ---------------------------------------------------------------------------
+# NIOS autonomous sweep (sweep_mode='nios') -- ported from fpga_branch
+# (docs/nios_sweep.md has the protocol and the firmware side). Commands ride
+# as sentinel values in the upper 32 bits of a retune2 packet's timestamp.
+# 0x5357xxxx ("SW..") is ~1.8 million years out at 10 MSPS, so it can never be
+# a real sample count and the normal retune path is unaffected. Requires the
+# Nios II/f image with the rx.vhd tamer fix (hosted_niosII_f_sweep_ts.rbf);
+# on stock firmware every path falls back to the standard sweep.
+NIOS_CMD_PRIME = 0x53575052   # "SWPR"
+NIOS_CMD_EXEC  = 0x53574550   # "SWEP"
+NIOS_CMD_STOP  = 0x53575354   # "SWST"
+NIOS_CMD_QUERY = 0x53575147   # "SWQG"
+NIOS_INTERVAL_UNIT = 64       # the dwell is sent divided by this
+# Samples left unused at BOTH ends of each capture window. Alignment lands
+# within a few tens of samples of the step boundary, and a window that starts
+# even slightly early pulls the tail of the settling transient into the
+# average -- degraded h_cal rather than a failure, so it is worth paying for.
+NIOS_WINDOW_GUARD = 64
+# Shortest dwell that holds on the II/f image, in samples at 10 Msps.
+# Measured 2026-09-07 (Gate 2, dwell-vs-actual): the firmware rails at ~3030
+# samples (~303 us/step) -- asked 2048 or 1024, it steps at ~3030 either way.
+# 3456 is above the rail but UNSTABLE in practice: per-step period wobbles
+# +/-14 samples and the slicer thrashes (S_repeat 13-19 dB, realignment on
+# most sweeps). 4096 holds its period to +/-7, slices cleanly (S_repeat
+# 36-37 dB, zero realignments over 80-sweep blocks), and with the pipeline the
+# sweep is processing-bound anyway, so a shorter dwell buys nothing.
+# (The Nios II/e floor was 20544 -- 2.003 ms/step, 42 SPI transactions at
+# ~47.7 us of CPU each; that constant does not apply to this image.)
+NIOS_MIN_DWELL = 4096
+# Hard cap on a bulk capture, in RX buffers (~0.25 s at 2048-sample buffers).
+# A pipelined inflight capture between on-demand sweeps (warm B-scan mode)
+# would otherwise grow without bound at ~78 MB/s. The sweep itself completes
+# within ~35 ms of EXEC, so a capped capture still contains the whole train;
+# _rx_capture simply stops appending at the cap and harvest proceeds normally.
+NIOS_BULK_MAX_BUFFERS = 1220
+
+BLADERF_RX = libbladeRF.BLADERF_RX
+
+
+def rx_ring_depth():
+    # Depth of the driver's RX sync ring, in buffers (lazy import so the
+    # pure-math parts of this module stay importable without the driver).
+    try:
+        from bladerf_driver import RX_RING_DEPTH
+        return RX_RING_DEPTH
+    except Exception:
+        return 16
+
 
 # Diagnostics for the settle gate, off unless SFCW_DIAG names a path prefix.
 # Costs one array store per RX buffer and one per step when on, nothing when off.
@@ -337,6 +385,56 @@ class SFCWEngine:
         self._adc_hot_state = ()
         self._adc_hot_run = {'rx1': 0, 'rx2': 0}
         self._adc_clean_run = 0
+        # --- NIOS autonomous sweep state (see the constants block) ---
+        # 'standard' is the validated USB-per-step sweep and stays the default.
+        # 'nios' hands the whole sweep to the FPGA firmware and slices one
+        # continuous capture at the step boundaries; every failure path in
+        # _sweep_core_nios falls back to 'standard' and says why.
+        # 'nios' by default as of 2026-09-07: bracketed 2x1200-sweep blocks
+        # through the full stack measured 28.6/28.8 ms (34.8 Hz) at S_repeat
+        # 35.2/34.9 dB against the standard sweep's 55.4/55.2 ms -- a 1.93x
+        # win at equal-or-better quality, with every failure falling back to
+        # one standard sweep. 'standard' remains the fully-validated
+        # host-driven core; one sfcw_set_params reverts.
+        self.sweep_mode = 'nios'
+        self.nios_dwell = 4096        # samples per step, rounded to 64 -- see NIOS_MIN_DWELL
+        self.nios_settle = 1024       # samples dropped at the start of a step
+        # Overlap the next sweep's EXEC+capture with this sweep's processing.
+        # This is where most of the speed lives (48 -> 28.5 ms engine-direct);
+        # the cost is that a failure surfaces one sweep late, as a fallback.
+        self.nios_pipeline = True
+        self._nios_primed = False
+        self._nios_primed_steps = 0
+        self._nios_primed_key = None
+        self._nios_step_offset = 0
+        self._nios_last_offset = 0
+        self._nios_last_drift = 0
+        self._nios_last_score = 0.0
+        self._nios_fail = None
+        self._nios_realigned = 0
+        self._nios_period = 0.0
+        self._nios_last_phase = 0
+        self._nios_capture_loss = 0.0
+        self._nios_capture_lag = 0
+        self._nios_period_hist = []
+        self._nios_inflight = None
+        self._nios_tone = None
+        self._nios_tone_len = None
+        self._nios_cmd_profile = None
+        # Latched when the loaded FPGA image cannot run the autonomous
+        # sweep (stock firmware enqueues the sentinels and the sample
+        # counter reads 0) -- e.g. after a power cycle reverts to the SPI
+        # image. One clear line instead of a prime-and-fail per sweep.
+        self._nios_unavailable = False
+        self._last_sweep_core = 'standard'
+        self._nios_fallbacks = 0
+        self._nios_last_span_ok = None
+        self._bulk_capture = False
+        self._bulk_rx1 = []
+        self._bulk_rx2 = []
+        self._bulk_start_sample = 0
+        self._bulk_start_seq = 0
+        self._bulk_max_buffers = NIOS_BULK_MAX_BUFFERS
 
     @property
     def num_steps(self):
@@ -415,6 +513,10 @@ class SFCWEngine:
                 grid_changed = True
             if grid_changed:
                 self._apply_freq_grid()
+                # The NIOS holds a recorded copy of the old grid.
+                self._nios_primed = False
+                if self._nios_inflight is not None:
+                    self._nios_discard_inflight()
             if 'num_buffers' in kwargs:
                 self.num_buffers = max(1, int(kwargs['num_buffers']))
             if 'settle_count' in kwargs:
@@ -445,6 +547,33 @@ class SFCWEngine:
                 self.bscan_avg_count = max(1, int(kwargs['bscan_avg_count']))
             if 'bscan_primer' in kwargs:
                 self.bscan_primer = bool(kwargs['bscan_primer'])
+            if 'sweep_mode' in kwargs:
+                mode = str(kwargs['sweep_mode'])
+                if mode in ('standard', 'nios') and mode != self.sweep_mode:
+                    self.sweep_mode = mode
+                    if self._nios_inflight is not None:
+                        self._nios_discard_inflight()
+            if 'nios_dwell' in kwargs:
+                new_val = max(NIOS_INTERVAL_UNIT, int(kwargs['nios_dwell']))
+                if new_val < NIOS_MIN_DWELL:
+                    print(f"[sfcw] nios_dwell {new_val} is below the "
+                          f"{NIOS_MIN_DWELL}-sample floor the FPGA can hold; "
+                          f"clamping")
+                    new_val = NIOS_MIN_DWELL
+                if new_val != self.nios_dwell:
+                    self.nios_dwell = new_val
+                    # The steady-median override in _nios_refine_offset would
+                    # otherwise carry the OLD dwell's period into the new grid
+                    # and slice every sweep at the wrong stride.
+                    self._nios_period_hist = []
+                    if self._nios_inflight is not None:
+                        self._nios_discard_inflight()
+            if 'nios_settle' in kwargs:
+                self.nios_settle = max(0, int(kwargs['nios_settle']))
+            if 'nios_pipeline' in kwargs:
+                self.nios_pipeline = bool(kwargs['nios_pipeline'])
+                if not self.nios_pipeline and self._nios_inflight is not None:
+                    self._nios_discard_inflight()
 
     def get_params(self):
         return {
@@ -466,6 +595,10 @@ class SFCWEngine:
             'max_range': self.max_range,
             'bscan_avg_count': self.bscan_avg_count,
             'bscan_primer': self.bscan_primer,
+            'sweep_mode': self.sweep_mode,
+            'nios_dwell': self.nios_dwell,
+            'nios_settle': self.nios_settle,
+            'nios_primed': self._nios_primed,
         }
 
     def run_coherence_test(self, callback=None):
@@ -797,6 +930,16 @@ class SFCWEngine:
         self._rx_cond = threading.Condition()
         self._rx_latest = None
         self._rx_seq = 0
+        # The hardware sample counter restarts with the stream, and the NIOS
+        # forgets its recorded sweep across a re-prime anyway. A fresh stream
+        # also re-probes firmware capability (the image may have been
+        # reloaded since the last session).
+        self._nios_primed = False
+        self._nios_unavailable = False
+        self._nios_inflight = None
+        self._bulk_capture = False
+        self._bulk_rx1 = []
+        self._bulk_rx2 = []
         self._rx_t = None
         self._rx_gap = 0.0
         self._diag_gaps = None
@@ -851,6 +994,10 @@ class SFCWEngine:
             print(f"[sfcw] diag dump failed: {e}")
 
     def _stop_tx_rx(self):
+        if self._nios_inflight is not None or self._nios_primed:
+            self._nios_discard_inflight()
+        self._nios_primed = False
+        self._nios_period_hist = []
         self._diag_dump()
         self.driver.stop_rx_dual()
         self.driver.stop_tx_dual()
@@ -872,10 +1019,863 @@ class SFCWEngine:
             self._rx_t = now
             self._rx_latest = (rx1_iq, rx2_iq)
             self._rx_seq += 1
+            if self._bulk_capture:
+                if len(self._bulk_rx1) < self._bulk_max_buffers:
+                    # _rx_loop_dual builds fresh arrays per callback, so
+                    # holding the reference is enough -- no copy needed.
+                    self._bulk_rx1.append(rx1_iq)
+                    self._bulk_rx2.append(rx2_iq)
+                else:
+                    # Cap hit: the sweep is long since over; stop accumulating
+                    # so an idle pipelined capture cannot eat memory.
+                    self._bulk_capture = False
             if SFCW_DIAG and self._diag_gaps_n < DIAG_MAX_GAPS:
                 self._diag_gaps[self._diag_gaps_n] = self._rx_gap
                 self._diag_gaps_n += 1
             self._rx_cond.notify_all()
+
+    # ------------------------------------------------------------------
+    # NIOS autonomous sweep
+    #
+    # The FPGA steps the synthesizers through the frequency list on its own,
+    # so a sweep costs one USB round-trip instead of two per step. See
+    # docs/nios_sweep.md for the protocol and the firmware side.
+    # ------------------------------------------------------------------
+
+    def _nios_command(self, cmd, arg=0):
+        """Send a sweep command as a sentinel timestamp in a retune2 packet.
+
+        Returns the libbladeRF status. The NIOS answers with a value in the
+        response's duration field, but libbladeRF unpacks that straight into a
+        log_verbose and drops it (nios_access.c), so nothing comes back here.
+        That is why T0 has to be anchored from timestamps below rather than
+        simply read.
+        """
+        prof = self._nios_cmd_profile
+        if prof is None and self._qt_master_rx:
+            prof = self._qt_master_rx[0]
+        if prof is None:
+            return -1
+        dev_ptr = self.driver.device.dev[0]
+        timestamp = ((cmd & 0xFFFFFFFF) << 32) | (arg & 0xFFFFFFFF)
+        return libbladeRF.bladerf_schedule_retune(
+            dev_ptr, bladerf.CHANNEL_RX(0), timestamp, 0, prof)
+
+    def _nios_prime(self, freqs, qt_rx, qt_tx):
+        """Teach the NIOS the sweep by walking it once over USB.
+
+        Costs one full sweep's worth of retunes (~124 ms at 51 steps) and holds
+        until the frequency grid changes. The NIOS records the profile indices
+        of the RETUNE_NOW packets it sees while primed, so it can only ever
+        replay frequencies that were actually tuned here.
+        """
+        num_steps = len(freqs)
+        self._nios_cmd_profile = qt_rx[0]
+        if self._nios_command(NIOS_CMD_PRIME, num_steps) != 0:
+            print("[sfcw] NIOS prime rejected — is the sweep firmware loaded?")
+            return False
+
+        dev_ptr = self.driver.device.dev[0]
+        tx_ch = bladerf.CHANNEL_TX(0)
+        rx_ch = bladerf.CHANNEL_RX(0)
+        for i in range(num_steps):
+            f = int(freqs[i])
+            libbladeRF.bladerf_schedule_retune(dev_ptr, rx_ch, 0, f, qt_rx[i])
+            libbladeRF.bladerf_schedule_retune(dev_ptr, tx_ch, 0, f, qt_tx[i])
+
+        self._nios_primed = True
+        self._nios_primed_steps = num_steps
+        self._nios_primed_key = (int(freqs[0]), int(freqs[-1]), num_steps)
+        print(f"[sfcw] NIOS primed with {num_steps} steps")
+        return True
+
+    def _nios_clear_queue(self):
+        """Drop anything sitting in the FPGA's scheduled-retune queues."""
+        try:
+            dev_ptr = self.driver.device.dev[0]
+            libbladeRF.bladerf_cancel_scheduled_retunes(dev_ptr, bladerf.CHANNEL_RX(0))
+            libbladeRF.bladerf_cancel_scheduled_retunes(dev_ptr, bladerf.CHANNEL_TX(0))
+        except Exception as e:
+            print(f"[sfcw] cancel_scheduled_retunes: {e}")
+
+    def _nios_stop(self):
+        """Abort any sweep the FPGA still thinks it is running."""
+        self._nios_command(NIOS_CMD_STOP)
+
+    def _nios_timestamp(self):
+        try:
+            return int(self.driver.get_timestamp(BLADERF_RX))
+        except Exception:
+            return 0
+
+    def _bulk_start(self, max_buffers=None):
+        """Open a bulk capture, bounded to max_buffers.
+
+        The bound is not just a memory guard, it is a STABILITY requirement
+        under pipelining. The capture for sweep N+1 is opened before sweep N is
+        processed, so it keeps accumulating for as long as processing takes --
+        and processing cost is dominated by np.concatenate over the captured
+        buffer list. That is a positive feedback loop: slower processing -> more
+        buffers -> slower concatenate -> slower still. Measured 2026-09-07
+        through the full stack, uncapped in practice (a 1220-buffer / 0.25 s
+        cap, ~10x what a sweep needs): the sweep drifted 28 ms -> 44 ms over a
+        1200-sweep run, and rotated slices appeared with it. Capping at what
+        the sweep actually needs holds it flat.
+        """
+        with self._rx_cond:
+            self._bulk_rx1 = []
+            self._bulk_rx2 = []
+            self._bulk_max_buffers = (NIOS_BULK_MAX_BUFFERS if max_buffers is None
+                                      else min(int(max_buffers),
+                                               NIOS_BULK_MAX_BUFFERS))
+            # Buffer number N (1-based, as _rx_seq counts them) covers samples
+            # [(N-1)*S, N*S). The next buffer to land is _rx_seq + 1, so the
+            # first sample we collect sits at _rx_seq * S.
+            self._bulk_start_sample = self._rx_seq * self._rx_buffer_samples
+            self._bulk_start_seq = self._rx_seq
+            self._bulk_capture = True
+
+    def _bulk_stop(self):
+        with self._rx_cond:
+            self._bulk_capture = False
+            rx1 = self._bulk_rx1
+            rx2 = self._bulk_rx2
+            self._bulk_rx1 = []
+            self._bulk_rx2 = []
+            return rx1, rx2, self._bulk_start_sample
+
+    def _bulk_wait(self, needed_samples, timeout_s):
+        """Block until `needed_samples` more samples have been delivered.
+
+        Counted as buffers since the bulk capture started rather than against
+        an absolute sample index, so this does not depend on how the buffer
+        sequence lines up with the hardware sample counter.
+        """
+        samples_per_buffer = self._rx_buffer_samples
+        with self._rx_cond:
+            needed_seq = self._bulk_start_seq + \
+                int(np.ceil(needed_samples / samples_per_buffer)) + 2
+        deadline = time.perf_counter() + timeout_s
+        with self._rx_cond:
+            while self._rx_seq < needed_seq:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    return False
+                if self._stop_event.is_set():
+                    return False
+                self._rx_cond.wait(timeout=min(remaining, 0.05))
+        return True
+
+    # Dwells folded together to lock the grid phase. The transients average
+    # down fast, so a slice of the capture is as good as all of it -- and the
+    # full-capture version cost more than the sweep it was measuring.
+    _NIOS_FOLD_DWELLS = 16
+
+    @staticmethod
+    def _nios_phase_dev(i0, i1, q0, q1, ref):
+        """|sin(deviation from the dominant phase advance)| for each sample pair.
+
+        d = c[n+1] * conj(c[n]) is the phase advance as a phasor. Projecting it
+        onto the mean advance and taking the perpendicular component gives the
+        deviation without ever forming an angle -- atan2 per sample dominated
+        the whole sweep on the Pi.
+        """
+        dr = i1 * i0 + q1 * q0
+        di = q1 * i0 - i1 * q0
+        if ref is None:
+            mr = float(dr.mean())
+            mi = float(di.mean())
+            nrm = np.sqrt(mr * mr + mi * mi)
+            if nrm <= 0.0:
+                return None, None
+            ref = (mr / nrm, mi / nrm)
+        mr, mi = ref
+        perp = np.abs(di * mr - dr * mi)
+        mag = np.sqrt(dr * dr + di * di)
+        np.maximum(mag, 1e-6, out=mag)
+        return perp / mag, ref
+
+    def _nios_transient_profile(self, ref_all, ref=None):
+        """Per-sample "the phase is not advancing smoothly" indicator.
+
+        Inside a dwell the synthesizer is locked and the sample-to-sample phase
+        advance is constant. While it is settling the advance is scrambled.
+        That is what marks a step boundary. Result is aligned so element k
+        describes the transition into sample k.
+        """
+        i = np.ascontiguousarray(ref_all[0::2], dtype=np.float32)
+        q = np.ascontiguousarray(ref_all[1::2], dtype=np.float32)
+        dev, ref = self._nios_phase_dev(i[:-1], i[1:], q[:-1], q[1:], ref)
+        if dev is None:
+            return np.zeros(len(i), dtype=np.float32)
+        return np.concatenate((np.zeros(1, dtype=np.float32), dev))
+
+    def _nios_grid_phase(self, dev, dwell, settle):
+        """Where in the dwell the step boundary sits, modulo the dwell.
+
+        Folds the transient indicator over the dwell so every boundary stacks
+        up, then finds the longest stretch that is never transient -- that is
+        the capture window, and the boundary is `settle` before it.
+
+        Scoring candidate offsets by coherence instead does NOT work: a window
+        shorter than the settle region can sit entirely inside a neighbouring
+        step's clean tail and score exactly as well as the aligned one.
+
+        Returns (phase, contrast); contrast <= 0 means no grid was found.
+        """
+        win = dwell - settle
+        usable = (len(dev) // dwell) * dwell
+        if win <= 0 or usable < dwell * 2:
+            return 0, -1.0
+
+        fold = dev[:usable].reshape(-1, dwell).sum(axis=0)
+        ext = np.concatenate((fold, fold[:win]))
+        csum = np.concatenate(((0.0,), np.cumsum(ext)))
+        wsum = csum[win:win + dwell] - csum[:dwell]
+
+        mean = float(wsum.mean())
+        if mean <= 0:
+            return 0, -1.0
+        contrast = float(wsum.max() - wsum.min()) / mean
+        quiet_start = int(np.argmin(wsum))
+
+        # quiet_start is where the clean capture window begins, so the step
+        # boundary sits `settle` earlier. Verified against
+        # test_nios_slicing.py, which models the firmware's real transient
+        # pattern: this recovers T0 to the sample.
+        return (quiet_start - settle) % dwell, contrast
+
+    def _nios_launch(self, units, num_steps, dwell):
+        """Begin a bulk capture and start a sweep inside it.
+
+        The capture is opened before the command goes out, so the sweep is
+        guaranteed to fall inside it: EXEC costs a USB round-trip and the
+        firmware only starts stepping a dwell after that.
+        """
+        # Pre-size from what the sweep needs; refined once round_trip is known.
+        self._bulk_start(max_buffers=int(np.ceil(
+            ((num_steps + 4) * dwell + 32 * self._rx_buffer_samples)
+            / self._rx_buffer_samples)) + 8)
+        ts0 = self._nios_timestamp()
+        rc = self._nios_command(NIOS_CMD_EXEC, (units << 16) | (num_steps & 0xFFFF))
+        ts1 = self._nios_timestamp()
+        if rc != 0 or ts1 <= ts0:
+            self._bulk_stop()
+            return None
+        round_trip = ts1 - ts0
+        # The driver holds up to num_buffers of already-captured samples, so a
+        # capture opened after a gap begins with stale ones and can run out
+        # before the sweep's last transient -- which is what alignment keys on.
+        # Sweeps run back to back in a benchmark and there is no gap; the
+        # server serialises a result between them and there is.
+        backlog = 16 * self._rx_buffer_samples
+        need = round_trip + backlog + (num_steps + 3) * dwell
+        # Re-cap now that `need` is known: _bulk_start was called before the
+        # round trip could be measured. +8 buffers of slack so the wait is
+        # never starved by its own cap.
+        with self._rx_cond:
+            self._bulk_max_buffers = min(
+                NIOS_BULK_MAX_BUFFERS,
+                int(np.ceil(need / self._rx_buffer_samples)) + 8)
+        return {'round_trip': round_trip, 'ts_start': ts0, 'need': need}
+
+    def _nios_harvest(self, inflight):
+        """Wait out an in-flight capture and take the buffers.
+
+        Also measures whether the capture is gapless. The FPGA's sample counter
+        advances in real time regardless of what the host does, so comparing it
+        against the samples actually delivered says exactly how many were lost
+        inside this capture -- and lost samples are a discontinuity in the
+        timeline that no uniform period can model.
+        """
+        need = inflight['need']
+        ts_start = inflight.get('ts_start', 0)
+        ok = self._bulk_wait(need,
+                             timeout_s=need / float(self.driver.sample_rate) + 1.0)
+        ts_end = self._nios_timestamp()
+        rx1, rx2, start = self._bulk_stop()
+        got = sum(len(b) // 2 for b in rx2)
+        elapsed = max(1, ts_end - ts_start)
+        self._nios_capture_loss = 1.0 - got / float(elapsed)
+        # Delivery lag in per-channel samples: how far behind real time the
+        # delivered stream was when the harvest closed. Ordinary backlog under
+        # load; only a lag near the ring capacity implies actual loss.
+        self._nios_capture_lag = max(0, elapsed - got)
+        return (rx1, rx2, start) if ok else None
+
+    def _nios_discard_inflight(self):
+        """Abandon any capture or sweep still running.
+
+        Unconditional: a harvest that timed out has already cleared the
+        in-flight record but may well have left the FPGA mid-sweep.
+        """
+        self._nios_inflight = None
+        if getattr(self, '_rx_cond', None) is not None:
+            self._bulk_stop()
+        self._nios_stop()
+
+    def _nios_diagnose(self, ref_all, dwell, settle, num_steps, hot, starts):
+        """Explain an alignment failure in terms of what the FPGA actually did.
+
+        Finds the step transients directly, without assuming a period, so a
+        real period that differs from the dwell the host is slicing at shows up
+        as a number instead of as cells that mysteriously stop being hot.
+        """
+        try:
+            dev = self._nios_transient_profile(ref_all)
+            k = 64
+            sm = np.convolve(dev, np.ones(k, dtype=np.float32) / k, mode='same')
+            med = float(np.median(sm))
+            mad = float(np.median(np.abs(sm - med))) + 1e-12
+            edges = np.flatnonzero((sm[:-1] <= med + 10 * mad) &
+                                   (sm[1:] > med + 10 * mad)) + 1
+            keep = []
+            for x in edges:
+                if not keep or x - keep[-1] > dwell // 4:
+                    keep.append(int(x))
+            gaps = np.diff(np.array(keep)).astype(np.float64) if len(keep) > 1 else np.array([])
+            if len(gaps):
+                best, best_n = gaps[0], 0
+                for g in gaps:
+                    c = int(np.sum(np.abs(gaps - g) < 0.1 * g))
+                    if c > best_n:
+                        best, best_n = g, c
+                period = float(np.median(gaps[np.abs(gaps - best) < 0.1 * best]))
+            else:
+                period = float('nan')
+            pattern = ''.join('X' if h else '.' for h in hot)
+            print(f"[sfcw]   grid used period {self._nios_period:.1f}, "
+                  f"phase {self._nios_last_phase}")
+            print(f"[sfcw]   {len(keep)} transients found, actual period "
+                  f"{period:.0f} samples vs dwell {dwell} "
+                  f"({period - dwell:+.0f}, drifts a probe width after "
+                  f"{abs(settle / (period - dwell)) if abs(period - dwell) > 1 else float('inf'):.0f} steps)")
+            print(f"[sfcw]   hot cells: {pattern}")
+        except Exception as ex:
+            print(f"[sfcw]   diagnose failed: {ex}")
+
+    def _nios_detect_transients(self, dev, period_hint):
+        """Every step boundary in the capture, as sample positions.
+
+        Thresholds a smoothed transient indicator over the whole capture rather
+        than probing where boundaries are predicted to be. Probing is cheaper
+        but circular: it needs the period to know where to look, and the period
+        is what we are trying to measure. Detecting first has found every
+        transient on hardware, including on captures where the probe-based
+        version gave up around step ten.
+
+        k=64, not the k=256 the Nios II/e was tuned with. The II/f image's
+        fastlock retunes are far cleaner: measured 2026-09-07, a boundary is
+        hot for a median of ~16-33 SAMPLES (1.6-3.3 us) with some boundaries
+        peaking at only 0.125 deviation -- a 256-sample boxcar dilutes that
+        below the 8-MAD threshold and only ~20 of 51 steps were detected
+        (every sweep fell back). At k=64, 57 edges are found on the same
+        capture; a long II/e-style transient is still fully hot at k=64, so
+        this is strictly more sensitive, and the MAD threshold + period fit +
+        min-gap merge absorb the extra noise sensitivity.
+        """
+        k = 64
+        if len(dev) <= k * 2:
+            return np.empty(0, dtype=np.int64)
+        c = np.cumsum(dev, dtype=np.float64)
+        sm = (c[k:] - c[:-k]) / k
+
+        # Bulk statistics from a subsample: the threshold describes the quiet
+        # floor of a slowly-varying field, and a full np.median (a sort) over
+        # the whole capture was most of this function's cost.
+        sub = sm[::8]
+        med = float(np.median(sub))
+        mad = float(np.median(np.abs(sub - med))) + 1e-12
+        hot = sm > med + 8.0 * mad
+        if not hot.any():
+            return np.empty(0, dtype=np.int64)
+
+        edges = np.flatnonzero((~hot[:-1]) & hot[1:]) + 1
+        keep = []
+        for x in edges:
+            if not keep or x - keep[-1] > period_hint // 4:
+                keep.append(int(x))
+        return np.array(keep, dtype=np.int64)
+
+    def _nios_refine_offset(self, ref_all, t0_guess, search, num_steps):
+        # INVARIANT: alignment is derived from the REFERENCE channel only.
+        # RX2 is a cable loopback, so nothing in front of the antenna can
+        # change it -- which is what makes slicing immune to the scene. Do not
+        # feed the signal channel, h_cal, or anything derived from a previous
+        # sweep into this decision: a target entering the beam then looks
+        # exactly like a mis-slice, and the "correction" rotates good sweeps.
+        # That regression is documented at the span gate below.
+        """Find T0 in the capture, to the sample.
+
+        Three separate things have to come out of this, and each needs a
+        different tool:
+
+        - the period, which is NOT the dwell. The FPGA schedules on its sample
+          counter but the host stream loses a fraction of a percent of samples,
+          so the timeline is compressed, by 16 to 24 samples per step and not
+          by the same amount every sweep. A least-squares fit through the
+          detected transients measures it.
+
+        - which step is T0. The firmware activates step 0 at T0-dwell and step
+          1 at T0+dwell, so T0's own boundary carries no transient: the train
+          has a double-width gap and T0 sits in the middle of it.
+
+        - the exact boundary, to the sample. Detection is biased by the width
+          of its own smoothing window, so the position comes instead from
+          folding at the measured period, where the longest never-transient
+          stretch is the capture window and its leading edge is the boundary.
+
+        Returns (offset, score); score <= 0 means it could not be found.
+        """
+        dwell = int(self.nios_dwell)
+        settle = int(self.nios_settle)
+        n_pairs = len(ref_all) // 2
+        self._nios_fail = None
+        self._nios_period = float(dwell)
+        if n_pairs < dwell * 3:
+            self._nios_fail = f"capture {n_pairs} < 3 dwells"
+            return t0_guess, -1.0
+
+        i = np.ascontiguousarray(ref_all[0::2], dtype=np.float32)
+        q = np.ascontiguousarray(ref_all[1::2], dtype=np.float32)
+
+        dev = self._nios_transient_profile(ref_all)
+        pos = self._nios_detect_transients(dev, dwell)
+        if len(pos) < num_steps // 2:
+            self._nios_fail = (f"only {len(pos)} transients in the capture, "
+                               f"need at least {num_steps // 2}")
+            return t0_guess, -1.0
+
+        gaps = np.diff(pos).astype(np.float64)
+        period = float(np.median(gaps))          # robust to the gap at T0
+        # Real drift is tens of samples per step, not hundreds. On the II/e the
+        # only term was stream compression (period a fraction of a percent
+        # SHORTER than the dwell); the II/f image also steps slightly LONG --
+        # measured 2026-09-07: dwell 4096 -> period 4107 (+0.27%), 4928 -> 4960
+        # (+0.65%). 1.5% accepts both directions with margin; the failure this
+        # gate exists to catch (the median gap latching onto something other
+        # than the step train) is off by tens of percent, not one.
+        if abs(period - dwell) > dwell * 0.015:
+            self._nios_fail = (f"step period {period:.0f} is {period - dwell:+.0f} "
+                               f"off the {dwell}-sample dwell -- too far to be "
+                               f"stream compression")
+            return t0_guess, -1.0
+
+        # --- pin the step lattice on the regular tail train ----------------
+        #
+        # The old missing-tooth search indexed EVERY transient against a grid
+        # anchored at pos[0] and looked for the empty cell. That worked on the
+        # Nios II/e and mis-anchors on the II/f, because the EXEC front matter
+        # is not ON the T0 grid there: measured 2026-09-07, EXEC produces a
+        # transient pair ~1940 samples apart (step 0's activation) and the
+        # first REGULAR boundary lands 2.7-2.9 dwells after it -- the firmware
+        # reads "now" for T0 only after ~300 us of activation-plus-response
+        # handling, so the front transients sit a latency-dependent FRACTION
+        # of a dwell off the grid. On the II/e the dwell was 6x longer and the
+        # same latency rounded away. So: find the longest run of period-spaced
+        # transients (that is steps 1..n-1, the only strictly periodic thing
+        # in the capture), extend it across weak steps, and anchor T0 at its
+        # END -- the firmware stops after step n-1, so the last lattice member
+        # is the step n-1 boundary. A missed LAST step shifts the anchor one
+        # period. That case is caught structurally by the span gate further
+        # down, which refuses the sweep rather than guessing at it.
+        good_gap = np.abs(gaps - period) < 0.05 * period
+        runs, start = [], None
+        for j, g in enumerate(good_gap):
+            if g and start is None:
+                start = j
+            elif not g and start is not None:
+                runs.append((start, j))
+                start = None
+        if start is not None:
+            runs.append((start, len(good_gap)))
+        if not runs:
+            self._nios_fail = "no run of period-spaced transients"
+            return t0_guess, -1.0
+        lo, hi = max(runs, key=lambda r: r[1] - r[0])   # pos[lo..hi] inclusive
+
+        # A weak step mid-train splits the run in two; its neighbours are
+        # still on the lattice. Take every transient within 0.15 period of the
+        # main run's lattice, which re-joins the halves and skips the hole.
+        k_all = np.round((pos - pos[lo]) / period).astype(np.int64)
+        on_lat = np.abs(pos - (pos[lo] + k_all * period)) < 0.15 * period
+        sel = np.flatnonzero(on_lat)
+        k_sel = k_all[sel].astype(np.float64)
+        p_sel = pos[sel].astype(np.float64)
+
+        # A back-to-back capture can begin with STALE buffers holding the tail
+        # of the PREVIOUS sweep (see the backlog note in _nios_launch) -- also
+        # period-spaced, also on-lattice if its phase happens to align, so the
+        # lattice can span more periods than one sweep. Our own train is the
+        # trailing one (the capture always ends after this sweep's last step),
+        # and steps 1..n-1 span exactly num_steps-2 periods: keep only the
+        # trailing window of that many periods. The >2-period EXEC-latency gap
+        # between the stale tail and our step 1 keeps stale members out of it.
+        keep_lat = k_sel >= k_sel[-1] - (num_steps - 2)
+        sel, k_sel, p_sel = sel[keep_lat], k_sel[keep_lat], p_sel[keep_lat]
+
+        covered = len(sel)
+        k_span = int(k_sel[-1] - k_sel[0])
+        # Interior holes are harmless -- a missed boundary between two present
+        # ones does not move either end, and the span (checked below, after
+        # the fit) is what pins T0. Only refuse here if so little of the train
+        # survived that the fit itself would be unreliable.
+        if covered < int(0.75 * (num_steps - 1)):
+            self._nios_fail = (f"lattice holds only {covered} of "
+                               f"{num_steps - 1} step boundaries")
+            return t0_guess, -1.0
+
+        # Refit the period through the lattice members, with outlier
+        # rejection: a single spurious detection drags the slope enough to
+        # matter (measured +/-3500 samples of accumulated drift across 51
+        # steps without this).
+        intercept = None
+        if covered >= 6:
+            slope, intercept = np.polyfit(k_sel, p_sel, 1)
+            for _ in range(2):
+                resid = p_sel - (slope * k_sel + intercept)
+                spread = float(np.median(np.abs(resid))) + 1.0
+                keep = np.abs(resid) < 4.0 * spread
+                if keep.sum() < 6:
+                    break
+                slope, intercept = np.polyfit(k_sel[keep], p_sel[keep], 1)
+            if abs(slope - period) < period * 0.01:
+                period = float(slope)
+            else:
+                intercept = None
+
+        # The period error is a property of the firmware and the host keeping
+        # up, not of this particular sweep, so it barely moves between sweeps.
+        # Hold a running median and refuse an estimate that jumps away from it
+        # -- one bad fit then costs nothing instead of rotating a whole sweep.
+        hist = getattr(self, '_nios_period_hist', None)
+        if hist is None:
+            hist = self._nios_period_hist = []
+        hist.append(period)
+        if len(hist) > 9:
+            hist.pop(0)
+        if len(hist) >= 5:
+            steady = float(np.median(hist))
+            if abs(period - steady) > 24.0:
+                period = steady
+        self._nios_period = period
+
+        # --- anchor T0, and REFUSE to guess when the structure is ambiguous --
+        #
+        # The firmware fires steps 1..n-1 on the dwell grid (step 0 is
+        # activated by EXEC itself, off-grid), so a complete lattice holds
+        # n-1 boundaries spanning exactly n-2 periods. When that holds, the
+        # first member IS step 1 and the last IS step n-1 -- the front anchor
+        # (first - period) and the end anchor (last - (n-1)*period) are then
+        # algebraically THE SAME NUMBER, and T0 is certain.
+        #
+        # When a boundary at one END is missed the span comes up short, and
+        # the two anchors differ by exactly one period: that is the one-step
+        # rotation. Nothing inside the sweep can say which end lost it --
+        # both channels shift together, so every capture window is still
+        # clean CW, just of the neighbouring frequency, and h_cal comes out a
+        # perfectly valid measurement that is simply rotated by one step.
+        #
+        # So this does NOT try to repair it. It falls back to the standard
+        # sweep for this one sweep, which is correct and merely slower.
+        # Measured 2026-09-07 over 199 sweeps: span was n-2 on 197, short by
+        # one period on 1 (the rotation), and wildly short on 1 broken
+        # capture -- so the gate costs ~1% of sweeps and removes the rotation
+        # entirely.
+        #
+        # An earlier version anchored on the END and repaired rotations by
+        # correlating against the previous sweep / a running template. That
+        # is unfixable by construction: a genuine SCENE CHANGE (a target
+        # entering the beam) drops agreement exactly like a mis-slice does,
+        # so the resolver rotated correctly-aligned sweeps, and re-seeding
+        # the template on one of those latched the error until the sweep was
+        # restarted. Alignment must not depend on scene stability.
+        self._nios_last_span_ok = (k_span == num_steps - 2)
+        if k_span != num_steps - 2:
+            self._nios_fail = (
+                f"step lattice spans {k_span} periods, expected "
+                f"{num_steps - 2} -- a boundary at one end was missed, so "
+                f"T0 is ambiguous by a whole step")
+            return t0_guess, -1.0
+
+        # Front anchor: first lattice member = step 1, so T0 is one period
+        # earlier. Taken off the fitted line rather than the raw detection,
+        # which sits a smoothing window off the true edge.
+        if intercept is not None:
+            p_first = float(np.polyval((slope, intercept), k_sel[0]))
+        else:
+            p_first = float(p_sel[0])
+        approx_t0 = p_first - period
+
+        # Detection sits a smoothing window off the true edge, so take the
+        # exact boundary from a fold at the measured period instead.
+        per_i = max(1, int(round(period)))
+        span = int(min(self._NIOS_FOLD_DWELLS * per_i, n_pairs - 2))
+        r0 = int(max(1, min(int(approx_t0), n_pairs - span - 1)))
+        dev_r, _ = self._nios_phase_dev(i[r0:r0 + span - 1], i[r0 + 1:r0 + span],
+                                        q[r0:r0 + span - 1], q[r0 + 1:r0 + span],
+                                        None)
+        offset = int(round(approx_t0))
+        contrast = 1.0
+        if dev_r is not None:
+            dev_r = np.concatenate((np.zeros(1, dtype=np.float32), dev_r))
+            local, contrast = self._nios_grid_phase(dev_r, per_i, settle)
+            if contrast >= 0.05:
+                phase = (r0 + local) % per_i
+                delta = (phase - offset) % per_i
+                if delta > per_i // 2:
+                    delta -= per_i
+                offset += int(delta)
+        self._nios_last_phase = offset
+
+        if offset < 1 or offset + (num_steps - 1) * per_i + per_i > n_pairs:
+            self._nios_fail = (f"T0 at {offset} leaves no room for "
+                               f"{num_steps} steps in {n_pairs} samples")
+            hot = np.zeros(int(k_sel[-1] - k_sel[0]) + 1, dtype=bool)
+            hot[(k_sel - k_sel[0]).astype(np.int64)] = True
+            self._nios_diagnose(ref_all, dwell, settle, num_steps, hot, pos)
+            return t0_guess, -1.0
+
+        return offset, max(contrast, 0.05)
+
+    def _sweep_core_nios(self, freqs, qt_rx, qt_tx, num_buffers, settle_count,
+                         progress_cb=None):
+        """One command, one continuous capture, sliced at the step boundaries.
+
+        Falls back to the standard sweep on any failure, so selecting this mode
+        without the sweep firmware loaded degrades rather than breaks.
+        Returns (h_cal, dropped_steps, adc_peak) like _sweep_core; num_buffers
+        and settle_count only matter on the fallback path -- the NIOS capture
+        window is set by nios_dwell/nios_settle in SAMPLES, not buffers.
+        """
+        num_steps = len(freqs)
+        if self._stop_event.is_set():
+            # THREE values, like _sweep_core's own early return -- see the
+            # comment there for the unpack bug this shape prevents.
+            return None, 0, None
+
+        def fallback(reason):
+            self._nios_last_score = -1.0
+            self._last_sweep_core = 'fallback'
+            self._nios_fallbacks += 1
+            self._nios_discard_inflight()
+            print(f"[sfcw] NIOS sweep: {reason} — falling back to standard")
+            self._nios_primed = False
+            # Firmware without sweep support does not recognise the sentinels,
+            # so it treats them as ordinary scheduled retunes and enqueues
+            # them. Those entries never fire and would fill the 16-deep queue,
+            # so clear it before handing back to the standard sweep.
+            self._nios_clear_queue()
+            return self._sweep_core(freqs, qt_rx, qt_tx, num_buffers,
+                                    settle_count, progress_cb)
+
+        if qt_rx is None or qt_tx is None:
+            return fallback("no quick-tune profiles")
+
+        key = (int(freqs[0]), int(freqs[-1]), num_steps)
+        if not self._nios_primed or self._nios_primed_key != key:
+            if not self._nios_prime(freqs, qt_rx, qt_tx):
+                return fallback("priming failed")
+
+        dwell = int(self.nios_dwell)
+        settle = int(self.nios_settle)
+        if settle >= dwell:
+            return fallback(f"settle {settle} >= dwell {dwell}")
+
+        units = dwell // NIOS_INTERVAL_UNIT
+        if units < 1 or units > 0xFFFF:
+            return fallback(f"dwell {dwell} out of range")
+        dwell = units * NIOS_INTERVAL_UNIT      # what the NIOS will actually use
+
+        # Cache the mixing tone at capture-window length.
+        if dwell - settle - 2 * NIOS_WINDOW_GUARD < 64:
+            return fallback(f"dwell {dwell} leaves no capture window after "
+                            f"{settle} settle")
+
+        try:
+            inflight = self._nios_inflight
+            self._nios_inflight = None
+            if inflight is None:
+                inflight = self._nios_launch(units, num_steps, dwell)
+                if inflight is None:
+                    # Stock firmware ACCEPTS the sentinels (it enqueues them
+                    # as scheduled retunes) but its sample counter reads 0,
+                    # which is what this detects. Latch it off for the session
+                    # rather than paying a prime-and-fail on every sweep.
+                    self._nios_unavailable = True
+                    print("[sfcw] NIOS autonomous sweep unavailable on this "
+                          "FPGA image (sample counter not running) -- using "
+                          "the standard sweep for this session. Load "
+                          "hosted_niosII_f_sweep_ts.rbf and restart the sweep "
+                          "to re-enable.")
+                    return fallback("EXEC rejected, or the sample counter is "
+                                    "not running — is the rx.vhd tamer change "
+                                    "in this FPGA image?")
+
+            harvested = self._nios_harvest(inflight)
+            if harvested is None:
+                return fallback("timed out waiting for the capture")
+
+            # See nios_pipeline in __init__ for why this is off by default.
+            if self.nios_pipeline:
+                self._nios_inflight = self._nios_launch(units, num_steps, dwell)
+        except Exception as e:
+            return fallback(f"exec failed: {e}")
+
+        rx1_bufs, rx2_bufs, bulk_start = harvested
+        round_trip = inflight['round_trip']
+        if not rx1_bufs:
+            return fallback("no buffers captured")
+
+        # A capture with a GAP in it (RX thread stalled past the ring depth,
+        # libbladeRF dropped buffers) cannot be sliced: every position after
+        # the gap is shifted, the step lattice splits in two, and the
+        # realignment search will happily return the least-bad of three wrong
+        # answers. _nios_harvest measures exactly this -- delivered samples
+        # against hardware-clock elapsed -- so gate on it BEFORE slicing.
+        # The no-loss baseline reads ~-0.5% (stale head bias); one lost buffer
+        # in a ~27 ms capture reads ~+0.8%.
+        # What that ratio measures is delivery LAG at harvest, which only
+        # means loss once it could have exceeded the sync ring -- with the
+        # 256-buffer ring a few ms of lag is ordinary backlog under load
+        # (measured 2-7 ms at 30 Hz full stack; an earlier 0.5%-"loss" gate
+        # here rejected every sweep). Gate at 75% of the ring: past that,
+        # samples may genuinely have been dropped.
+        lag_samples = self._nios_capture_lag
+        ring_samples = rx_ring_depth() * self._rx_buffer_samples
+        if lag_samples > 0.75 * ring_samples:
+            return fallback(
+                f"RX delivery lagged "
+                f"{lag_samples / self.driver.sample_rate * 1e3:.0f} ms at "
+                f"harvest -- possible ring overflow, capture untrusted")
+
+        # float32 throughout: this is a million-plus samples and the Pi is
+        # memory-bandwidth bound here, not precision bound.
+        sig_all = np.concatenate(rx1_bufs).astype(np.float32)
+        ref_all = np.concatenate(rx2_bufs).astype(np.float32)
+
+        # Same {'rx1','rx2'} shape _sweep_core produces. Strided by 4: this is
+        # a headroom monitor against a 40%/75% threshold, not a measurement,
+        # and a full abs().max() over two million-sample arrays costs real ms.
+        adc_peak = {'rx1': float(np.abs(sig_all[::4]).max()) if len(sig_all) else 0.0,
+                    'rx2': float(np.abs(ref_all[::4]).max()) if len(ref_all) else 0.0}
+
+        if len(ref_all) // 2 < (num_steps + 2) * dwell:
+            return fallback("capture does not span the sweep")
+
+        # The anchor is a hint only; _nios_refine_offset validates the grid
+        # structurally and ignores it if the data disagrees. Do NOT trim the
+        # capture to a trailing window before aligning: where the train sits
+        # depends on how much STALE ring content the capture opened with,
+        # which is unknowable -- with an empty ring the train is at the FRONT
+        # and a (num_steps+4)*dwell tail window cuts its head off (tried
+        # 2026-09-07, broke every sweep in exactly that way).
+        t0_rel = max(0, round_trip // 2 + dwell)
+        offset, score = self._nios_refine_offset(ref_all, t0_rel, 0, num_steps)
+        if score <= 0:
+            return fallback(f"could not locate the step grid: "
+                            f"{self._nios_fail or 'unknown'} "
+                            f"(capture loss {self._nios_capture_loss * 100:.1f}%)")
+        self._nios_last_offset = offset
+        self._nios_last_drift = offset - t0_rel
+        self._nios_last_score = score
+
+        # Reduce each step to one complex number.
+        #
+        # Fancy-indexing a (num_steps, win) window out of the capture built two
+        # 16 MB complex arrays and cost more than the sweep itself. Instead the
+        # mixing tone is zero-padded out to a full dwell, which lets the steps
+        # be addressed as a plain contiguous reshape -- no copy -- and turns
+        # the whole reduction into four real matrix-vector products.
+        # Steps land every `period` samples, which is a little under the dwell
+        # (see _nios_refine_offset). Rounding it to an integer keeps the
+        # reshape below a view rather than a 4 MB gather, and costs at most
+        # half a sample per step.
+        # Everything below is sized from the MEASURED period, not the dwell.
+        # Deriving the window from one and the pad from the other is how a
+        # 18368-into-18304 broadcast error happens.
+        stride = int(round(self._nios_period)) or dwell
+        # The measured period can sit slightly ABOVE the dwell on the II/f
+        # image (see _nios_refine_offset), so do not clamp it to the dwell --
+        # slicing 4107-sample steps at a 4096 stride walks the window 11
+        # samples per step, ~550 by step 50. 2% cap = sanity only.
+        stride = max(settle + 2 * NIOS_WINDOW_GUARD + 64,
+                     min(stride, int(dwell * 1.02)))
+        win = stride - settle - 2 * NIOS_WINDOW_GUARD
+        # Keep the correlation window an INTEGER number of tone cycles so LO
+        # leakage (and every odd harmonic) lands on a null of the rectangular
+        # window's sinc -- the same rule DEMOD_SAMPLES follows, see the
+        # constants comment at the top of this file. At 100 kHz / 10 Msps that
+        # is any multiple of 100 samples. The trimmed samples just extend the
+        # trailing guard; cost is 10*log10(win/(win-99)) of processing gain at
+        # worst, well under 0.25 dB for any usable dwell.
+        per_cycle = int(round(self.driver.sample_rate / self.driver.cw_offset))
+        if per_cycle > 1:
+            win -= win % per_cycle
+        if win < max(64, per_cycle):
+            return fallback(f"dwell {dwell} leaves no capture window after "
+                            f"{settle} settle + guards")
+        if getattr(self, '_nios_tone_len', None) != win:
+            t = np.arange(win, dtype=np.float64) / self.driver.sample_rate
+            self._nios_tone = np.exp(-1j * 2 * np.pi * self.driver.cw_offset * t) / 2047.0
+            self._nios_tone_len = win
+        span = num_steps * stride
+        if offset + span > len(sig_all) // 2:
+            return fallback("capture does not span the sweep")
+
+        if getattr(self, '_nios_pad_key', None) != (stride, settle, win):
+            pad_r = np.zeros(stride, dtype=np.float32)
+            pad_i = np.zeros(stride, dtype=np.float32)
+            lead = settle + NIOS_WINDOW_GUARD
+            pad_r[lead:lead + win] = self._nios_tone.real
+            pad_i[lead:lead + win] = self._nios_tone.imag
+            self._nios_pad_r, self._nios_pad_i = pad_r, pad_i
+            self._nios_pad_key = (stride, settle, win)
+        pad_r, pad_i = self._nios_pad_r, self._nios_pad_i
+
+        def reduce_steps(flat, off):
+            i_v = flat[0::2][off:off + span].reshape(num_steps, stride)
+            q_v = flat[1::2][off:off + span].reshape(num_steps, stride)
+            return ((i_v @ pad_r - q_v @ pad_i)
+                    + 1j * (i_v @ pad_i + q_v @ pad_r)) / win
+
+        def h_cal_at(off):
+            ref = reduce_steps(ref_all, off)
+            ok = np.abs(ref) > 1e-10
+            out = np.zeros(num_steps, dtype=np.complex128)
+            out[ok] = reduce_steps(sig_all, off)[ok] / ref[ok]
+            return out, int(num_steps - np.count_nonzero(ok))
+
+        # T0 is settled structurally (see the span gate in
+        # _nios_refine_offset), so there is nothing left to resolve here and
+        # NOTHING in this path looks at the previous sweep. That is
+        # deliberate: any scene-similarity check confuses a target entering
+        # the beam with a mis-slice, and will happily rotate a correctly
+        # aligned sweep to make the scene look more like it used to. See the
+        # long note at the span gate for the failure that produced.
+        h_cal, dropped = h_cal_at(offset)
+
+        if dropped > num_steps // 5:
+            return fallback(f"{dropped}/{num_steps} steps had no reference signal")
+
+        if progress_cb:
+            progress_cb(num_steps - 1)
+
+        self._last_sweep_core = 'nios'
+        return h_cal, dropped, adc_peak
+
+    def _sweep_dispatch(self, freqs, qt_rx, qt_tx, num_buffers, settle_count,
+                        progress_cb=None):
+        """Route one sweep to the selected core. 'standard' is the validated
+        USB-retune-per-step path and stays the default; 'nios' is the FPGA
+        autonomous sweep, and every failure inside it falls back to standard,
+        so a regression is one set_params away from being undone."""
+        if self.sweep_mode == 'nios' and not self._nios_unavailable:
+            return self._sweep_core_nios(freqs, qt_rx, qt_tx, num_buffers,
+                                         settle_count, progress_cb)
+        self._last_sweep_core = 'standard'
+        return self._sweep_core(freqs, qt_rx, qt_tx, num_buffers,
+                                settle_count, progress_cb)
 
     def _perform_sweep(self):
         with self._lock:
@@ -897,7 +1897,7 @@ class SFCWEngine:
                     'freq_mhz': freqs[i] / 1e6,
                 })
 
-        h_cal, dropped_steps, adc_peak = self._sweep_core(
+        h_cal, dropped_steps, adc_peak = self._sweep_dispatch(
             freqs, qt_rx, qt_tx, num_buffers, settle_count, progress)
         if h_cal is None:
             return None
@@ -906,7 +1906,23 @@ class SFCWEngine:
             print(f"[sfcw] WARNING: {dropped_steps}/{num_steps} steps had incomplete captures")
 
         self._warn_if_adc_hot(adc_peak)
-        return self._process_h_cal(h_cal, adc_peak)
+        result = self._process_h_cal(h_cal, adc_peak)
+        # Which core actually produced this sweep, plus autonomous-sweep diag.
+        # 'fallback' means the nios path failed THIS sweep and the data is a
+        # (correct, slower) standard sweep -- a block mixing flavors scores
+        # terribly on mixture-blind metrics, so consumers need to know.
+        result['sweep_core'] = self._last_sweep_core
+        if self.sweep_mode == 'nios':
+            result['nios_diag'] = {
+                'score': round(self._nios_last_score, 3),
+                'period': round(self._nios_period, 2),
+                'realigned': self._nios_realigned,
+                'fallbacks': self._nios_fallbacks,
+                'lag_ms': round(self._nios_capture_lag /
+                                float(self.driver.sample_rate) * 1e3, 2),
+                'span_ok': self._nios_last_span_ok,
+            }
+        return result
 
     def _perform_sweep_raw(self):
         """Like _perform_sweep but returns raw h_cal array for averaging."""
@@ -919,7 +1935,7 @@ class SFCWEngine:
 
         freqs, qt_rx, qt_tx = self._build_sweep_grid(start, stop, step)
 
-        h_cal, _, adc_peak = self._sweep_core(freqs, qt_rx, qt_tx, num_buffers, settle_count)
+        h_cal, _, adc_peak = self._sweep_dispatch(freqs, qt_rx, qt_tx, num_buffers, settle_count)
         self._last_adc_peak = adc_peak
         self._warn_if_adc_hot(adc_peak)
         return h_cal

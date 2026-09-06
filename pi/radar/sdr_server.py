@@ -174,6 +174,16 @@ class SDRServer:
                     params['bscan_avg_count'] = int(cmd['bscan_avg_count'])
                 if 'bscan_primer' in cmd:
                     params['bscan_primer'] = bool(cmd['bscan_primer'])
+                # NIOS autonomous sweep controls (fpga_branch port, 2026-09-07).
+                # The GUI does not send these yet; benchmark/tool clients do.
+                if 'sweep_mode' in cmd:
+                    params['sweep_mode'] = str(cmd['sweep_mode'])
+                if 'nios_dwell' in cmd:
+                    params['nios_dwell'] = int(cmd['nios_dwell'])
+                if 'nios_settle' in cmd:
+                    params['nios_settle'] = int(cmd['nios_settle'])
+                if 'nios_pipeline' in cmd:
+                    params['nios_pipeline'] = bool(cmd['nios_pipeline'])
                 self.sfcw.set_params(**params)
                 await self._broadcast_sfcw_status()
 
@@ -353,6 +363,10 @@ class SDRServer:
                 }
                 if 'phase_coherence' in data:
                     result_msg['phase_coherence'] = data['phase_coherence']
+                if 'sweep_core' in data:
+                    result_msg['sweep_core'] = data['sweep_core']
+                if 'nios_diag' in data:
+                    result_msg['nios_diag'] = data['nios_diag']
                 msg = json.dumps(result_msg)
             else:
                 continue

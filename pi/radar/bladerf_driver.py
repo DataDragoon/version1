@@ -11,6 +11,10 @@ MGC = libbladeRF.BLADERF_GAIN_MGC
 TUNING_MODE_FPGA = libbladeRF.BLADERF_TUNING_MODE_FPGA
 
 
+# RX sync ring depth (buffers) for dual-channel streaming -- see start_rx_dual.
+RX_RING_DEPTH = 256
+
+
 class BladeRFDriver:
     def __init__(self):
         self.device = None
@@ -406,7 +410,16 @@ class BladeRFDriver:
         self.device.sync_config(
             layout=ChannelLayout.RX_X2,
             fmt=Format.SC16_Q11,
-            num_buffers=16,
+            # 256, not 16 (changed 2026-09-07): the ring is the only thing
+            # between an RX-thread stall and DROPPED samples, and stalls up to
+            # 50.9 ms have been measured under full-stack load. 16 buffers is
+            # 3.3 ms of tolerance; a drop is invisible in SC16_Q11 (no
+            # metadata) and shifts every later sample position, which the NIOS
+            # autonomous sweep's continuous-capture slicing cannot survive.
+            # 256 buffers = 52 ms of stall tolerance at 4 MB of memory. For
+            # the standard sweep this converts rare sample loss into delay,
+            # which the lockstep settle gate already handles.
+            num_buffers=RX_RING_DEPTH,
             buffer_size=4096,
             num_transfers=8,
             stream_timeout=3500

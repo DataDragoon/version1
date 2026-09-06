@@ -54,9 +54,13 @@ CORRUPT_BAR = 0.999   # adjacent-sweep complex correlation below this = visibly 
 Z_BAR = 8.0           # robust sigmas off a step's own median
 
 
-async def run_block(ws, settle, n, warm, timeout):
+async def run_block(ws, settle, n, warm, timeout, mode='standard',
+                    dwell=4096, nios_settle=1024, pipeline=True):
     """One measurement block: set params, sweep, collect n results after `warm`."""
-    await ws.send(json.dumps({'cmd': 'sfcw_set_params', 'settle_count': settle}))
+    await ws.send(json.dumps({'cmd': 'sfcw_set_params', 'settle_count': settle,
+                              'sweep_mode': mode, 'nios_dwell': dwell,
+                              'nios_settle': nios_settle,
+                              'nios_pipeline': pipeline}))
     await asyncio.sleep(0.3)
     await ws.send(json.dumps({'cmd': 'sfcw_start'}))
     ts, H, got = [], [], 0
@@ -101,7 +105,11 @@ async def main(args):
               f"{'vis corrupt':>13}", flush=True)
         blocks = []
         for b in range(args.blocks):
-            ts, H = await run_block(ws, args.settle, args.sweeps, args.warm, args.timeout)
+            ts, H = await run_block(ws, args.settle, args.sweeps, args.warm,
+                                    args.timeout, mode=args.mode,
+                                    dwell=args.dwell,
+                                    nios_settle=args.nios_settle,
+                                    pipeline=not args.no_pipeline)
             d = np.diff(ts) * 1000.0
             med = float(np.median(d))
             z, corr, s_repeat = score(H)
@@ -136,4 +144,9 @@ if __name__ == '__main__':
     p.add_argument('--warm', type=int, default=10, help='sweeps discarded at block start')
     p.add_argument('--url', default=DEFAULT_URL)
     p.add_argument('--timeout', type=float, default=25.0, help='per-message recv timeout (s)')
+    p.add_argument('--mode', choices=('standard', 'nios'), default='standard',
+                   help='sweep core: standard (USB retune per step) or nios (FPGA autonomous)')
+    p.add_argument('--dwell', type=int, default=4096, help='nios dwell, samples (default 4096)')
+    p.add_argument('--nios-settle', type=int, default=1024, help='nios per-step settle, samples')
+    p.add_argument('--no-pipeline', action='store_true', help='disable capture pipelining in nios mode')
     asyncio.run(main(p.parse_args()))

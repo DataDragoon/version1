@@ -1,0 +1,149 @@
+PROVENANCE: hosted_niosII_f_sweep_ts.rbf
+==================================================
+Build date:        2026-09-06 19:18:39 UTC -> 2026-09-06 19:33:25 UTC (Total Build Time 00:14:43)
+Build host:        Windows 11, launched via Nios II Command Shell (Git Bash tool), output dir hdl/quartus/hostedxA9-2026-09-07_01.03.18
+
+Quartus:
+    Quartus Prime Shell
+    Version 18.1.0 Build 625 09/12/2018 SJ Standard Edition
+    Copyright (C) 2018  Intel Corporation. All rights reserved.
+    install: C:/intelFPGA/18.1  (nios2-elf-gcc 5.3.0, H-x86_64-mingw32)
+
+Build parameters (build_sweep_firmware.sh -> hdl/quartus/build_bladerf.sh):
+    BOARD=bladeRF-micro  REV=hosted  SIZE=A9  NIOS_REV=Fast (Nios II/f)
+    device 5CEBA9F23C8 (Cyclone V E), nios ram_size 131072
+    qsys log: 'set nios_impl fast' / 'set_instance_parameter_value nios2 impl Fast'
+
+Source tree:       copied from sfrpi:~/bladerf-src (Nuand upstream, commit 73ce750
+                   'Revert bladeRF2: gate TX SPDT during AD9361 rate and bandwidth updates')
+                   submodule thirdparty/analogdevicesinc/no-OS @ 0bba46e6f6f75785a65d425ece37d0a04daf6157
+git status --short:
+     M hdl/fpga/platforms/bladerf-micro/software/bladeRF_nios/Makefile
+     M hdl/fpga/platforms/bladerf-micro/vhdl/rx.vhd
+     M hdl/fpga/platforms/common/bladerf/software/bladeRF_nios/src/devices.c
+     M hdl/fpga/platforms/common/bladerf/software/bladeRF_nios/src/pkt_retune2.c
+    ?? build_output/
+    ?? build_sweep_firmware.sh
+
+Modified tracked files vs 73ce750 (git diff --stat):
+     .../bladerf-micro/software/bladeRF_nios/Makefile   |   2 +-
+     hdl/fpga/platforms/bladerf-micro/vhdl/rx.vhd       |  17 +-
+     .../bladerf/software/bladeRF_nios/src/devices.c    |  69 ++++-
+     .../software/bladeRF_nios/src/pkt_retune2.c        | 308 +++++++++++++++++++++
+     4 files changed, 389 insertions(+), 7 deletions(-)
+    sha256(git diff of the 3 Pi-modified files rx.vhd/devices.c/pkt_retune2.c) = e0f92a85c8e30487aff60d77114ba07580f2a98a6a60e6ab8f437c2e9fe4e4f1
+    sha256(git diff of all 4 files incl. Makefile)                               = 16d27abd6b7bf8e3c1fb7eb59b98e4fafcac5e94cf7f756bc1dbaaea0711110f
+    NOTE: bladerf-micro/software/bladeRF_nios/Makefile is a build-host-only change (ad936x -> ad936x/fast:
+          skips CMake's dependency-scan step, which fails under the Windows Nios shell). It does not
+          change any compiled code; the build directory was wiped before this run so nothing was incremental.
+
+Per-file sha256 of modified sources:
+    bac0bf39359e911c6e78f8ae67100f2c98002b88483b7b9fa777e274d1941241 *hdl/fpga/platforms/bladerf-micro/vhdl/rx.vhd
+    1a834ac1d4dfa04efdbc8c6601d0fdcfdaba627e3f798f610b0d60b46410a9d5 *hdl/fpga/platforms/common/bladerf/software/bladeRF_nios/src/devices.c
+    b13ec2fd36e6d4f40ba19f9bee1e77e9cff10a01fb7737f0d14a64e7ed5a9dbe *hdl/fpga/platforms/common/bladerf/software/bladeRF_nios/src/pkt_retune2.c
+    abf7a1fede6a4440b60d3e0676dcce8332a46eab5fbcf86316b5f9fb95b2bb39 *hdl/fpga/platforms/bladerf-micro/software/bladeRF_nios/Makefile
+    d6559252fbfcb930149d4bcce45059b1d7a17406768a219a81232134b497da2a *build_sweep_firmware.sh
+
+Patch markers verified in this tree:
+    rx.vhd:155: if( meta_en = '1' or rx_enable = '1' ) then   [upstream: if( meta_en = '1' ) then]
+    pkt_retune2.c:255:#define SWEEP_CMD_PRIME     0x53575052U     /* "SWPR" */
+    pkt_retune2.c:256:#define SWEEP_CMD_EXEC      0x53574550U     /* "SWEP" */
+    pkt_retune2.c:426:        case SWEEP_CMD_PRIME:
+    pkt_retune2.c:438:        case SWEEP_CMD_EXEC: {
+    NIOS ELF symbols: sweep sweep_activate sweep_port sweep_preload sweep_profile_activate sweep_spdt 
+
+build_sweep_firmware.sh changes vs the Pi copy (NIOS_REV Tiny->Fast, Lite->Standard comments):
+    --- /tmp/bsf.orig	2026-09-07 00:35:09.846794200 +0530
+    +++ build_sweep_firmware.sh	2026-09-07 00:44:48.958216100 +0530
+    @@ -2,7 +2,7 @@
+     #
+     # Build a bladeRF xA9 FPGA image containing the autonomous SFCW sweep firmware.
+     #
+    -# REQUIRES an x86-64 machine with Intel Quartus Prime Lite installed and on
+    +# REQUIRES an x86-64 machine with Intel Quartus Prime STANDARD installed and on
+     # PATH (quartus_sh, quartus_cpf, nios2-bsp, nios2-elf-gcc). None of those tools
+     # have ARM builds, which is why this cannot run on the Pi.
+     #
+    @@ -23,8 +23,10 @@
+     BOARD="bladeRF-micro"
+     REV="hosted"
+     SIZE="A9"
+    -# Nios II/e. Works with Quartus Prime Lite; "Fast" needs Standard or Pro.
+    -NIOS_REV="Tiny"
+    +# Nios II/f (Fast). REQUIRES Quartus Prime Standard: Lite cannot build a Nios II/f
+    +# core, and Pro does not support Cyclone V at all. "Tiny" (Nios II/e) is the only
+    +# revision Lite can build.
+    +NIOS_REV="Fast"
+     
+     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+     cd "$SCRIPT_DIR"
+    @@ -34,9 +36,9 @@
+     
+     if ! command -v quartus_sh >/dev/null 2>&1; then
+         echo "ERROR: quartus_sh not found on PATH." >&2
+    -    echo "Install Intel Quartus Prime Lite and source its settings, e.g.:" >&2
+    -    echo "  export PATH=/opt/intelFPGA_lite/23.1std/quartus/bin:\$PATH" >&2
+    -    echo "  export PATH=/opt/intelFPGA_lite/23.1std/nios2eds/bin:\$PATH" >&2
+    +    echo "Install Intel Quartus Prime Standard and source its settings, e.g.:" >&2
+    +    echo "  export PATH=/opt/intelFPGA/18.1/quartus/bin:\$PATH" >&2
+    +    echo "  export PATH=/opt/intelFPGA/18.1/nios2eds/bin:\$PATH" >&2
+         exit 1
+     fi
+     
+    @@ -61,7 +63,18 @@
+     echo
+     
+     cd hdl/quartus
+    -./build_bladerf.sh -b "${BOARD}" -r "${REV}" -s "${SIZE}" -n "${NIOS_REV}"
+    +# The Nios II Command Shell exports SHELLOPTS (for igncr), and bash folds this
+    +# script's own -e/-u/pipefail into that exported value, so build_bladerf.sh and
+    +# git's shell scripts would inherit them (git-sh-i18n: GIT_TEXTDOMAINDIR unbound
+    +# variable).  Hand the child the current options minus those three.
+    +child_shellopts=":${SHELLOPTS}:"
+    +for opt in nounset errexit pipefail; do
+    +    child_shellopts="${child_shellopts//:${opt}:/:}"
+    +done
+    +child_shellopts="${child_shellopts#:}"
+    +child_shellopts="${child_shellopts%:}"
+    +env SHELLOPTS="${child_shellopts}" \
+    +    ./build_bladerf.sh -b "${BOARD}" -r "${REV}" -s "${SIZE}" -n "${NIOS_REV}"
+     cd "${SCRIPT_DIR}"
+     
+     # build_bladerf.sh writes to a dated directory; find the newest .rbf it made.
+
+Artifact timestamps (IST, all after build start marker 2026-09-07 00:48:39 IST):
+    2026-09-07_01:03:19  12858972  hdl/quartus/hostedxA9-2026-09-07_01.03.18/hostedxA9.rbf
+    2026-09-07_00:50:35  1026150  hdl/quartus/work/bladerf-micro-A9-hosted/bladeRF_nios/bladeRF_nios.elf
+    2026-09-07_01:03:17  12858972  hdl/quartus/work/bladerf-micro-A9-hosted/output_files/hosted.rbf
+    2026-09-07_01:03:10  12619250  hdl/quartus/work/bladerf-micro-A9-hosted/output_files/hosted.sof
+
+Timing:
+       1     Slack : 0.005
+       1     Slack : 0.018
+       1     Slack : 0.056
+       1     Slack : 0.121
+       1     Slack : 0.123
+       1     Slack : 0.126
+       1     Slack : 0.131
+       1     Slack : 0.151
+       1     Slack : 0.166
+       1     Slack : 0.171
+       1     Slack : 0.172
+       1     Slack : 0.181
+       1     Slack : 0.182
+       1     Slack : 0.184
+       1     Slack : 0.190
+       1     Slack : 0.216
+       1     Slack : 0.230
+       1     Slack : 0.261
+       1     Slack : 0.274
+       1     Slack : 0.284
+    Fitter: Fitter Status : Successful 
+
+Finished image:
+    hosted_niosII_f_sweep_ts.rbf  12858972 bytes
+    sha256 3449d1af4275fa704e108ff1853d543e7660a6eae138180dc81bdf38a2d24df1
+    md5    74c6976428dfab6270f0bb452455f70b
+
+Full build log: build_niosII_f_sweep_ts.log (kept alongside on the build host, C:/bladerf-src/build_output/)
+Earlier failed attempts this session: attempt1 (bash -e option glitch outside Nios shell), attempt2 (ad936x CMake depend step) - both produced no image.

@@ -4085,3 +4085,154 @@ the carry window (`LIDAR_CARRY_MS`, raised 400 -> 1000 ms), so a brief burst of
 invalid returns at a poor target angle -- documented at 30-40% of TF-LC02 reads on
 this bench -- no longer surfaces at all. Only a standoff that has been null
 continuously for ~3 s is reported.
+
+## Nios II/f FPGA image + autonomous sweep: VALIDATED, PORTED, DEFAULT (2026-09-07)
+
+The II/f image (`~/bladerf-src/build_output/hosted_niosII_f_sweep_ts.rbf`, Quartus Prime
+**Standard** 18.1, `NIOS_REV=Fast`, rx.vhd timestamp fix + `fpga_branch` sweep firmware)
+is validated, and the Pi-side autonomous-sweep driver is ported from `fpga_branch` onto
+the current `sfcw_engine.py`. Confirmed working on the GUI by the operator, including the
+target-in / target-out case that broke an earlier draft (see "the resolver that had to
+go" below). **The image is committed at `fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf`**
+(sha256 `3449d1af...`, provenance + load instructions in `fpga/images/README.md`).
+**It is RAM-loaded only (`bladeRF-cli -l fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf`)
+and reverts on power cycle -- SPI flash still holds the OLD image; flashing (`-L`) is the
+operator's call.** After a
+power cycle, reload it or the engine prints one line ("NIOS autonomous sweep unavailable
+on this FPGA image") and runs the standard sweep for the session: the capability latch
+(`_nios_unavailable`) detects the dead sample counter at the first EXEC, so a stock image
+degrades to exactly the old behaviour rather than churning. `docs/nios_sweep.md` (copied
+from `fpga_branch`, plus a 2026-09-07 II/f addendum) holds the protocol and firmware side.
+
+Measured through the full stack (`start.py` + one websocket client), 51 steps, settle 0:
+
+| | ms/sweep | Hz | S_repeat (windowed, worst-2 steps trimmed) | mis-sliced |
+|---|---|---|---|---|
+| old II/e image, host-driven | 65.5 | 15.3 | -- | -- |
+| II/f image, host-driven (`'standard'`) | 55.3-56.2 | 17.8-18.1 | 36.0-36.4 dB | 0.00% |
+| **II/f image, autonomous (`'nios'`) -- DEFAULT** | **27.1-27.5** | **36.4-36.8** | **33.9-37.4 dB** | **0.00%** |
+
+2500-sweep continuous soak on the shipped code: **27.5 ms flat (36.4 Hz), 0.00% rotated,
+S_repeat 33.1-34.8 dB across all 24 windows with no drift, 1.0% fallbacks.**
+
+- **The II/f image alone bought ~10 ms with no host change** -- the Nios services
+  host-driven retune packets too, and the II/e's ~47.7 us/SPI-transaction CPU cost is the
+  term that shrank. Even `sweep_mode='standard'` now beats the documented 65.5 ms.
+- **Gate 2, the II/f step floor: ~303 us (~3030 samples)** -- 6.6x the II/e's 2.003 ms
+  rail and better than the ~490 us prediction, so the profile preload genuinely hides
+  under the dwell. Ask for less and the firmware steps at ~3030 regardless.
+
+### Controls (via `sfcw_set_params`; the GUI does not send them, so it gets the defaults)
+
+`sweep_mode` = `'nios'` (default) | `'standard'` (the host-driven core, untouched -- **one
+set_params reverts everything**); `nios_dwell` (samples/step, min = default = 4096);
+`nios_settle` (default 1024); `nios_pipeline` (default True). `benchmark_sweep.py --mode
+nios [--dwell N --nios-settle N --no-pipeline]`. **Every failure inside `_sweep_core_nios`
+falls back to ONE standard sweep and prints why** -- a fallback is a correct slower sweep,
+not a lost one. Every `sfcw_result` carries `sweep_core` (`nios` / `fallback` / `standard`)
+and, in nios mode, a `nios_diag`. **Any block metric that ignores `sweep_core` is
+measuring a mixture of two sweep flavours and will read far worse than either.**
+
+### T0 is anchored STRUCTURALLY, and the gate fails closed
+
+The firmware fires steps 1..n-1 on the dwell grid (step 0 is activated by EXEC itself,
+off-grid), so a complete transient lattice holds n-1 boundaries spanning exactly **n-2
+periods**. When that holds, the first member *must* be step 1 and the last *must* be step
+n-1 -- the front anchor (`first - period`) and the end anchor (`last - (n-1)*period`)
+become algebraically the same number and T0 is certain. Measured over 199 sweeps: span was
+n-2 on **197**, short by one period on **1** (that is the one-step rotation), and wildly
+short on **1** broken capture.
+
+A short span is the ambiguous case, and **nothing inside a single sweep can resolve it**:
+both channels shift together, so every capture window is still clean CW -- just of the
+neighbouring frequency -- and h_cal comes out a perfectly valid measurement rotated by one
+step. In-window reference magnitude is identical either way (measured). So the gate
+**refuses the sweep** rather than guessing. Costs ~1% of sweeps, removes rotation entirely.
+
+**INVARIANT, enforced and commented in `_nios_refine_offset`: alignment is derived from
+the REFERENCE channel (`ref_all`) only.** RX2 is a cable loopback, so nothing in front of
+the antenna can change it -- that is what makes slicing immune to the scene. `sig_all` is
+touched only for the ADC peak and the final division. Never feed the signal channel,
+h_cal, or anything from a previous sweep into the alignment decision.
+
+### The resolver that had to go (2026-09-07) -- do NOT reintroduce it
+
+An intermediate version anchored on the END of the lattice and repaired rotations by
+correlating h_cal against the previous sweep, then against a decayed template of accepted
+sweeps. Both are unfixable by construction, and the operator found the failure on the GUI:
+
+- **Bistable against the previous sweep.** Once one rotated sweep became `prev`, rotated
+  sweeps agreed with each other and correct ones looked wrong. Under load it flapped
+  between the two locks and **43% of sweeps came out rotated**.
+- **The template version confuses a SCENE CHANGE with a mis-slice.** Inserting a target
+  drops agreement exactly as a mis-slice does, so the resolver rotated correctly-aligned
+  sweeps; re-seeding the template on one of those latched the error, and **removing the
+  target did not recover it** -- only stopping and restarting the sweep (which clears the
+  template) did. That is the exact symptom reported.
+- Note the metric itself is also weak: a one-step rotation of a smooth spectrum still
+  correlates ~0.96 in the frequency domain, so it is high in absolute terms.
+
+Alignment must not depend on scene stability. The span gate replaced all of it.
+
+### The pipelined capture must be BOUNDED, or it feeds back
+
+With `nios_pipeline`, sweep N+1's capture is opened before sweep N is processed, so it
+accumulates for as long as processing takes -- and processing is dominated by
+`np.concatenate` over that buffer list. That is a positive feedback loop: slower
+processing -> more buffers -> slower concatenate -> slower still. Measured with only the
+1220-buffer / 0.25 s hard cap in place (~10x what a sweep needs), the sweep **drifted
+28 -> 44 ms over a 1200-sweep run and dragged 4.8% of sweeps into misalignment**.
+`_bulk_start(max_buffers)` now sizes the cap from what the sweep actually needs (~112
+buffers), refined once `round_trip` is known. That alone took it to 27.3 ms flat with 0.1%
+rotated; the span gate then removed the last of it.
+
+### What the II/f broke in fpga_branch's alignment (all in `sfcw_engine.py`)
+
+1. **Transients are 16-33 samples wide** (vs hundreds on II/e): detection boxcar k
+   256 -> 64, or only ~20 of 51 boundaries are found and every sweep falls back.
+2. **EXEC front matter is NOT on the T0 grid**: a distinctive pair ~1940 samples apart,
+   then ~11,120 samples to the first regular boundary -- **3.190 periods, std 0.0055**.
+   On the II/e the dwell was 6x longer and this latency rounded away.
+3. **The period can run LONG** (4096 -> up to 4107; +0.65% at 4928), not only short:
+   period gate 0.5% -> 1.5%, and the stride is no longer clamped to the dwell.
+4. **Dwell 3456 is unstable** (period wobble +/-14 samples, S_repeat 13-19 dB) even though
+   the rail is ~3030 -- hence `NIOS_MIN_DWELL = 4096`. With the pipeline the sweep is
+   PROCESSING-bound (~27 ms against ~21 ms of stepping), so a shorter dwell buys nothing.
+5. **`_nios_period_hist` is cleared on a dwell change** -- the steady-median override
+   otherwise carries the old dwell's period into the new grid and slices garbage.
+6. **A stale capture head is normal** -- back-to-back captures open on ring backlog holding
+   the PREVIOUS sweep's tail, also period-spaced. The lattice keeps only the trailing
+   (num_steps-2)-period window. Do NOT trim the capture to a tail window before aligning:
+   with an empty ring the train sits at the FRONT and the trim cuts its head off (tried,
+   broke every sweep).
+
+### Sample loss / delivery lag under load
+
+A continuous capture is sliceable only if it is gapless. Under full-stack load the RX
+thread stalls (50.9 ms worst on record); the old 16-buffer sync ring gave 3.3 ms of
+tolerance and overflow DROPS samples with no flag in SC16_Q11.
+
+- **RX sync ring 16 -> 256 buffers** (`bladerf_driver.py` `RX_RING_DEPTH`, 52 ms of stall
+  tolerance, 4 MB). Also helps the standard sweep: converts rare loss into delay, which the
+  lockstep settle gate already handles.
+- **Harvest lag gate**: `_nios_capture_lag` (hardware-clock elapsed minus delivered) vs 75%
+  of the ring, before slicing. NOTE this is delivery LAG, not loss -- 2-7 ms is ordinary
+  backlog at 36 Hz. An earlier gate that read it as "loss" at a 0.5% threshold **rejected
+  every sweep**; do not lower it without understanding that distinction.
+
+### Still open / cautions
+
+- The GUI's sweep-time estimate and Settle field describe the standard sweep; in nios mode
+  they are cosmetic. GUI awareness of `sweep_mode` (and a toggle) is future work.
+- `nios_settle = 1024` was chosen with wide margin over the ~30-sample transients, not by
+  A/B. The correlation window auto-trims to a multiple of 100 samples so LO leakage stays
+  on a sinc null (same rule as `DEMOD_SAMPLES`).
+- **The TX2->RX2 loopback is still flaky** and is now the dominant quality term: raw
+  whole-block S_repeat runs 26-34 dB in BOTH modes, with one step (0, 8 or 12) carrying
+  14-60% of the difference energy. Reseat it before trusting any absolute S_repeat. Use
+  windowed+trimmed S_repeat, not whole-block, whenever raw is under ~32 dB (the 0.999 corr
+  bar IS the noise floor there).
+- **Run ONE benchmark client at a time.** Two clients issuing `sfcw_start`/`sfcw_stop`
+  corrupted several blocks during this session and cost real debugging time; repeated
+  start/stop cycling also still degrades the device (recover by restarting `start.py`
+  after a 15-20 s gap, or `usbreset` if it wedges).
