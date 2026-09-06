@@ -102,6 +102,8 @@ export default function Sidebar({
   onBscanScaleScopeChange,
   bscanShowGate,
   onBscanShowGateChange,
+  cscanProjection,
+  onCscanProjectionChange,
   bscanScaleLink,
   onBscanScaleLinkChange,
   cscanRowScales,
@@ -414,6 +416,8 @@ export default function Sidebar({
                   onScaleLinkChange={onBscanScaleLinkChange}
                   showGate={bscanShowGate}
                   onShowGateChange={onBscanShowGateChange}
+                  projection={cscanProjection}
+                  onProjectionChange={onCscanProjectionChange}
                   lidarMm={lidarMm}
                   lidarOffsetMm={lidarOffsetMm}
                   bgRef={bscanBgRef}

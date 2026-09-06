@@ -24,6 +24,7 @@ export default function CscanPanel({
   sharedScale, bgDiag, procParams, captureProgress,
   scaleScope, onScaleScopeChange, rowScales, showGate, onShowGateChange,
   scaleLink, onScaleLinkChange, gridScales, liveDiag,
+  projection, onProjectionChange,
   roverConnected, roverStatus, sendRover, roverScan,
 }) {
   const {
@@ -81,6 +82,17 @@ export default function CscanPanel({
   const canActivate = isConnected && sdrConnected;
   const captured = scanData.length;
   const stats = gridStats(params);
+  // Plan-view scale and placement, defaulted so the panel still renders if the
+  // prop is absent.
+  const proj = projection || { toScale: false, pxPerCm: 8, leftPx: 60, topPx: 80 };
+  const nudgeScale = (f) => onProjectionChange({
+    ...proj,
+    pxPerCm: Math.min(200, Math.max(0.2, Math.round(proj.pxPerCm * f * 1000) / 1000)),
+  });
+  const nudgePlace = (key, d) => onProjectionChange({
+    ...proj,
+    [key]: Math.round((proj[key] + d) * 10) / 10,
+  });
   const gridFull = captured >= stats.total;
 
   // ── Rover mode ────────────────────────────────────────────────────────
@@ -792,6 +804,136 @@ export default function CscanPanel({
             </div>
           </>
         )}
+      </Section>
+
+      {/* Plan-view scale — for projecting the grid back onto the wall it was
+          swept over. Fit is the old behaviour and is right on a monitor; to
+          scale is the one that can be aligned, because the mapping stops
+          depending on the pane size. */}
+      <Section label="Projection">
+        <button
+          onClick={() => onProjectionChange({ ...proj, toScale: !proj.toScale })}
+          className={cn(
+            'w-full px-3 py-2 rounded-lg text-xs font-medium transition-all border',
+            proj.toScale
+              ? 'bg-[#4aff8a]/10 border-[#4aff8a]/40 text-[#4aff8a]'
+              : 'bg-white/5 border-white/10 text-white/50 hover:text-white/80',
+          )}
+        >
+          {proj.toScale ? '● To scale' : 'Fit to pane'}
+        </button>
+
+        <EditableField
+          label="Scale"
+          value={proj.pxPerCm}
+          unit="px/cm"
+          onChange={(v) => onProjectionChange({ ...proj, pxPerCm: v })}
+          min={0.2}
+          max={200}
+          locked={!proj.toScale}
+        />
+
+        {/* Multiplicative trim, because aligning a projected image is a matter
+            of a few percent either way rather than a fixed number of pixels. */}
+        <div className="grid grid-cols-4 gap-1.5">
+          {[['-5%', 1 / 1.05], ['-1%', 1 / 1.01], ['+1%', 1.01], ['+5%', 1.05]].map(([label, f]) => (
+            <button
+              key={label}
+              disabled={!proj.toScale}
+              onClick={() => nudgeScale(f)}
+              className={cn(
+                'px-2 py-1.5 rounded-lg text-[10px] font-mono font-semibold transition-all border',
+                proj.toScale
+                  ? 'bg-white/5 border-white/10 text-white/60 hover:text-white hover:border-white/25'
+                  : 'bg-[#0a0a0a]/40 border-white/5 text-white/20 cursor-not-allowed',
+              )}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {/* Placement. Measured from the top-left of the VIEWPORT (everything
+            right of this sidebar), not of the C-scan canvas, so the projected
+            grid holds its position when the Live Sweep pane appears or a row's
+            B-scan opens underneath it. */}
+        <div className="px-1 pt-1 text-[9px] font-medium uppercase tracking-wider text-[#555555]">
+          Grid top-left, from the viewport corner
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <EditableField
+            label="Left"
+            value={proj.leftPx}
+            unit="px"
+            onChange={(v) => onProjectionChange({ ...proj, leftPx: v })}
+            min={-20000}
+            max={20000}
+            locked={!proj.toScale}
+          />
+          <EditableField
+            label="Top"
+            value={proj.topPx}
+            unit="px"
+            onChange={(v) => onProjectionChange({ ...proj, topPx: v })}
+            min={-20000}
+            max={20000}
+            locked={!proj.toScale}
+          />
+        </div>
+
+        {[['leftPx', 'Left'], ['topPx', 'Top']].map(([key, label]) => (
+          <div key={key} className="flex items-center gap-1.5">
+            <span className="w-7 shrink-0 text-[9px] font-medium uppercase tracking-wider text-[#555555]">
+              {label}
+            </span>
+            {[-10, -1, 1, 10].map(d => (
+              <button
+                key={d}
+                disabled={!proj.toScale}
+                onClick={() => nudgePlace(key, d)}
+                className={cn(
+                  'flex-1 px-1 py-1.5 rounded-lg text-[10px] font-mono font-semibold transition-all border',
+                  proj.toScale
+                    ? 'bg-white/5 border-white/10 text-white/60 hover:text-white hover:border-white/25'
+                    : 'bg-[#0a0a0a]/40 border-white/5 text-white/20 cursor-not-allowed',
+                )}
+              >
+                {d > 0 ? `+${d}` : d}
+              </button>
+            ))}
+          </div>
+        ))}
+
+        <div className="grid grid-cols-2 gap-2">
+          <InfoTile
+            label="Grid on screen"
+            value={proj.toScale
+              ? `${(stats.width * proj.pxPerCm).toFixed(0)} × ${(stats.height * proj.pxPerCm).toFixed(0)} px`
+              : 'fitted'}
+          />
+          <InfoTile
+            label="Cell on screen"
+            value={proj.toScale
+              ? `${(hStep * proj.pxPerCm).toFixed(1)} × ${(vStep * proj.pxPerCm).toFixed(1)} px`
+              : '—'}
+          />
+        </div>
+
+        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
+          To scale draws the plan view at exactly this many screen pixels per
+          centimetre and puts its top-left corner exactly there, so the image is
+          the swept rectangle times one constant at a fixed spot — trim both
+          against the projector's own zoom and aim until the grid lands on the
+          real wall, then leave them alone. Fitted scaling cannot be aligned: it
+          re-derives itself from the pane size, so opening a row's B-scan or
+          resizing the window silently moves everything. Left/Top are measured
+          from the viewport corner rather than from this pane, so the same pane
+          changes leave the projected grid where it is. The B-scan pane places
+          its columns from the same layout, so it stays registered under the
+          grid either way. A grid that falls outside the pane is CLIPPED, not
+          re-fitted — re-fitting would be exactly the silent re-scaling this
+          avoids, so move it back rather than expecting it to shrink.
+        </div>
       </Section>
 
       {/* Colour scaling — dynamic tracks the data, manual pins both ends live */}

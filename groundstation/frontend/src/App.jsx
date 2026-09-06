@@ -451,6 +451,40 @@ export default function App() {
   // Draw the depth gate on the B-scan pane. Purely a placement aid -- the gate
   // always drives the plan view's cell values whether or not it is drawn.
   const [bscanShowGate, setBscanShowGate] = useState(true);
+  // Plan-view scale. Off, the grid is fitted to whatever space the pane has --
+  // fine on a monitor, useless through a projector, because the mapping then
+  // changes with the window size and with whether the B-scan row is open. On,
+  // the grid is drawn at exactly `pxPerCm` screen pixels per centimetre, so the
+  // image on the wall is the swept rectangle scaled by one constant the
+  // operator trims against the projector's own zoom until the grid lands on the
+  // real geometry. Persisted, because that constant is a property of the rig
+  // and the projector, not of a session.
+  //
+  // `leftPx` / `topPx` place the grid's TOP-LEFT corner relative to the
+  // viewport's top-left -- the area right of the sidebar, not the C-scan
+  // canvas. Measuring from the viewport is what keeps a projected grid still
+  // when the Live Sweep pane appears or a row's B-scan opens: the canvas moves
+  // under it, the grid does not.
+  const [cscanProjection, setCscanProjectionState] = useState(() => {
+    const num = (k, dflt) => {
+      const v = parseFloat(localStorage.getItem(k));
+      return Number.isFinite(v) ? v : dflt;
+    };
+    const px = num('cscan_px_per_cm', 8);
+    return {
+      toScale: localStorage.getItem('cscan_to_scale') === 'true',
+      pxPerCm: px > 0 ? px : 8,
+      leftPx: num('cscan_left_px', 60),
+      topPx: num('cscan_top_px', 80),
+    };
+  });
+  const setCscanProjection = useCallback((next) => {
+    localStorage.setItem('cscan_to_scale', String(!!next.toScale));
+    localStorage.setItem('cscan_px_per_cm', String(next.pxPerCm));
+    localStorage.setItem('cscan_left_px', String(next.leftPx));
+    localStorage.setItem('cscan_top_px', String(next.topPx));
+    setCscanProjectionState(next);
+  }, []);
   // 'linked' (both panes off one population of bins, so a colour means one dB
   // in both) or 'independent' (the plan view scales within its own gated cell
   // values). Ignored while scaling is manual, which pins both by definition.
@@ -1713,6 +1747,8 @@ export default function App() {
         onBscanScaleScopeChange={setBscanScaleScope}
         bscanShowGate={bscanShowGate}
         onBscanShowGateChange={setBscanShowGate}
+        cscanProjection={cscanProjection}
+        onCscanProjectionChange={setCscanProjection}
         bscanScaleLink={bscanScaleLink}
         onBscanScaleLinkChange={setBscanScaleLink}
         cscanRowScales={cscanRowScales}
@@ -1843,6 +1879,7 @@ export default function App() {
         bscanScaleScope={bscanScaleScope}
         bscanShowGate={bscanShowGate}
         bscanScaleLink={bscanScaleLink}
+        cscanProjection={cscanProjection}
         cscanRowScales={cscanRowScales}
         cscanGridScales={cscanGridScales}
         cscanLiveResult={cscanLiveProcessed.result}

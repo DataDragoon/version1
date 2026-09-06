@@ -371,3 +371,81 @@ export function gridRoverExtent(params, origin) {
     yMax: origin.y,
   };
 }
+
+// ── Plan-view layout ────────────────────────────────────────────────────────
+//
+// Shared by the C-scan plan view and by the B-scan pane below it, so the two
+// images line up column for column: the B-scan places each position at the x of
+// the grid cell it was captured at, which is only possible if both derive that
+// x from one function.
+//
+// `projection` selects the scale and, to scale, the placement:
+//   { toScale: false }                              fit the grid inside the plot box
+//   { toScale: true, pxPerCm, leftPx, topPx }       exact scale, exact placement
+//
+// To-scale exists for projecting the plan view back onto the wall it was swept
+// over. Its whole point is that the mapping does NOT depend on the pane size,
+// so the operator tunes one constant here plus the projector's own zoom and the
+// image lands on the real geometry. A fitted scale would silently re-scale
+// whenever the window or the pane split changed, which is exactly what makes an
+// aligned projection drift.
+//
+// `leftPx` / `topPx` place the grid's top-left corner relative to the top-left
+// of the VIEWPORT -- the whole area right of the sidebar -- not of this canvas.
+// `canvasOffset` is where this canvas sits inside that viewport, and subtracting
+// it is what makes the placement hold still when the Live Sweep pane appears or
+// a row's B-scan opens underneath: the canvas moves, the grid does not. Measured
+// from the canvas instead, every pane change would slide the projected image.
+export const CSCAN_PAD = { top: 24, bottom: 38, left: 52, right: 64 };
+
+export function cscanLayout(w, h, params, projection, canvasOffset) {
+  const pad = CSCAN_PAD;
+  const plotW = w - pad.left - pad.right;
+  const plotH = h - pad.top - pad.bottom;
+
+  const hCount = Math.max(1, params.hCount);
+  const vCount = Math.max(1, params.vCount);
+  // A single line in an axis still needs a finite cell size to draw.
+  const cellSpanX = params.hStep > 0 ? params.hStep : 1;
+  const cellSpanY = params.vStep > 0 ? params.vStep : 1;
+  const spanX = hCount * cellSpanX;
+  const spanY = vCount * cellSpanY;
+
+  const fitScale = Math.min(plotW / spanX, plotH / spanY);
+  const toScale = !!(projection && projection.toScale)
+    && Number.isFinite(projection.pxPerCm) && projection.pxPerCm > 0;
+  const scale = toScale ? projection.pxPerCm : fitScale;
+
+  const gridW = spanX * scale;
+  const gridH = spanY * scale;
+
+  // Fitted, the grid is centred in the plot box and the axes get their margins.
+  // To scale it is placed explicitly and may go anywhere on the canvas, so the
+  // clip box is the whole canvas -- reserving margins there would silently
+  // forbid placements the operator asked for.
+  const off = canvasOffset || { x: 0, y: 0 };
+  const leftPx = Number.isFinite(projection && projection.leftPx) ? projection.leftPx : 0;
+  const topPx = Number.isFinite(projection && projection.topPx) ? projection.topPx : 0;
+
+  const originX = toScale ? leftPx - off.x : pad.left + (plotW - gridW) / 2;
+  // Vertical grows upward: iy = 0 sits at the BOTTOM of the grid box, so the
+  // placed TOP edge is originY - gridH.
+  const originY = toScale ? topPx - off.y + gridH : pad.top + (plotH + gridH) / 2;
+
+  const clip = toScale
+    ? { x: 0, y: 0, w, h }
+    : { x: pad.left, y: pad.top, w: plotW, h: plotH };
+
+  return {
+    pad, plotW, plotH, scale, fitScale, toScale, gridW, gridH, originX, originY,
+    clip, canvasOffset: off,
+    cellW: cellSpanX * scale, cellH: cellSpanY * scale,
+    // True when any part of the grid falls outside the box that can show it --
+    // too big, or placed past an edge. The plan view clips and says so rather
+    // than re-fitting, because re-fitting is the silent re-scaling this mode
+    // exists to avoid.
+    overflows: toScale && (
+      originX < clip.x - 0.5 || originX + gridW > clip.x + clip.w + 0.5
+      || originY - gridH < clip.y - 0.5 || originY > clip.y + clip.h + 0.5),
+  };
+}
