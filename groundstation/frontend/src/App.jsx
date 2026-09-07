@@ -374,10 +374,10 @@ export default function App() {
   // changes whenever the head is re-mounted, so it is user-editable and
   // persisted rather than hardcoded.
   //
-  // Measured on the bench 2026-08-28: with the aperture against the wall (true
-  // zero standoff) the lidar reads 164.83 mm +/- 0.68. 160 keeps a 5 mm buffer
-  // so a real zero-standoff pose reports slightly positive rather than negative.
-  // Re-measure after any re-mount.
+  // Measured on the bench 2026-09-07 with the new antenna (80 mm aperture,
+  // 100 mm length): aperture against the wall, lidar reads 136-138 mm.
+  // 132 keeps a ~5 mm buffer so a real zero-standoff pose reports slightly
+  // positive rather than negative. Re-measure after any re-mount.
   //
   // Getting this wrong is not symmetric. A constant offset error *cancels
   // exactly* for a model trained and used under that same offset: the unwind
@@ -392,7 +392,7 @@ export default function App() {
   // out-of-span reporting in sfcwProcessed below.
   const [lidarOffsetMm, setLidarOffsetMmState] = useState(() => {
     const v = parseFloat(localStorage.getItem('lidar_antenna_offset_mm'));
-    return Number.isFinite(v) ? v : 160;
+    return Number.isFinite(v) ? v : 132;
   });
   const setLidarOffsetMm = useCallback((v) => {
     localStorage.setItem('lidar_antenna_offset_mm', String(v));
