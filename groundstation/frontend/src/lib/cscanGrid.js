@@ -448,6 +448,76 @@ export function gridRoverExtent(params, origin) {
   };
 }
 
+// ── Continuous row traverse ─────────────────────────────────────────────────
+//
+// A continuous raster drives a whole row in ONE move and bins the sweeps that
+// land along the way, instead of stopping at every cell. See lib/roverTrack.js
+// for why that is now the right thing to do and what bounds it.
+
+// How far past each end of a row the traverse runs, in mm.
+//
+// Two things have to fall OUTSIDE the grid, or they corrupt the cells at the
+// ends of every row:
+//
+//  * THE RAMPS. Position between two status frames is interpolated linearly,
+//    which is exact at constant velocity and wrong by half an acceleration
+//    term while accelerating -- 2.07 mm at 500 mm/s^2 over one 91 ms status
+//    gap, which at a 5 mm pitch is most of a cell. `v^2/2a` is the distance
+//    the ramp itself occupies.
+//  * THE LAST STATUS GAP. A sweep is only binned once a status frame arrives
+//    that brackets it in time (the track never extrapolates), so the final
+//    ~91 ms of a traverse resolves after the rover has already stopped. The
+//    margin makes sure that stretch is overrun rather than grid.
+//
+// Cheap either way: 10.6 mm at 25 mm/s, 30 mm at 100 mm/s -- a few tenths of a
+// second per row against a row that takes tens of seconds.
+export function traverseOverrun(speedMmS, accelMmS2) {
+  const v = Math.max(0, Number(speedMmS) || 0);
+  const a = Math.max(1, Number(accelMmS2) || 500);
+  const ramp = (v * v) / (2 * a);
+  const margin = Math.max(10, v * 0.2);
+  return ramp + margin;
+}
+
+// Geometry of one continuous row traverse, in the rover's frame.
+//
+// `rowFromTop` counts rows in CAPTURE order (0 = the origin's row, the top
+// one), matching roverCellForIndex: even rows run left to right, odd rows run
+// back right to left. Cell coordinates stay in the display frame, so `iy`
+// still counts up from the bottom and everything downstream is unchanged.
+export function rowTraverse(rowFromTop, params, origin, overrunMm = 0) {
+  const h = Math.max(1, params.hCount);
+  const v = Math.max(1, params.vCount);
+  const r = Math.max(0, Math.min(v - 1, rowFromTop | 0));
+  const dir = r % 2 === 0 ? 1 : -1;
+  const iy = v - 1 - r;
+  const stepMm = params.hStep * 10;
+  const xAt = (ix) => origin.x + ix * stepMm;
+  const firstX = xAt(dir > 0 ? 0 : h - 1);
+  const lastX = xAt(dir > 0 ? h - 1 : 0);
+  return {
+    rowFromTop: r,
+    iy,
+    dir,
+    y_mm: origin.y - r * params.vStep * 10,
+    firstX,
+    lastX,
+    entryX: firstX - dir * overrunMm,
+    exitX: lastX + dir * overrunMm,
+  };
+}
+
+// The rectangle a CONTINUOUS raster actually reaches: the grid plus the
+// overrun at both ends of every row. Checked against the soft limits before a
+// move is issued, exactly like gridRoverExtent -- there are no endstops, and
+// `move_to_mm` clamps silently while still reporting the move `completed`, so
+// a traverse hanging over the end of a rail would raster a row that is not the
+// one on screen and pile duplicate sweeps into the cell at the limit.
+export function gridRoverExtentContinuous(params, origin, overrunMm = 0) {
+  const ext = gridRoverExtent(params, origin);
+  return { ...ext, xMin: ext.xMin - overrunMm, xMax: ext.xMax + overrunMm };
+}
+
 // ── Plan-view layout ────────────────────────────────────────────────────────
 //
 // Shared by the C-scan plan view and by the B-scan pane below it, so the two

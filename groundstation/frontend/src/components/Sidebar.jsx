@@ -92,7 +92,7 @@ export default function Sidebar({
   bscanParams,
   onBscanParamsChange,
   onBscanAction,
-  roverScan,
+  roverScan, roverRowStats, sweepPeriodMs,
   bscanScaleMode,
   onBscanScaleModeChange,
   bscanDisplayMode,
@@ -179,6 +179,12 @@ export default function Sidebar({
   bgModelTrainResult,
   bgModelTrainError,
   bgModelSweepsPerCapture,
+  bgContinuousActive,
+  bgContinuousStats,
+  bgContBinMm,
+  onBgContBinChange,
+  bgContMaxSpeed,
+  onBgContMaxSpeedChange,
   onBgModelSweepsChange,
   onBgModelAction,
   bgScanMode,
@@ -336,6 +342,12 @@ export default function Sidebar({
                   trainResult={bgModelTrainResult}
                   trainError={bgModelTrainError}
                   sweepsPerCapture={bgModelSweepsPerCapture}
+                  continuousActive={bgContinuousActive}
+                  continuousStats={bgContinuousStats}
+                  contBinMm={bgContBinMm}
+                  onContBinChange={onBgContBinChange}
+                  contMaxSpeed={bgContMaxSpeed}
+                  onContMaxSpeedChange={onBgContMaxSpeedChange}
                   onSweepsChange={onBgModelSweepsChange}
                   stopFreq={sfcwParams.stopFreq}
                   onModelAction={onBgModelAction}
@@ -422,6 +434,8 @@ export default function Sidebar({
                   roverStatus={roverStatus}
                   sendRover={sendRover}
                   roverScan={roverScan}
+                  roverRowStats={roverRowStats}
+                  sweepPeriodMs={sweepPeriodMs}
                   params={bscanParams}
                   onParamsChange={onBscanParamsChange}
                   scaleMode={bscanScaleMode}

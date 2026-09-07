@@ -682,6 +682,150 @@ go). Keeping both is the point: slip and missed steps are the only error sources
 observe, so the two must not be assumed equal. Export is **v6**; import still reads v3-v5.
 Import deliberately does NOT restore `scanMode` -- it is a live control, not data.
 
+## Continuous rover C-scan raster (2026-09-07)
+
+The C-Scan panel's Rover mode gained a **Row traverse** toggle: `continuous` (the new
+default) drives a whole row in ONE move and bins the sweeps by the position they were
+taken at; `stepped` is the original stop-at-every-cell raster, kept unchanged as the
+fallback for ruling the continuous path out. `lib/roverTrack.js` (pure) holds the
+position track, the binning and the sampling arithmetic; `useRoverScan.js` grew
+`row_start -> row_settle -> traversing` beside the existing `moving -> settling ->
+capturing`. **Both walk the grid in the same order** -- `rowTraverse()` reproduces
+`roverCellForIndex()` cell for cell (checked) -- so a grid captured either way is the
+same record and feeds SAR / 2D Map / export identically.
+
+**Why it is now the right thing to do.** The stepped flow was designed around a 550 ms
+sweep, where any motion smeared a sweep across frequency. At the 27.5 ms NIOS sweep the
+per-cell cost is ~93% overhead: `MIN_MOVE_MS` 500 + `roverSettleMs` 200 + one
+deliberately discarded in-flight sweep (`skip: 1`), against ~28 ms of actual sweeping.
+All of it is gone, and the sweeps that used to be thrown away between cells become free
+coherent averaging. Measured in simulation, 1 m row at 5 mm pitch: **stepped 76 s at 1
+sweep/cell; continuous at 20 mm/s 50 s at 8.3 sweeps/cell (+9.2 dB)**; at 100 mm/s a
+3-row 11-cell grid completes in 6.9 s.
+
+### Smear is NOT the limit any more -- spatial sampling is
+
+Motion during a sweep is a phase error bilinear in (step index, velocity). The linear
+term is range-Doppler coupling, an apparent range SHIFT of `(f_start/B) * D * sin(theta)
+~= 0.65 * D` where `D` is the distance moved during the **20.9 ms RF window** (51 steps x
+`NIOS_MIN_DWELL` = 4096 samples at 10 Msps -- note that is the per-STEP dwell, **not**
+`RX_BUFFER_SAMPLES = 2048`, which is the host-driven path's DMA granularity). The
+quadratic term is the actual defocus.
+
+| v (mm/s) | moved per sweep | range shift | quadratic phase |
+|---|---|---|---|
+| 20 | 0.42 mm | 0.27 mm | 0.05 rad |
+| 100 | 2.09 mm | 1.37 mm | 0.26 rad |
+| 150 (X axis max) | 3.13 mm | 2.05 mm | 0.39 rad |
+
+Against a 50 mm range cell and the ~0.79 rad (pi/4) where defocus starts to matter,
+**both are inside budget at any speed this rail can reach.** At 550 ms the quadratic term
+was 3.4 rad at 50 mm/s, which is why the rig had to stop. Range-Doppler coupling also
+says where a sweep "is": the apparent range sits at `f_start/B` = 2/3 through the sweep
+rather than at its midpoint, so the phase centre is 65% of the way through the RF window.
+
+**What binds instead is one number: `sweep spacing = v * T_sweep`** -- 0.69 mm at
+25 mm/s, 2.75 mm at 100, 4.12 mm at 150. **A grid pitch finer than that leaves cells
+empty however long the scan runs**; those sweeps were never taken. Consequently **pitch,
+speed and averaging depth are ONE resource, not three**: `sweeps/cell = pitch /
+(v * T_sweep)`. Pick two. The panel shows spacing, sweeps/cell, coherent gain, row time
+and grid time live, and warns when the pitch is starved.
+
+**Finer is not better past a point.** Spatial Nyquist for the imaging is
+`dx <= lambda_min/(4 sin(theta_max))` = 15-21 mm at 5 GHz, so **5 mm already carries 3x
+margin**; below that, halving the pitch buys no resolution and costs 3 dB of per-cell SNR
+by splitting the same sweeps across twice as many cells. 1 mm is 15x oversampled and
+needs v <= 36 mm/s just to fill one sweep per cell.
+
+### Time base: one clock, and one scalar
+
+Both streams are already stamped on the **Pi's** clock -- `sfcw_result.timestamp` and
+`rover_status.last_status_at` -- so the association never touches `performance.now()`,
+which would fold two independent websocket latencies into the answer. The track
+**interpolates only and never extrapolates**: a sweep newer than the newest position
+frame waits (typically <91 ms, one status period at ~11 Hz) for a frame that brackets it.
+Extrapolating on the reported velocity is exact at constant velocity and wrong by half an
+acceleration term -- **2.07 mm at 500 mm/s^2 over one status gap** -- precisely at the
+ends of a row, where the ramps are.
+
+What remains is a single constant, `roverLatencyMs` (default 0): a sweep is stamped ~14 ms
+after its own phase centre, a status frame after its WiFi transit, and their **difference**
+is all that matters. **It is a BIAS, not noise** -- its sign follows the direction of
+travel, so in a snake it displaces alternate rows oppositely and a straight feature comes
+out as a zigzag of `2*v*tau`. Verified in simulation: 40 ms of unmodelled latency at
+100 mm/s gives per-row bias **+4.20 / -3.70 / +4.30 mm** (sign flipping with direction,
+i.e. an 8 mm zigzag), collapsing to **+0.25 / +0.25 / +0.20 mm** -- a harmless constant
+offset -- once corrected.
+
+**Measure it from ONE out-and-back pass over a row**: the spatial lag between the two
+directions is exactly `2*v*tau`. Same trick this file already proposes for the LiDAR
+timestamp. Note that nothing in the pipeline combines rows coherently today (C-scan
+focusing is per row, SAR treats the capture as one line), so an uncorrected tau costs only
+the plan-view zigzag -- it does not defocus anything.
+
+### Details that are load-bearing
+
+- **The traverse OVERRUNS both ends of every row** (`traverseOverrun` = `v^2/2a` plus
+  `max(10 mm, 0.2*v)`; 10.6 mm at 25 mm/s, 30 mm at 100). Two things must fall outside the
+  grid: the ramps, where interpolation between status frames is wrong by the acceleration
+  term above, and the last ~91 ms of the traverse, which only resolves after the rover has
+  stopped. **A grid whose overrun leaves the rail is refused, not clamped** --
+  `gridRoverExtentContinuous` is what the soft-limit check uses in this mode, and the
+  refusal names the run-up.
+- **Cells are keyed on POSITION, never arrival order.** `Math.round((x - originX)/pitch)`
+  is the half-pitch rule; a sweep landing outside the grid is dropped, not clamped. The
+  two snake directions visit the same columns in opposite orders and a stuttered link can
+  skip a bin, so order means nothing here.
+- **The scan speed IS the rail's max speed for the duration**: `x_max_speed` is pushed via
+  `rover_set_config` at `beginRaster` and restored by `finish()` on every exit path.
+  `set_config` **persists on the Pi**, so failing to restore would quietly slow every
+  later nudge and jog.
+- **A partial row is harvested on ANY end** -- completion, operator stop, e-stop, link
+  loss, or the sweep dying mid-row. A row is a minute of driving; same reasoning as the
+  BG-model continuous capture.
+- **Resume is by ROW, not by cell count.** A row emits however many cells its bins filled,
+  so the flat capture count is not a row counter; `capturedRows` is the number of distinct
+  `grid_iy` present in the data.
+- **Watch the HOLE, not the fill count.** The panel reports the largest run of consecutive
+  empty columns, which is what decides whether a row is usable -- same reason the BG-model
+  continuous capture watches Hole rather than Span.
+- Cells carry `rover_x_mm` (mean of the interpolated positions of the sweeps in that cell)
+  beside `rover_target_x_mm` (the column centre), plus a new **`rover_x_std_mm`** -- the
+  aperture the coherent average was actually taken over. At a 10 mm bin that aperture
+  costs <= 1.65 dB even at grazing incidence, against the 8-13 dB the averaging buys; at a
+  50 mm bin it would be -15.6 dB with a null inside the visible region, which is another
+  reason 50 mm pitch was the wrong place to be.
+- **`buildCellRecord()` in `App.jsx` is now shared by both capture paths** and pools
+  provenance from the looks themselves rather than taking it as an argument. It only ever
+  emits the fields it lists -- spreading a whole look would overwrite `h_cal_real/imag`
+  with a single sweep and silently undo the averaging, which is a bug that was live in the
+  first draft.
+- The new params ride along in the v7 export as provenance but are **not restored on
+  import**, exactly like `scanMode`: they are live controls, not data.
+
+### Verification
+
+`lib/roverTrack.js` and the traverse geometry are pure and were exercised head-first from
+node, and the **real state machine was driven against a simulated ramped gantry and a
+36 Hz sweep stream** (React shimmed to four hooks, timers stubbed, fake clock): a full
+11x3 raster fills all 33 cells in `roverCellForIndex` order with worst |position - column
+centre| of 0.75 mm; the latency bias behaves as derived (above); a stop mid-row harvests
+the partial row and restores the speed; 150 mm/s against a 1 mm pitch reports holes rather
+than hiding them; 20 mm/s at 5 mm pitch gives 8.3 sweeps/cell against the predicted 9.1;
+stepped mode is unchanged; and an overrun that leaves the rail is refused. There is still
+no test runner in this repo, so these were throwaway scripts. `vite build` passes.
+
+**NOT yet done on hardware, and these are the things to check first:**
+1. **Does motion itself cost anything?** Unknown -- vibration on rolling wheels is the one
+   term no arithmetic here can reach. Scan one row out and back at speed and score the two
+   passes cell by cell; compare against a stepped pass over the same row.
+2. **`roverLatencyMs` is 0 until measured.** The same out-and-back pass gives it, and
+   running it three times says whether it REPEATS -- latency does, mechanical hysteresis
+   on a rubber-wheel drive reversing direction may not. If it does not repeat, snake is
+   unusable and rows have to be driven unidirectionally with a fly-back (which costs
+   `v_scan/150` of the row time -- 17% at 25 mm/s but 100% at 150).
+3. **Is the ~11 Hz status rate really 11 Hz under load?** Everything above assumes it.
+
 ## Imaging Bench Panel — Offline Effect Comparison (2026-08-23)
 
 Panel id `imaging` (`ImagingPanel.jsx` + `ImagingDisplay.jsx` + `lib/imagingEffects.js`),
@@ -1222,6 +1366,190 @@ entire background sits within 2–6 cm of range, and 3 GHz of bandwidth gives ~5
 resolution. The "gated" metric therefore tracks the full-band metric closely. Separating a
 target from the face needs more bandwidth or aperture, not better background subtraction.
 
+## BG model continuous capture: wave the module, bin by standoff (2026-09-07)
+
+Manual BG-model capture used to be park / press Capture / hold still for 40 sweeps /
+move / repeat. That protocol existed because a sweep was ~550 ms, so any motion during
+one smeared it across frequency. At **36 Hz a sweep is 27.5 ms**, so the constraint has
+inverted: the positions can be swept continuously and hand-placement -- which was capping
+median gap at ~5 mm, and density is the dominant accuracy lever at ~12 dB of LOO
+suppression per doubling of gap -- stops being the bottleneck.
+
+**Continuous Capture** toggle in the BG Model panel's Capture section, manual mode only.
+Start it, sweep the module slowly across the span, stop it. Each sweep is filed under the
+standoff it was actually taken at into a fixed bin, and **each occupied bin becomes exactly
+one "capture" in the existing `{samples, stats}` shape** -- so coverage analysis, export
+v2, `buildInterpModel`, `evaluateLoo` and the trainer are all untouched and cannot tell a
+continuous position from a hand-placed one. `lib/bgContinuous.js` (pure),
+`createContinuousAccum`; App state is `bgContinuousRef` / `bgContinuousActive` /
+`bgContinuousStats`.
+
+### Standoff is INTERPOLATED from the lidar track, and this is the whole accuracy story
+
+The TF-LC02 measures at 11-17 Hz against 36 Hz sweeps, so most sweeps contain no new
+measurement and `App.jsx` carries the last one forward (`LIDAR_CARRY_MS`, 1 s) so the live
+display does not strobe. Stapling that carried reading to a MOVING sweep is a pure lag,
+and therefore a **direction-dependent bias** -- the sign flips when the pass reverses, so
+an out-and-back wave lays the same physical standoff down in two places, which is exactly
+what a coherent background model cannot absorb.
+
+Measured on a simulated 60 s out-and-back pass at 25 mm/s (14 Hz lidar with 0.4 mm noise,
+36 Hz sweeps, scored against known truth):
+
+| standoff from | rms error | out-and-back bias | sweeps kept |
+|---|---|---|---|
+| carried reading, unfiltered | 0.851 mm | **1.100 mm** | 100% |
+| fresh-reading filter (`lidar_n > 0`) | 0.445 mm | 0.016 mm | **38%** |
+| **interpolated (shipped)** | **0.322 mm** | 0.041 mm | **99%** |
+
+**The fresh-reading filter is not a bad answer and it is worth understanding why, because
+it is not obvious:** a measurement that landed inside the sweep's own window is on average
+at that sweep's midpoint, so requiring one gives an UNBIASED standoff, not merely a
+bounded-lag one. What it costs is that only ~38% of sweeps have one, plus +/- half a sweep
+period of jitter on the survivors. Interpolating between the measurement before the sweep
+and the one after is unbiased as well, keeps ~99% of sweeps, and is quieter on top because
+it averages two measurements where the filter takes one. On the same simulation the
+resulting model's LOO suppression went **39.8 -> 46.2 dB**.
+
+The first version of this panel shipped the fresh-reading filter. Both are correct; the
+interpolation is 2.6x the looks per bin and 28% less standoff error for the same run.
+
+**What is deliberately NOT corrected: the sensor's own publication lag** -- the fixed
+offset between the middle of its integration window and the value appearing on the wire.
+That is a constant time offset, so it is again a direction-dependent position bias, and it
+has never been measured. Rather than guess it, every accepted sweep records
+`lidar_v_mm_s` (SIGNED), so an out-and-back run contains both directions at the same
+standoff and the lag can be solved for offline from an export: find the tau that makes the
+outbound and return knots agree.
+
+### Why the Pi now polls the lidar at 200 Hz, and why that is NOT "more measurements"
+
+Asked 2026-09-07: why not raise `LIDAR_POLL_HZ` from 20 to 40 to get more data? **You
+cannot -- 11-17 Hz is the sensor's own measurement cadence.** Already measured directly:
+polling at 584 Hz gives a **median run of 34 identical consecutive polls** (584/34 = 17 Hz
+of real measurements), and Phase 1.1 measured **17.2 Hz at 165 mm, 11.5 Hz at 262 mm,
+11.5 Hz at 340 mm**. That it gets SLOWER with distance is the tell: adaptive integration
+time, not a settable frame clock. There is no register to write and no way to ask for more
+photons.
+
+What a fast poll DOES buy is a tight **timestamp**, which is what the interpolation needs.
+At 20 Hz we learned a measurement existed up to 50 ms late (1.25 mm at 25 mm/s); at 200 Hz
+it is 5 ms. So `LIDAR_POLL_HZ = 200`, and it is free -- measured 2026-08-27 at 584 Hz:
+broadcast 48.35 vs 48.79 Hz, IMU rate slightly BETTER at 33.83 vs 32.66 Hz.
+
+**The change that makes that safe is that `lidar_seq` now counts MEASUREMENTS, not reads.**
+It advances only when the value CHANGES (or when a stable value ages past
+`LIDAR_STABLE_REPUBLISH_S = 0.25`). Publishing 200 reads/s of a 14 Hz value would have made
+`App.jsx`'s `lidar_n` count duplicates and `lidar_std` measure the spread of a repeated
+number -- the "repeats deflate the spread" fiction the old 20 Hz cap existed to avoid. The
+new counter is also more honest than the old one WAS at 20 Hz, where 20-40% of reads were
+already repeats.
+
+Value-change detection is unreliable on a static target (1 mm quantisation against
+0.66-0.78 mm raw sigma, so ~40% of consecutive measurements land on the same integer) --
+hence the republish timeout, chosen well above the slowest observed internal period (~87 ms)
+so it can never fire between two genuinely-new measurements. Where it fires, the true
+spread over the window really is ~zero, so the repeat is not a lie.
+
+### The two filters that remain
+
+1. **NOT BRACKETED.** No interpolant exists if the sweep's time is not spanned by two
+   measurements within `MAX_BRACKET_GAP_S = 0.25`. The lidar going quiet is real (bursts of
+   invalid returns at a poor target angle are documented at 30-40% of reads on this bench),
+   and a straight line across the hole would invent a trajectory. Dropped, never
+   extrapolated -- including the last sweep or two of every run, which have no measurement
+   after them.
+2. **TOO FAST.** Frequency steps are sequential, so standoff changing DURING a sweep is a
+   phase ramp across the band -- a smear interpolation cannot fix either, because the sweep
+   genuinely does not describe one position. 40 mm/s at 27.5 ms is 1.1 mm. **Speed is a
+   least-squares slope over a 350 ms window of the track, not a consecutive difference** --
+   0.4 mm of lidar noise across a 70 ms gap is ~6 mm/s of phantom speed on its own.
+   Verified: a static rig with realistic noise gives zero motion rejects at a 40 mm/s limit.
+   `0` disables the gate.
+
+### Wave speed sets PER-PASS granularity; passes then fill the gaps
+
+Within one pass a measurement lands every `v * lidar_period`. Measured: a single 12 mm/s
+pass leaves a **1 mm** hole, a single 40 mm/s pass leaves **13 mm**. But over many passes
+it fills anyway -- the lidar cadence and the pass timing are incommensurate, so each pass
+samples different phases, and a 60 s run at 40 mm/s closes to a 1 mm hole just like the
+slow one. **A fast wave is not broken, it just needs more passes.** Watch Hole, not Span;
+Span only says how far the pass reached.
+
+### Numbers and the knob that is not obvious
+
+Simulated 60 s pass, 25 mm/s over 120 mm: **2184 sweeps -> 2152 kept (99%) -> 121 bins at
+1 mm, largest hole 1 mm**, median bracket 71 ms, against ~30 hand-placed positions at
+~5 mm. Build 7 ms, `evaluateLoo` 179 ms, model JSON 0.50 MB (n^2*S, so watch it if bin
+width ever goes far below 1 mm over a wide span).
+
+**Bin width floors at 0.5 mm because `bgModelInterp.js` `MERGE_MM` is 0.5** -- finer bins
+cannot make a finer model, they just split the same looks across knots the interpolator
+then re-merges with fewer sweeps each. Note the knot count can also come out **below** the
+bin count: a knot sits at the MEAN of its bin's samples, not at the bin centre, so two
+adjacent bins can land inside 0.5 mm of each other and get merged. Harmless.
+
+**The trade against static capture is looks per knot, and it is worth taking.** A static
+position gets 40 sweeps; a bin in the run above gets ~18. That costs `10*log10(40/18)` =
+3.5 dB off a measurement-noise term worth only ~5 dB in the first place (the 2026-08-28
+regime decomposition: single-sweep noise 5.16 dB, standoff noise 0.37 dB), while buying 2+
+doublings of density at ~12 dB each. If a run comes out thin, pass again -- do not raise
+the cap expecting it to fill bins that were never visited.
+
+### Wiring notes
+
+- **Two websockets, one clock.** The lidar track arrives on 9001 and the sweeps on 9003,
+  and they are matched on the Pi's `time.time()` -- `lidar_ts` from `stream.py` and
+  `sfcw_result.timestamp` from `sfcw_engine.py` are the same clock. Do not switch either
+  to `time.monotonic()` without fixing the other.
+- **The sweep's own timestamp is stamped at its END**, so the interpolation asks for the
+  standoff at `timestamp - period/2`, with the period a running median of adjacent sweep
+  intervals (median, not mean, so one stalled frame does not move it -- same choice
+  `Viewport.jsx`'s `useSweepRate` makes). 14 ms at 36 Hz, i.e. 0.35 mm at 25 mm/s -- the
+  same order as the lidar's own noise, so worth removing rather than ignoring.
+- **A run's first sweeps must NOT fall through to the legacy path.** The track is empty
+  until the first measurement lands, ~14 sweeps at 36 Hz, and filing those by their carried
+  standoff is the exact error this module exists to remove. Sweeps are held pending, and
+  the legacy path latches only after `LEGACY_DECIDE_S = 1.5` of sweeps with no measurement
+  at all (or at flush), which is a Pi that does not publish `lidar_ts`. The panel says so
+  when it happens.
+- The accumulator is a **ref**, and the panel is fed by a 250 ms interval, because a
+  per-sweep `setState` would re-render the sidebar 36 times a second to move a counter.
+  Same reason `sfcwDynamicScale` and the C-scan layout are refs.
+- **The run is harvested on ANY end** -- the toggle, the session stopping, a sweep error
+  (all three collapse to `sfcwRunning` going false) -- not only on the toggle. A minute of
+  waving is expensive to redo and a dropped session is exactly when losing it would hurt.
+- Continuous captures carry a `batch` id and **Undo Last drops the whole run**, since
+  undoing a 120-bin harvest one bin at a time is not a control anyone would use.
+- Continuous and the static per-position capture are mutually exclusive, both in the UI
+  and guarded in `handleBgModelAction`.
+- Each stored sample keeps `lidar_standoff_live_mm` (what the live path would have said)
+  beside the interpolated `lidar_standoff_mm`, plus `lidar_v_mm_s` and `lidar_bracket_s`.
+- `analyzeCoverage` is memoized in the panel and the per-position row list is capped at 80
+  rows: the panel re-renders at the LIDAR rate (the live standoff readout), and a
+  continuous run turns 30 rows into a few hundred.
+- Rover mode is unchanged; continuous is manual-only (the rover already places positions
+  precisely, which is the problem continuous exists to solve).
+
+### Verification
+
+`lib/bgContinuous.js` is pure and was exercised head-first from node (53 checks: the
+interpolant against hand-computed values, both no-extrapolation directions, refusal to
+interpolate across a quiet lidar, the sweep-midpoint correction, the motion gate at 200 vs
+20 mm/s and its signed velocity, a static rig with 0.4 mm lidar noise giving zero false
+motion rejects, binning and the cap, negative standoffs, capture ordering, hole detection
+distinct from span, the legacy latch and that a run's start is NOT given to it, the
+bin-width floor, the three-arm accuracy comparison above, per-pass vs multi-pass hole
+filling, and a full 60 s simulated pass built through `buildInterpModel` + `evaluateLoo`).
+There is still no test runner in this repo, so these were throwaway scripts. `vite build`
+passes and `stream.py` parses.
+
+**Not yet run on hardware.** Three things to check on the bench: that the 200 Hz poll and
+measurement-counting `lidar_seq` behave as expected in the live stream (watch the panel's
+Lidar readout -- median bracket should sit at 60-90 ms), that "no bracket" rejects stay
+near zero, and that a hand pass can be held under 40 mm/s. If the motion reject count is
+large, slow down before raising the limit: it is a smear budget, not a preference.
+
 ## Background subtraction: standoff instrumentation and the false-target hunt (2026-08-28)
 
 Investigating false targets (spurious returns where there is nothing) from the Akima
@@ -1266,6 +1594,15 @@ claim that the earlier 164 mm noise characterization was "measured at the wrong 
   (48.79 → 48.35 Hz), IMU update rate unchanged/slightly better (**32.66 → 33.83 Hz**).
 - Packet now carries `lidar_seq` (increments per *successful read*) and `lidar_ts`. At
   20 Hz the seq sequence seen by a client is contiguous — every reading reaches a packet.
+
+**SUPERSEDED 2026-09-07 on both counts: `LIDAR_POLL_HZ` is now 200, and `lidar_seq`
+increments per distinct MEASUREMENT rather than per read.** The reasoning above is still
+correct as far as it goes — polling faster genuinely cannot produce more measurements — but
+it treated the poll rate as buying only data, when it also buys the measurement's
+TIMESTAMP, which is what continuous BG capture interpolates against. Publishing every read
+at 200 Hz would have reintroduced exactly the `lidar_n`/`lidar_std` fiction this section
+describes, which is why the counter had to change with it. See "BG model continuous
+capture" below.
 
 `App.jsx`:
 - `lidarAccumRef` dedupes by `lidar_seq` before averaging. Measured against live packets:

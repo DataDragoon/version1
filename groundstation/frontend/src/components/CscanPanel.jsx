@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { cn } from '@/lib/utils';
 import { Section, InfoTile } from './Sidebar';
-import { orderedCellForIndex, gridStats, gridRoverExtent, BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
+import { orderedCellForIndex, gridStats, gridRoverExtent, gridRoverExtentContinuous,
+  traverseOverrun, BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
+import { samplingFor, NOMINAL_SWEEP_MS } from '@/lib/roverTrack';
 import { listDisplays } from './ProjectorWindow';
 
 const LIDAR_AVG_WINDOW = 20;
@@ -13,6 +15,9 @@ const PHASE_TEXT = {
   moving: 'Moving to the next cell',
   settling: 'Settling',
   capturing: 'Sweeping',
+  row_start: 'Driving to the start of the row',
+  row_settle: 'Settling before the row',
+  traversing: 'Scanning the row',
 };
 
 export default function CscanPanel({
@@ -26,12 +31,13 @@ export default function CscanPanel({
   scaleScope, onScaleScopeChange, rowScales, showGate, onShowGateChange,
   scaleLink, onScaleLinkChange, gridScales, liveDiag,
   projection, onProjectionChange, projector, onProjectorChange,
-  roverConnected, roverStatus, sendRover, roverScan,
+  roverConnected, roverStatus, sendRover, roverScan, roverRowStats, sweepPeriodMs,
 }) {
   const {
     hStep, hCount, vStep, vCount, gateStart, gateEnd, metric,
     focusEnabled, focusAperture,
     scanMode, roverOriginRightMm, roverOriginBelowMm, roverSettleMs,
+    roverTraverse, roverSpeedMmS, roverLatencyMs,
   } = params;
 
   const update = (key, value) => {
@@ -150,8 +156,26 @@ export default function CscanPanel({
         y: roverStatus.y_mm + (Number(roverOriginBelowMm) || 0),
       }
     : null;
-  const extent = originPreview ? gridRoverExtent(params, originPreview) : null;
   const cfg = roverStatus?.config;
+  // Continuous is the default traverse; 'stepped' is the original
+  // stop-at-every-cell raster, kept for ruling the continuous path out.
+  const continuous = roverTraverse !== 'stepped';
+  // A continuous raster reaches past the grid at both ends of every row, so the
+  // run-up is part of what has to fit inside the soft limits.
+  const overrunMm = continuous ? traverseOverrun(roverSpeedMmS, cfg?.x_accel || 500) : 0;
+  const extent = originPreview
+    ? (continuous
+        ? gridRoverExtentContinuous(params, originPreview, overrunMm)
+        : gridRoverExtent(params, originPreview))
+    : null;
+
+  // What this speed and pitch will actually sample at. Sweep spacing is
+  // v * T_sweep and nothing can make it finer, so a pitch below it leaves cells
+  // permanently empty -- shown here rather than discovered as a field of holes.
+  const sampling = samplingFor(roverSpeedMmS, hStep * 10, sweepPeriodMs);
+  const starved = sampling.perCell < 1.2;
+  const rowSeconds = (hStep * 10 * Math.max(0, hCount - 1) + 2 * overrunMm)
+    / Math.max(1, roverSpeedMmS);
   const fitsLimits = !(extent && cfg && cfg.limits_enabled) || (
     extent.xMin >= cfg.x_min_mm && extent.xMax <= cfg.x_max_mm
     && extent.yMin >= cfg.y_min_mm && extent.yMax <= cfg.y_max_mm
@@ -360,14 +384,127 @@ export default function CscanPanel({
                 max={100000}
               />
             </div>
-            <EditableField
-              label="Settle before sweep"
-              value={roverSettleMs}
-              unit="ms"
-              onChange={(v) => update('roverSettleMs', Math.round(v))}
-              min={0}
-              max={10000}
-            />
+            {/* How a row is walked. Continuous drives the whole row in one
+                move and bins the sweeps by the position they were taken at;
+                stepped stops at every cell. At a 27.5 ms sweep the per-cell
+                overhead of stopping (a 500 ms arrival gate, a settle, and one
+                discarded in-flight sweep) is ~93% of the time spent, so
+                continuous is both faster and better averaged. */}
+            <div className="px-1 pt-2 text-[9px] font-medium uppercase tracking-wider text-[#555555]">
+              Row traverse
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              {[
+                { id: 'continuous', label: 'Continuous' },
+                { id: 'stepped', label: 'Stepped' },
+              ].map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => !scanning && update('roverTraverse', m.id)}
+                  disabled={scanning}
+                  className={cn(
+                    'px-2 py-1.5 rounded-lg border text-[10px] transition-colors',
+                    'disabled:cursor-not-allowed disabled:opacity-40',
+                    (m.id === 'continuous' ? continuous : !continuous)
+                      ? 'bg-[#6B9BD2]/10 border-[#6B9BD2]/40 text-[#6B9BD2]'
+                      : 'bg-[#0a0a0a]/60 border-white/5 text-white/40 hover:border-white/15',
+                  )}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+
+            {continuous ? (
+              <>
+                <div className="grid grid-cols-2 gap-2">
+                  {/* The only capture knob in continuous mode: speed sets the
+                      sweep spacing, and therefore how many sweeps each cell
+                      gets, because pitch / speed / averaging are one resource.
+                      Pushed to the rail as x_max_speed for the raster and
+                      restored afterwards. */}
+                  <EditableField
+                    label="Scan speed"
+                    value={roverSpeedMmS}
+                    unit="mm/s"
+                    onChange={(v) => update('roverSpeedMmS', Math.max(1, Math.round(v)))}
+                    min={1}
+                    max={150}
+                  />
+                  <EditableField
+                    label="Settle at row start"
+                    value={roverSettleMs}
+                    unit="ms"
+                    onChange={(v) => update('roverSettleMs', Math.round(v))}
+                    min={0}
+                    max={10000}
+                  />
+                </div>
+
+                <div className="grid grid-cols-3 gap-2">
+                  <InfoTile label="Sweep spacing" value={`${sampling.spacingMm.toFixed(2)} mm`} />
+                  <InfoTile label="Sweeps / cell" value={sampling.perCell.toFixed(1)} />
+                  <InfoTile
+                    label="Row time"
+                    value={rowSeconds < 100 ? `${rowSeconds.toFixed(1)} s` : `${(rowSeconds / 60).toFixed(1)} min`}
+                  />
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  <InfoTile
+                    label="Coherent gain"
+                    value={sampling.perCell >= 1 ? `${(10 * Math.log10(sampling.perCell)).toFixed(1)} dB` : '—'}
+                  />
+                  <InfoTile label="Move / sweep" value={`${sampling.smearMm.toFixed(2)} mm`} />
+                  <InfoTile
+                    label="Grid time"
+                    value={(() => {
+                      const t = (rowSeconds + 1.5) * Math.max(1, vCount);
+                      return t < 100 ? `${t.toFixed(0)} s` : `${(t / 60).toFixed(1)} min`;
+                    })()}
+                  />
+                </div>
+
+                {/* A pitch finer than the sweep spacing cannot be filled by
+                    scanning for longer -- those sweeps were never taken. */}
+                {starved && (
+                  <div className="px-2 py-1.5 rounded-lg border border-amber-500/30 bg-amber-500/5 text-[9px] leading-relaxed text-amber-400/80">
+                    At {roverSpeedMmS} mm/s a sweep lands every {sampling.spacingMm.toFixed(2)} mm,
+                    which is {sampling.perCell < 1 ? 'coarser than' : 'barely finer than'} the
+                    {' '}{(hStep * 10).toFixed(1)} mm cell pitch — cells will be left empty however long
+                    the scan runs. Slow to {Math.max(1, Math.floor(hStep * 10 / ((sweepPeriodMs || NOMINAL_SWEEP_MS) / 1000) / 2))} mm/s
+                    {' '}for two sweeps a cell, or widen the pitch.
+                  </div>
+                )}
+
+                {/* One scalar absorbs every constant latency in both chains.
+                    Measure it from one out-and-back pass over a row: the
+                    spatial lag between the two directions is 2*v*tau. */}
+                <EditableField
+                  label="Timing offset"
+                  value={roverLatencyMs}
+                  unit="ms"
+                  onChange={(v) => update('roverLatencyMs', Math.round(v))}
+                  min={-500}
+                  max={500}
+                />
+                <div className="px-2 text-[9px] text-white/40 leading-relaxed">
+                  Sweeps and rover positions are both stamped on the Pi's clock; this is the
+                  residual between them. It is a bias, not noise — its sign follows the
+                  direction of travel, so in a snake it bends alternate rows oppositely by
+                  {' '}{(2 * roverSpeedMmS * Math.abs(roverLatencyMs) / 1000).toFixed(2)} mm.
+                  Measure it by scanning one row out and back and correlating the two.
+                </div>
+              </>
+            ) : (
+              <EditableField
+                label="Settle before sweep"
+                value={roverSettleMs}
+                unit="ms"
+                onChange={(v) => update('roverSettleMs', Math.round(v))}
+                min={0}
+                max={10000}
+              />
+            )}
 
             {originPreview && (
               <div className="grid grid-cols-2 gap-2">
@@ -387,6 +524,7 @@ export default function CscanPanel({
               )}>
                 Rover travels X {extent.xMin.toFixed(0)} → {extent.xMax.toFixed(0)} mm,
                 {' '}Y {extent.yMax.toFixed(0)} → {extent.yMin.toFixed(0)} mm.
+                {continuous && ` Includes ${overrunMm.toFixed(0)} mm of run-up at each end of every row, so the ramps fall outside the grid.`}
                 {!fitsLimits && ' That is outside the soft limits — there are no endstops, so the scan is refused rather than clamped.'}
               </div>
             )}
@@ -441,7 +579,9 @@ export default function CscanPanel({
                     ? (scanning
                         ? (armed
                             ? PHASE_TEXT.ready
-                            : `${PHASE_TEXT[roverScan.phase] || 'Scanning'} — cell ${roverScan.index + 1}/${roverScan.total}`)
+                            : `${PHASE_TEXT[roverScan.phase] || 'Scanning'} — ${roverScan.traverse === 'continuous'
+                                ? `row ${(roverScan.row ? roverScan.row.index : 0) + 1}/${roverScan.rowsTotal}`
+                                : `cell ${roverScan.index + 1}/${roverScan.total}`}`)
                         : 'Sweeping — stop latches the E-stop')
                     : 'Sweeping continuously...')
                 : !sdrConnected ? 'SDR not connected'
@@ -571,6 +711,22 @@ export default function CscanPanel({
                   : gridFull ? `All ${stats.total} cells captured`
                   : `${captured} of ${stats.total} cells — start the scan to fill the rest`}
               </span>
+              {/* Which cells of the row have actually been filled, live. Watch
+                  the largest HOLE rather than the fill count: it is the run of
+                  consecutive empty columns that decides whether a row is
+                  usable, the same reason the BG-model continuous capture
+                  watches Hole rather than Span. */}
+              {continuous && scanning && roverRowStats && (
+                <span className={cn(
+                  'text-[10px] leading-relaxed',
+                  roverRowStats.maxHoleRun > 1 ? 'text-amber-400/80' : 'text-white/40',
+                )}>
+                  Row {roverRowStats.filled}/{roverRowStats.total} cells
+                  {' · '}{roverRowStats.perCell.toFixed(1)} sweeps/cell
+                  {roverRowStats.maxHoleRun > 0 && ` · hole ${roverRowStats.maxHoleRun}`}
+                  {roverRowStats.dropped > 0 && ` · ${roverRowStats.dropped} over cap`}
+                </span>
+              )}
             </div>
           </div>
         ) : (

@@ -14,10 +14,36 @@ from imu_calibration import CalibratedIMU
 
 clients = set()
 
-# The TF-LC02's internal measurement updates at ~17 Hz (measured 2026-08-27),
-# so polling faster only returns the same value again. 20 Hz stays just above
-# the sensor without spinning the worker thread at ~584 Hz for nothing.
-LIDAR_POLL_HZ = 20
+# The TF-LC02's internal measurement updates at ~11-17 Hz (measured 2026-08-27:
+# a median run of 34 identical consecutive polls at ~584 Hz; and 17.2 Hz at
+# 165 mm falling to 11.5 Hz at 340 mm, which is adaptive integration time, not a
+# settable frame clock). Polling faster CANNOT produce more measurements.
+#
+# It is still polled fast, at 200 Hz, and that is deliberate: the poll rate does
+# not set how many measurements exist, it sets how late we learn that one has
+# appeared. At 20 Hz that was up to 50 ms, which on a hand-swept module at
+# 25 mm/s is 1.25 mm of position error -- and a DIRECTION-DEPENDENT one, since
+# the sign flips when the sweep reverses, so an out-and-back pass lays the same
+# physical standoff down in two places. At 200 Hz it is 5 ms / 0.13 mm. The cost
+# was measured at 584 Hz (2026-08-27) and is nil: broadcast 48.35 vs 48.79 Hz,
+# IMU rate slightly BETTER at 33.83 vs 32.66 Hz.
+#
+# What makes that safe for everything downstream is that `seq` now counts
+# MEASUREMENTS, not reads -- see lidar_poll_loop. Publishing 200 reads/s of a
+# 14 Hz value would have inflated the groundstation's `lidar_n` and deflated
+# `lidar_std` into fiction, which is exactly the trap the 20 Hz cap was avoiding.
+LIDAR_POLL_HZ = 200
+
+# A poll whose value differs from the last is unambiguously a new measurement.
+# The converse is not true: on a still target two genuine measurements can land
+# on the same integer millimetre (raw sigma is 0.66-0.78 mm against 1 mm
+# quantisation, so identical pairs run ~40%). Rather than undercount, a reading
+# that has been stable for this long is republished as a new measurement -- it
+# IS a current reading of a static target, so stamping it "now" is correct, and
+# the case only arises when the true spread over the window really is ~zero.
+# Chosen well above the slowest observed internal period (~87 ms at 11.5 Hz) so
+# it cannot fire between two genuinely-new measurements.
+LIDAR_STABLE_REPUBLISH_S = 0.25
 
 
 async def register(ws):
@@ -59,34 +85,51 @@ async def imu_poll_loop(imu, state):
 
 async def lidar_poll_loop(lidar, state, rate=LIDAR_POLL_HZ):
     """Reads the LiDAR in its own loop, publishing the latest reading into
-    `state`. This is deliberately NOT awaited inline in sensor_loop's broadcast
-    loop: TFLC02.read_distance() blocks on a 100ms UART timeout whenever the
-    sensor doesn't answer, which happened to be true throughout the 2026-08-24
+    `state`.
+
+    Polled at LIDAR_POLL_HZ (200), which is far above the sensor's own 11-17 Hz
+    measurement rate ON PURPOSE -- see the constant for why: fast polling buys a
+    tight TIMESTAMP for each measurement, not more of them.
+
+    `seq` and `ts` therefore describe MEASUREMENTS, not reads. `seq` advances
+    only when the value changes (or when a stable value ages past
+    LIDAR_STABLE_REPUBLISH_S), and `ts` is stamped at that moment. This matters
+    to every consumer: App.jsx dedupes accumulated readings by `lidar_seq`, so
+    publishing every read at 200 Hz would have made `lidar_n` count duplicates
+    and `lidar_std` measure the spread of a value repeated -- the "repeats
+    deflate the spread" fiction the old 20 Hz cap existed to avoid. Counting
+    measurements is both faster to timestamp AND more honest than the old
+    per-read counter was at 20 Hz, where 20-40% of reads were already repeats.
+
+    This is deliberately NOT awaited inline in sensor_loop's broadcast loop:
+    TFLC02.read_distance() blocks on a 100ms UART timeout whenever the sensor
+    doesn't answer, which happened to be true throughout the 2026-08-24
     debugging above. Awaiting it directly in the broadcast loop caps the whole
     stream (IMU included) at ~10Hz regardless of `rate` -- confirmed by timing
     read_distance() in isolation. Running it here, in its own task via
     run_in_executor, means a slow or dead LiDAR only slows *this* loop; the
     broadcast loop below keeps running at its full requested rate using
-    whatever LiDAR reading was most recently published, stale or not.
-
-    Capped at LIDAR_POLL_HZ. Measured 2026-08-27: the driver will poll at
-    ~584 Hz but the TF-LC02's *internal* measurement only updates at ~17 Hz
-    (median run of 34 identical consecutive polls), so the extra ~567 polls/s
-    are duplicate reads that burn a worker thread and I2C/UART time for no new
-    information. `lidar_seq` increments only on a successful read, so the
-    groundstation can tell genuinely-new samples from repeats of the same
-    packet and average only distinct ones."""
+    whatever LiDAR reading was most recently published, stale or not."""
     loop = asyncio.get_running_loop()
     fail_streak = 0
     interval = 1.0 / rate if rate and rate > 0 else 0.0
+    last_dist = None
+    last_pub = 0.0
     while True:
         t0 = time.monotonic()
         try:
             dist = await loop.run_in_executor(None, lidar.read_distance)
             state['dist'] = dist
             if dist is not None:
-                state['seq'] += 1
-                state['ts'] = time.time()
+                now = time.time()
+                # A changed value is unambiguously a new measurement. An
+                # unchanged one is ambiguous, so it is republished only once it
+                # has outlived any plausible internal period.
+                if dist != last_dist or (now - last_pub) >= LIDAR_STABLE_REPUBLISH_S:
+                    state['seq'] += 1
+                    state['ts'] = now
+                    last_pub = now
+                last_dist = dist
             fail_streak = 0
         except Exception as e:
             fail_streak += 1
@@ -114,10 +157,12 @@ async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ):
     print(f"Streaming sensors at {rate}Hz on ws://0.0.0.0:9001")
 
     imu_state = {'accel': None, 'gyro': None, 'temp': None}
-    # seq increments once per *successful* read, so a consumer can dedupe the
-    # repeats that come from broadcasting faster than the LiDAR updates.
+    # seq increments once per distinct MEASUREMENT (see lidar_poll_loop), so a
+    # consumer can dedupe both the repeats that come from broadcasting faster
+    # than the LiDAR updates and the repeats that come from polling faster.
     lidar_state = {'dist': None, 'seq': 0, 'ts': None}
-    print(f"LiDAR polled at {lidar_rate}Hz (sensor updates internally at ~17Hz)")
+    print(f"LiDAR polled at {lidar_rate}Hz "
+          f"(sensor measures internally at ~11-17Hz; seq counts measurements, not polls)")
     poll_tasks = [asyncio.create_task(lidar_poll_loop(lidar, lidar_state, lidar_rate))]
     if imu is not None:
         poll_tasks.append(asyncio.create_task(imu_poll_loop(imu, imu_state)))
@@ -131,8 +176,9 @@ async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ):
                 'gyro': imu_state['gyro'],
                 'temp': imu_state['temp'],
                 'lidar': lidar_state['dist'],
-                # Provenance for the LiDAR sample: seq identifies the reading,
-                # ts is when it was taken (not when this packet was sent).
+                # Provenance for the LiDAR sample: seq identifies the
+                # MEASUREMENT and ts is when that measurement was first seen
+                # (not when this packet was sent, and not when it was re-read).
                 'lidar_seq': lidar_state['seq'],
                 'lidar_ts': lidar_state['ts'],
                 'timestamp': time.time(),
@@ -164,7 +210,9 @@ async def main():
     parser.add_argument('--skip-cal', action='store_true', help='Skip gyro calibration (use saved)')
     parser.add_argument('--lidar-rate', type=float, default=LIDAR_POLL_HZ,
                         help=f'LiDAR poll rate in Hz (default: {LIDAR_POLL_HZ}; '
-                             '0 = uncapped, the pre-2026-08-27 behaviour)')
+                             '0 = uncapped. Sets timestamp precision, not the '
+                             'number of measurements -- the sensor measures at '
+                             '11-17 Hz whatever this is)')
     args = parser.parse_args()
 
     stop = asyncio.get_event_loop().create_future()

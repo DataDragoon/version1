@@ -8,6 +8,8 @@ import { useSarWorker } from './hooks/useSarWorker';
 import { useBgModelWorker } from './hooks/useBgModelWorker';
 import { inferBgModel } from './lib/bgModelInfer';
 import { computeCaptureStats } from './lib/bgCaptureStats';
+import { createContinuousAccum } from './lib/bgContinuous';
+import { createRowCollector } from './lib/roverTrack';
 import { computeRangeProfile } from './lib/rangeProfile';
 import { applyBscanBg, bgForStandoff, backgroundFor, coherentMean } from './lib/bscanBg';
 import { computeSharedScale, computeRowScales, computeGridScales, bgDiagnostics, planViewScales } from './lib/cscanGrid';
@@ -18,6 +20,71 @@ import { DEFAULT_PARAMS as IMAGING_DEFAULT_PARAMS } from './lib/imagingEffects';
 import ProjectorWindow from './components/ProjectorWindow';
 
 const SPEED_OF_LIGHT = 299792458;
+
+// One C-scan cell, from however many sweeps were taken at it.
+//
+// Shared by BOTH capture paths -- the stepped raster's "take N sweeps here" and
+// the continuous raster's "these are the sweeps that landed in this column" --
+// so the two cannot drift apart in what a cell record means. That has bitten
+// this repo before with duplicated kernels (CFAR, SAFT), and here the failure
+// would be invisible: both grids would still render, disagreeing about what a
+// cell contains.
+function buildCellRecord({ sweeps, meta, cell, grid, rover, target, roverXStd }) {
+  const meanSweep = coherentMean(sweeps, meta.num_steps);
+  const mean = (vals) => (vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null);
+  const stand = sweeps.map(w => w.lidar_standoff_mm).filter(v => v != null);
+  const standMean = mean(stand);
+  // Provenance is pooled from the looks themselves rather than passed in, so a
+  // multi-sweep cell reports the standoff and pose it was really measured at
+  // rather than whichever sweep happened to land last. The BG model is
+  // evaluated at this standoff, so it matters. Pooling from `sweeps` also means
+  // the two capture paths cannot disagree about how a cell is summarised, and
+  // that only the fields listed here can ever reach the record -- spreading a
+  // whole look would overwrite h_cal_real/imag with a single sweep and silently
+  // undo the averaging.
+  return {
+    // The Pi's own profile, kept for the export record. Nothing on screen reads
+    // it -- every display recomputes from h_cal with the panel's window -- but
+    // it is the only Hanning/nfft-204 version that exists and it costs nothing.
+    magnitudes: meta.magnitudes,
+    distances: meta.distances,
+    // EVERY look, not just the mean: coherent-vs-incoherent is a display
+    // control and has to stay flippable against recorded data.
+    sweeps,
+    // The COHERENT mean, because everything that reads h_cal without knowing
+    // about `sweeps` -- SAR, the BG-model trainer, Super Fit, svdFilter, the
+    // export -- must see the averaged cell.
+    h_cal_real: meanSweep.re,
+    h_cal_imag: meanSweep.im,
+    num_steps: meta.num_steps,
+    step_size: meta.step_size,
+    range_offset: meta.range_offset,
+    lidar_standoff_mm: standMean,
+    lidar_n: sweeps.reduce((a, w) => a + (w.lidar_n || 0), 0),
+    lidar_std: stand.length > 1
+      ? Math.sqrt(stand.reduce((a, v) => a + (v - standMean) ** 2, 0) / stand.length)
+      : (sweeps[0].lidar_std ?? null),
+    lidar_offset_mm: sweeps[0].lidar_offset_mm ?? null,
+    roll_deg: mean(sweeps.map(w => w.roll_deg).filter(v => v != null)),
+    pitch_deg: mean(sweeps.map(w => w.pitch_deg).filter(v => v != null)),
+    grid_ix: cell.ix,
+    grid_iy: cell.iy,
+    x_cm: cell.ix * grid.hStep,
+    y_cm: cell.iy * grid.vStep,
+    // Where the gantry actually stood, beside where it was asked to. Slip and
+    // missed steps are the only error sources nothing can observe, so the
+    // commanded target is kept next to the reported position rather than
+    // assuming they agree. Under a continuous traverse `rover_x_mm` is the mean
+    // of the interpolated positions of the sweeps in the cell and
+    // `rover_x_std_mm` their spread -- the aperture the coherent average was
+    // actually taken over.
+    rover_x_mm: rover ? rover.x : null,
+    rover_y_mm: rover ? rover.y : null,
+    rover_x_std_mm: roverXStd != null ? roverXStd : null,
+    rover_target_x_mm: target ? target.x_mm : null,
+    rover_target_y_mm: target ? target.y_mm : null,
+  };
+}
 
 const ROVER_TRAIL_MAX = 2000;
 const ROVER_LOG_MAX = 120;
@@ -277,6 +344,34 @@ export default function App() {
   const [bgModelCapturing, setBgModelCapturing] = useState(false);
   const [bgModelAccumCount, setBgModelAccumCount] = useState(0);
   const bgModelAccumRef = useRef(null);
+  // Continuous capture: sweeps are binned by their own instantaneous standoff
+  // while the module is waved over the span, instead of one hand-placed
+  // position at a time. See lib/bgContinuous.js for why the stream has to be
+  // filtered before it is binned. The accumulator lives in a ref -- at 36 Hz a
+  // per-sweep setState would re-render the whole tree at the sweep rate -- and
+  // publishes a summary on an interval below.
+  const bgContinuousRef = useRef(null);
+  const [bgContinuousActive, setBgContinuousActive] = useState(false);
+  const [bgContinuousStats, setBgContinuousStats] = useState(null);
+  const [bgContBinMm, setBgContBinMmState] = useState(
+    () => Number(localStorage.getItem('bgmodel_cont_bin_mm')) || 1.0
+  );
+  const setBgContBinMm = useCallback((v) => {
+    // Below the interpolator's own 0.5 mm merge distance a finer bin cannot
+    // produce a finer model, only thinner bins.
+    const n = Math.max(0.5, Math.min(20, Number(v) || 1.0));
+    localStorage.setItem('bgmodel_cont_bin_mm', String(n));
+    setBgContBinMmState(n);
+  }, []);
+  const [bgContMaxSpeed, setBgContMaxSpeedState] = useState(() => {
+    const v = localStorage.getItem('bgmodel_cont_max_speed');
+    return v == null ? 40 : Number(v);
+  });
+  const setBgContMaxSpeed = useCallback((v) => {
+    const n = Math.max(0, Math.min(1000, Number(v) || 0));
+    localStorage.setItem('bgmodel_cont_max_speed', String(n));
+    setBgContMaxSpeedState(n);
+  }, []);
   const [bgScanMode, setBgScanModeState] = useState(
     () => localStorage.getItem('bgmodel_scan_mode') || 'manual'
   );
@@ -400,6 +495,27 @@ export default function App() {
   const bscanCaptureRef = useRef(null);
   const bscanBgCaptureRef = useRef(false);
 
+  // ── Continuous rover raster ───────────────────────────────────────────────
+  //
+  // The rover's reported position over time, and the row currently being
+  // binned. Both are REFS: the track takes a sample at ~11 Hz and sweeps land
+  // at ~36 Hz, and re-rendering the tree for either would be the expensive way
+  // to move a number that only the binning reads. Same reason sfcwDynamicScale
+  // and the C-scan layout are refs.
+  //
+  // Everything here works on the PI's clock -- sfcw_result.timestamp for a
+  // sweep, rover_status.last_status_at for a position -- never on
+  // performance.now(), which would fold two independent websocket latencies
+  // into the association.
+  const roverCollectorRef = useRef(createRowCollector());
+  const [roverRowStats, setRoverRowStats] = useState(null);
+  const roverRowStatsAtRef = useRef(0);
+
+  // Measured sweep period, ms. Published at ~1 Hz from a ref so the sidebar is
+  // not re-rendered at the sweep rate to move a readout.
+  const sweepPeriodRef = useRef({ last: null, buf: [], pubAt: 0 });
+  const [sweepPeriodMs, setSweepPeriodMs] = useState(null);
+
   // Distance from the lidar's reference plane to the antenna aperture, so
   // standoff = lidar_reading - offset. It is a property of the mounting and
   // changes whenever the head is re-mounted, so it is user-editable and
@@ -485,12 +601,88 @@ export default function App() {
     // the second to reach the origin before the raster starts.
     roverOriginRightMm: 0,
     roverOriginBelowMm: 0,
-    // Mechanical settling allowed after a move before a sweep is taken.
+    // Mechanical settling allowed after a move (stepped) or at the start of a
+    // row (continuous) before sweeping begins.
     roverSettleMs: 200,
+    // How the rover walks a row.
+    //   'continuous' -- one move per row, sweeps binned by the position they
+    //                   were taken at. At a 27.5 ms sweep this is 2-4x faster
+    //                   than stepping AND gives more averaging, because the
+    //                   per-cell cost was ~93% overhead (a 500 ms arrival gate,
+    //                   a settle, and one discarded in-flight sweep).
+    //   'stepped'    -- the original stop-at-every-cell raster, kept as the
+    //                   fallback for ruling the continuous path out.
+    roverTraverse: 'continuous',
+    // Traverse speed, mm/s. This is the ONLY capture knob in continuous mode:
+    // it sets the sweep spacing (v * 27.5 ms) and therefore how many sweeps
+    // each cell gets, since pitch / speed / averaging are one resource. Pushed
+    // to the rail as x_max_speed for the duration of the raster and restored
+    // afterwards. The rail's own configured maximum is 150 mm/s.
+    roverSpeedMmS: 100,
+    // Constant timing offset between the sweep clock and the rover position
+    // clock, ms. Both are already stamped on the Pi's clock, so this is only
+    // the residual: a sweep is stamped ~14 ms after its own phase centre and a
+    // status frame after its WiFi transit. Positive means the raw attribution
+    // runs AHEAD along the direction of travel and is pulled back.
+    //
+    // It is a bias, not noise -- its sign follows the direction of travel, so
+    // in a snake it displaces alternate rows oppositely (a zigzag of 2*v*tau).
+    // Measure it from one out-and-back pass over a row: the spatial lag
+    // between the two directions is exactly 2*v*tau.
+    roverLatencyMs: 0,
   });
   // The SDR message handler is mounted once, so it reads the grid through a ref.
   const bscanParamsRef = useRef(bscanParams);
   bscanParamsRef.current = bscanParams;
+
+  // ── Continuous raster: binning a row's sweeps by position ─────────────────
+  //
+  // The collector owns the position track, the queue of sweeps waiting for a
+  // bracketing position, and the row being binned; see lib/roverTrack.js. This
+  // is only the React-facing shell around it.
+
+  // Row fill, published at ~4 Hz. Sweeps land at ~36 Hz and publishing per
+  // sweep would re-render the sidebar that often to move a counter.
+  const publishRowStats = useCallback(() => {
+    const now = performance.now();
+    if (now - roverRowStatsAtRef.current < 250) return;
+    roverRowStatsAtRef.current = now;
+    setRoverRowStats(roverCollectorRef.current.summary());
+  }, []);
+
+  // A row's traverse is starting: open a fresh bin for it.
+  const handleRoverRowOpen = useCallback((geom) => {
+    const col = roverCollectorRef.current;
+    col.setLatencyMs(bscanParamsRef.current.roverLatencyMs);
+    col.openRow(geom);
+    roverRowStatsAtRef.current = 0;
+    setRoverRowStats(col.summary());
+  }, []);
+
+  // The traverse has ended -- completed, stopped, or failed. Harvest whatever
+  // the bins hold; a partial row is still data, and a row is a minute of
+  // driving. Idempotent: the state machine calls it on arrival and again from
+  // finish().
+  const handleRoverRowClose = useCallback(() => {
+    const out = roverCollectorRef.current.closeRow();
+    if (!out) return;
+    const grid = bscanParamsRef.current;
+    const geom = out.geom;
+    if (out.cells.length) {
+      setBscanData(prev => [...prev, ...out.cells.map(c => buildCellRecord({
+        sweeps: c.sweeps,
+        meta: c.meta,
+        cell: { ix: c.ix, iy: c.iy },
+        grid,
+        // Where the rail actually was, averaged over the sweeps in this cell,
+        // against the column centre it was filed under.
+        rover: { x: c.xMean, y: geom.y_mm },
+        target: { x_mm: geom.originXMm + c.ix * geom.hStepMm, y_mm: geom.y_mm },
+        roverXStd: c.xStd,
+      }))]);
+    }
+    setRoverRowStats(out.summary);
+  }, []);
 
   // B-scan display toggles
   const [bscanScaleMode, setBscanScaleMode] = useState('linear');
@@ -1081,6 +1273,17 @@ export default function App() {
         lidarLastSeqRef.current = seq;
         lidarAccumRef.current.push(msg.lidar);
         lidarLastFreshRef.current = { mm: msg.lidar, t: performance.now() };
+        // Continuous BG capture interpolates standoff at each sweep's own
+        // instant, so it needs the measurement TRACK rather than the per-sweep
+        // average. `lidar_ts` is the Pi's time.time() at the moment the
+        // measurement first appeared, which is the same clock sfcw_result's
+        // `timestamp` uses -- that is what makes two websockets comparable.
+        if (bgContinuousRef.current) {
+          bgContinuousRef.current.pushLidar({
+            t: msg.lidar_ts,
+            d: msg.lidar - lidarOffsetRef.current,
+          });
+        }
       }
     }
     // Pose from the gravity vector. accel is body-frame [forward, left, up] in
@@ -1177,6 +1380,27 @@ export default function App() {
       };
       setSfcwLidarProvenance(provenance);
 
+      // Sweep period from the PI's own timestamps -- median of the adjacent
+      // differences over a 12-sweep window, the same statistic (and for the
+      // same reason: one stalled or dropped frame must not move it) as
+      // Viewport's useSweepRate. The C-scan panel needs it to say what a given
+      // traverse speed will actually sample at, since sweep spacing is
+      // v * T_sweep and everything else follows from that.
+      {
+        const sp = sweepPeriodRef.current;
+        if (sp.last != null) {
+          const d = (msg.timestamp - sp.last) * 1000;
+          if (d > 0 && d < 5000) { sp.buf.push(d); if (sp.buf.length > 12) sp.buf.shift(); }
+        }
+        sp.last = msg.timestamp;
+        const nowMs = performance.now();
+        if (sp.buf.length >= 4 && nowMs - sp.pubAt > 1000) {
+          sp.pubAt = nowMs;
+          const sorted = [...sp.buf].sort((a, b) => a - b);
+          setSweepPeriodMs(sorted[sorted.length >> 1]);
+        }
+      }
+
       // Always update live display
       setSfcwResult(msg);
       setSfcwStandoffMm(standoffMm);
@@ -1195,11 +1419,18 @@ export default function App() {
         setSfcwBgCapturing(false);
       }
 
-      // C-scan capture: the first sweep after the button press is the cell.
-      // The cell is resolved from the capture index along the snake path and
-      // stored on the record, so editing the grid later never relabels it.
+      // C-scan capture, STEPPED (and manual). The first sweep after the button
+      // press is the cell. The cell is resolved from the capture index along the
+      // snake path and stored on the record, so editing the grid later never
+      // relabels it.
       if (bscanCaptureRef.current) {
         const tag = bscanCaptureRef.current;
+        const look = {
+          h_cal_real: msg.h_cal_real ? [...msg.h_cal_real] : null,
+          h_cal_imag: msg.h_cal_imag ? [...msg.h_cal_imag] : null,
+          timestamp: msg.timestamp,
+          ...provenance,
+        };
         // A sweep already in flight when the tag was set began before the rover
         // finished settling, so it is smeared by the move itself. Results are
         // emitted serially, so discarding exactly one guarantees the sweep we
@@ -1211,73 +1442,57 @@ export default function App() {
           // the running mean: the coherent/incoherent choice is a DISPLAY
           // control, so it has to stay changeable against recorded data, and
           // that is only possible if the individual looks survive.
-          tag.got.push({
-            h_cal_real: msg.h_cal_real ? [...msg.h_cal_real] : null,
-            h_cal_imag: msg.h_cal_imag ? [...msg.h_cal_imag] : null,
-            timestamp: msg.timestamp,
-            ...provenance,
-          });
+          tag.got.push(look);
           setBscanCaptureProgress({ got: tag.got.length, need: tag.need });
         } else {
           const grid = bscanParamsRef.current;
-          const sweeps = [...tag.got, {
-            h_cal_real: msg.h_cal_real ? [...msg.h_cal_real] : null,
-            h_cal_imag: msg.h_cal_imag ? [...msg.h_cal_imag] : null,
-            timestamp: msg.timestamp,
-            ...provenance,
-          }];
-          // Cell-level provenance is pooled over the sweeps actually taken, so a
-          // multi-sweep cell reports the standoff it was really measured at
-          // rather than whichever sweep happened to land last. The BG model is
-          // evaluated at this number, so it matters.
-          const meanSweep = coherentMean(sweeps, msg.num_steps);
-          const stand = sweeps.map(w => w.lidar_standoff_mm).filter(v => v != null);
-          const pooled = {
-            ...provenance,
-            lidar_standoff_mm: stand.length ? stand.reduce((a, b) => a + b, 0) / stand.length : null,
-            lidar_n: sweeps.reduce((a, w) => a + (w.lidar_n || 0), 0),
-            lidar_std: stand.length > 1
-              ? Math.sqrt(stand.reduce((a, v) => a + (v - stand.reduce((x, y) => x + y, 0) / stand.length) ** 2, 0) / stand.length)
-              : provenance.lidar_std,
+          const sweeps = [...tag.got, look];
+          const meta = {
+            magnitudes: [...msg.magnitudes],
+            distances: [...msg.distances],
+            num_steps: msg.num_steps,
+            step_size: msg.step_size,
+            range_offset: msg.range_offset,
           };
-          setBscanData(prev => {
-            const cell = tag.cell || cellForIndex(prev.length, grid.hCount);
-            return [...prev, {
-              // The Pi's own profile, kept for the export record. Nothing on
-              // screen reads it -- every display recomputes from h_cal with the
-              // panel's window -- but it is the only Hanning/nfft-204 version
-              // that exists and it costs nothing to keep.
-              magnitudes: [...msg.magnitudes],
-              distances: [...msg.distances],
-              sweeps,
-              // The coherent mean, NOT the last sweep. Everything that reads
-              // h_cal without knowing about `sweeps` -- SAR, the BG-model
-              // trainer, Super Fit, svdFilter, the export -- then sees the
-              // averaged cell, which is the whole point of having taken N.
-              h_cal_real: meanSweep.re,
-              h_cal_imag: meanSweep.im,
-              num_steps: msg.num_steps,
-              step_size: msg.step_size,
-              range_offset: msg.range_offset,
-              ...pooled,
-              grid_ix: cell.ix,
-              grid_iy: cell.iy,
-              x_cm: cell.ix * grid.hStep,
-              y_cm: cell.iy * grid.vStep,
-              // Where the gantry actually stood, beside where it was asked to.
-              // Slip and missed steps are the only error sources nothing can
-              // observe, so the commanded target is kept next to the reported
-              // position rather than assuming they agree.
-              rover_x_mm: tag.rover ? tag.rover.x : null,
-              rover_y_mm: tag.rover ? tag.rover.y : null,
-              rover_target_x_mm: tag.target ? tag.target.x_mm : null,
-              rover_target_y_mm: tag.target ? tag.target.y_mm : null,
-            }];
-          });
+          setBscanData(prev => [...prev, buildCellRecord({
+            sweeps,
+            meta,
+            cell: tag.cell || cellForIndex(prev.length, grid.hCount),
+            grid,
+            rover: tag.rover,
+            target: tag.target,
+            roverXStd: null,
+          })]);
           bscanCaptureRef.current = null;
           setBscanCapturing(false);
           setBscanCaptureProgress(null);
         }
+      }
+
+      // C-scan capture, CONTINUOUS. The rover is mid-row and never stops, so a
+      // sweep is not "the cell" -- it is a sample at whatever position the rail
+      // happened to be at when it was taken, and the column it belongs to is
+      // resolved from that position once the rover track brackets its
+      // timestamp. Held pending until then rather than extrapolated; see
+      // lib/roverTrack.js.
+      if (roverCollectorRef.current.isOpen() && msg.h_cal_real && msg.h_cal_imag) {
+        roverCollectorRef.current.pushSweep({
+          t: msg.timestamp,
+          sample: {
+            h_cal_real: [...msg.h_cal_real],
+            h_cal_imag: [...msg.h_cal_imag],
+            timestamp: msg.timestamp,
+            ...provenance,
+          },
+          meta: {
+            magnitudes: [...msg.magnitudes],
+            distances: [...msg.distances],
+            num_steps: msg.num_steps,
+            step_size: msg.step_size,
+            range_offset: msg.range_offset,
+          },
+        });
+        publishRowStats();
       }
 
       // B-scan BG reference: likewise tagged groundstation-side
@@ -1313,6 +1528,23 @@ export default function App() {
           setBgModelCapturing(false);
           setBgModelAccumCount(0);
         }
+      }
+      // Continuous capture. The sample is the same object the static path
+      // stores; its standoff is REPLACED by one interpolated from the lidar
+      // track at this sweep's own instant (see lib/bgContinuous.js), so the
+      // sweep is filed where it was actually taken rather than where the last
+      // reading happened to say. `timestamp` is the Pi clock and is what ties
+      // the two streams together.
+      if (bgContinuousRef.current) {
+        bgContinuousRef.current.pushSweep({
+          h_cal_real: msg.h_cal_real ? [...msg.h_cal_real] : null,
+          h_cal_imag: msg.h_cal_imag ? [...msg.h_cal_imag] : null,
+          ...provenance,
+          num_steps: msg.num_steps,
+          step_size: msg.step_size,
+          range_offset: msg.range_offset,
+          timestamp: msg.timestamp,
+        });
       }
       if (bgModelTestRef.current) {
         const test = bgModelTestRef.current;
@@ -1358,6 +1590,17 @@ export default function App() {
   const handleRoverMessage = useCallback((msg) => {
     if (msg.type === 'rover_status') {
       setRoverStatus(msg);
+      // Feed the position track that a continuous raster bins against. Stamped
+      // with the PI's ingest time of the board frame, which is the same clock
+      // sfcw_result.timestamp uses -- so the association never touches a
+      // browser clock or either websocket's own delivery latency. Pushed for
+      // every frame whether or not a raster is running, so the history is
+      // already there the moment a row opens.
+      if (typeof msg.last_status_at === 'number'
+          && roverCollectorRef.current.pushStatus({ t: msg.last_status_at, x: msg.x_mm, y: msg.y_mm })
+          && roverCollectorRef.current.isOpen()) {
+        publishRowStats();
+      }
       setRoverTrail(prev => {
         const last = prev[prev.length - 1];
         if (last && last.x === msg.x_mm && last.y === msg.y_mm) return prev;
@@ -1375,7 +1618,7 @@ export default function App() {
       setRoverLog(prev => [...prev.slice(-(ROVER_LOG_MAX - 1)),
                            { t: Date.now() / 1000, line: `error: ${msg.message}` }]);
     }
-  }, []);
+  }, [publishRowStats]);
 
   const roverUrl = piIp ? `ws://${piIp}:9002` : null;
   const { status: roverConnectionStatus, send: sendRover, connect: connectRover, disconnect: disconnectRover } = useWebSocket(roverUrl, handleRoverMessage);
@@ -1432,6 +1675,12 @@ export default function App() {
     setBscanCapturing(true);
   }, [bscanProcParams.avgCount]);
 
+  // How many grid rows already hold data. Rows are captured top-down and a row
+  // is emitted whole, so the count of distinct rows IS the resume point.
+  const capturedRowCount = useMemo(
+    () => new Set(bscanData.map(d => d.grid_iy).filter(v => v != null)).size,
+    [bscanData]);
+
   const roverScan = useRoverScan({
     params: bscanParams,
     roverStatus,
@@ -1445,6 +1694,12 @@ export default function App() {
     // A cell now takes avgCount sweeps, so the capture watchdog has to scale
     // with it or a high Avg would trip the timeout before the cell completes.
     sweepsPerCell: Math.max(1, bscanProcParams.avgCount),
+    // Continuous mode. A row emits however many cells its bins filled, so the
+    // flat capture count is not a row counter -- resume is on distinct rows
+    // present in the data instead.
+    capturedRows: capturedRowCount,
+    onRowOpen: handleRoverRowOpen,
+    onRowClose: handleRoverRowClose,
   });
 
   // A raster that ends -- completed, stopped or failed -- must not leave a tag
@@ -1456,6 +1711,11 @@ export default function App() {
       bscanCaptureRef.current = null;
       setBscanCapturing(false);
     }
+    // The row itself is harvested by the state machine's finish(), which runs
+    // before this. Anything left here is only the bin reference and unresolved
+    // sweeps, which must not survive into the next raster -- they would be
+    // filed against a row that has moved.
+    roverCollectorRef.current.reset();
   }, [roverScanActive]);
 
   const requestRoverBgCapture = useCallback(() => {
@@ -1636,6 +1896,43 @@ export default function App() {
     }
   }, [sendSdr, sendSfcwParams, sfcwRunning, bscanData, bscanParams, sfcwParams, bscanBgRef, bscanBgModel, roverScan, lidarOffsetMm]);
 
+  // Ending a continuous run folds every occupied bin into the capture list as
+  // one position each. Harvesting on ANY end -- the toggle, the session
+  // stopping, a sweep error -- and not only on the toggle: a minute of waving
+  // is expensive to redo, and a dropped session is exactly when losing it would
+  // hurt most.
+  const harvestContinuous = useCallback(() => {
+    const accum = bgContinuousRef.current;
+    bgContinuousRef.current = null;
+    setBgContinuousActive(false);
+    if (!accum) return;
+    // Resolve the sweeps still waiting on a bracketing measurement, and give up
+    // on the last one or two that will never get one.
+    accum.flush();
+    const caps = accum.toCaptures();
+    setBgContinuousStats({ ...accum.summary(), harvested: caps.length });
+    if (!caps.length) return;
+    // Tagged as one batch so Undo can drop the run rather than one bin of it.
+    const batch = Date.now();
+    setBgModelCaptures(prev => [...prev, ...caps.map(c => ({ ...c, batch }))]);
+  }, []);
+
+  useEffect(() => {
+    if (!bgContinuousActive || sfcwRunning) return;
+    harvestContinuous();
+  }, [bgContinuousActive, sfcwRunning, harvestContinuous]);
+
+  // The accumulator is a ref, so the panel is fed on an interval rather than
+  // per sweep -- at 36 Hz the latter would re-render the sidebar 36 times a
+  // second to move a counter.
+  useEffect(() => {
+    if (!bgContinuousActive) return;
+    const id = setInterval(() => {
+      if (bgContinuousRef.current) setBgContinuousStats(bgContinuousRef.current.summary());
+    }, 250);
+    return () => clearInterval(id);
+  }, [bgContinuousActive]);
+
   const handleBgModelAction = useCallback((action, payload) => {
     if (action === 'start_session') {
       if (sfcwRunning) return;
@@ -1644,12 +1941,37 @@ export default function App() {
     } else if (action === 'stop_session') {
       sendSdr({ cmd: 'sfcw_stop' });
     } else if (action === 'capture') {
+      if (bgContinuousRef.current) return;
       setBgModelCapturing(true);
       bgModelAccumRef.current = { samples: [], target: bgModelSweepsPerCapture };
+    } else if (action === 'continuous_start') {
+      if (!sfcwRunning || bgContinuousRef.current || bgModelAccumRef.current) return;
+      // The per-position sweep budget doubles as the per-bin cap: it means the
+      // same thing (how many looks one standoff gets) and it is what bounds
+      // memory over a long wave.
+      bgContinuousRef.current = createContinuousAccum({
+        binWidthMm: bgContBinMm,
+        maxSweepsPerBin: bgModelSweepsPerCapture,
+        maxSpeedMmS: bgContMaxSpeed,
+      });
+      setBgContinuousStats(bgContinuousRef.current.summary());
+      setBgContinuousActive(true);
+    } else if (action === 'continuous_stop') {
+      harvestContinuous();
     } else if (action === 'undo') {
-      setBgModelCaptures(prev => prev.slice(0, -1));
+      setBgModelCaptures(prev => {
+        if (!prev.length) return prev;
+        // A continuous run arrives as one position per occupied bin -- often a
+        // hundred of them -- so undoing it a bin at a time is not a control
+        // anyone would use. The whole run goes.
+        const last = prev[prev.length - 1];
+        return last.batch != null
+          ? prev.filter(c => c.batch !== last.batch)
+          : prev.slice(0, -1);
+      });
     } else if (action === 'clear') {
       setBgModelCaptures([]);
+      setBgContinuousStats(null);
     } else if (action === 'build') {
       // One training sample per position, using the coherent mean across that
       // position's sweeps. The replicas are the same standoff measured N times,
@@ -1764,7 +2086,7 @@ export default function App() {
       setBgModelTestResult(null);
       bgModelTestRef.current = { samples: [] };
     }
-  }, [sendSdr, sendSfcwParams, sfcwRunning, bgModelCaptures, sfcwParams, bgModelSweepsPerCapture, bgModelWorker.startTraining, bgModelWorker.reset, bgModelWorker.resultRef]);
+  }, [sendSdr, sendSfcwParams, sfcwRunning, bgModelCaptures, sfcwParams, bgModelSweepsPerCapture, bgContBinMm, bgContMaxSpeed, harvestContinuous, lidarOffsetMm, bgModelWorker.startTraining, bgModelWorker.reset, bgModelWorker.resultRef]);
 
   // Rate counter interval
   const rateIntervalRef = useRef(null);
@@ -1866,6 +2188,8 @@ export default function App() {
         onBscanParamsChange={setBscanParams}
         onBscanAction={handleBscanAction}
         roverScan={roverScan}
+        roverRowStats={roverRowStats}
+        sweepPeriodMs={sweepPeriodMs}
         bscanScaleMode={bscanScaleMode}
         onBscanScaleModeChange={setBscanScaleMode}
         bscanDisplayMode={bscanDisplayMode}
@@ -1961,6 +2285,12 @@ export default function App() {
         bgModelTrainResult={bgModelWorker.result}
         bgModelTrainError={bgModelWorker.error}
         bgModelSweepsPerCapture={bgModelSweepsPerCapture}
+        bgContinuousActive={bgContinuousActive}
+        bgContinuousStats={bgContinuousStats}
+        bgContBinMm={bgContBinMm}
+        onBgContBinChange={setBgContBinMm}
+        bgContMaxSpeed={bgContMaxSpeed}
+        onBgContMaxSpeedChange={setBgContMaxSpeed}
         onBgModelSweepsChange={setBgModelSweepsPerCapture}
         onBgModelAction={handleBgModelAction}
         bgScanMode={bgScanMode}
