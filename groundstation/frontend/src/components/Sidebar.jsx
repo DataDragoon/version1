@@ -181,6 +181,15 @@ export default function Sidebar({
   bgModelSweepsPerCapture,
   onBgModelSweepsChange,
   onBgModelAction,
+  bgScanMode,
+  onBgScanModeChange,
+  bgRoverSpanMm,
+  onBgRoverSpanChange,
+  bgRoverStepMm,
+  onBgRoverStepChange,
+  bgRoverDirection,
+  onBgRoverDirectionChange,
+  roverBgScan,
   imagingSnapshot,
   imagingSnapshotName,
   onLoadImagingSnapshot,
@@ -331,6 +340,18 @@ export default function Sidebar({
                   stopFreq={sfcwParams.stopFreq}
                   onModelAction={onBgModelAction}
                   lidarMm={lidarMm}
+                  roverConnected={roverConnected}
+                  roverStatus={roverStatus}
+                  bgScanMode={bgScanMode}
+                  onBgScanModeChange={onBgScanModeChange}
+                  bgRoverSpanMm={bgRoverSpanMm}
+                  onBgRoverSpanChange={onBgRoverSpanChange}
+                  bgRoverStepMm={bgRoverStepMm}
+                  onBgRoverStepChange={onBgRoverStepChange}
+                  bgRoverDirection={bgRoverDirection}
+                  onBgRoverDirectionChange={onBgRoverDirectionChange}
+                  roverBgScan={roverBgScan}
+                  sendRover={sendRover}
                 />
               )}
               {activePanel === 'sfcw' && (

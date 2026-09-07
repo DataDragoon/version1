@@ -366,7 +366,7 @@ self.onmessage = function (e) {
   const numBins = distances.length;
   const numSteps = hasHcal ? bscanData[0].h_cal_real.length : 0;
   const freqStepHz = bscanData[0].step_size || 20000000;
-  const rangeOffset = bscanData[0].range_offset || 0.5;
+  const rangeOffset = bscanData[0].range_offset || 0.378;
 
   // The two paths index DIFFERENT profiles -- the coherent one rebuilds its own
   // zero-padded IFFT from h_cal, the incoherent one uses the magnitudes/distances that

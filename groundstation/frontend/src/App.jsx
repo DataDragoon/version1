@@ -13,6 +13,7 @@ import { applyBscanBg, bgForStandoff, backgroundFor, coherentMean } from './lib/
 import { computeSharedScale, computeRowScales, computeGridScales, bgDiagnostics, planViewScales } from './lib/cscanGrid';
 import { cellForIndex, orderedCellForIndex, BG_STATUS, BG_STATUS_TEXT } from './lib/cscanGrid';
 import { useRoverScan } from './hooks/useRoverScan';
+import { useRoverBgScan } from './hooks/useRoverBgScan';
 import { DEFAULT_PARAMS as IMAGING_DEFAULT_PARAMS } from './lib/imagingEffects';
 import ProjectorWindow from './components/ProjectorWindow';
 
@@ -229,7 +230,7 @@ export default function App() {
     // See CLAUDE.md "Sweep-to-sweep variability is set by the REFERENCE channel's level".
     tx2Gain: 45,
     rx2Gain: 5,
-    rangeOffset: 0.5,
+    rangeOffset: 0.378,
   });
 
   const sfcwParamsRef = useRef(sfcwParams);
@@ -276,6 +277,36 @@ export default function App() {
   const [bgModelCapturing, setBgModelCapturing] = useState(false);
   const [bgModelAccumCount, setBgModelAccumCount] = useState(0);
   const bgModelAccumRef = useRef(null);
+  const [bgScanMode, setBgScanModeState] = useState(
+    () => localStorage.getItem('bgmodel_scan_mode') || 'manual'
+  );
+  const setBgScanMode = useCallback((v) => {
+    localStorage.setItem('bgmodel_scan_mode', v);
+    setBgScanModeState(v);
+  }, []);
+  const [bgRoverSpanMm, setBgRoverSpanMmState] = useState(
+    () => Number(localStorage.getItem('bgmodel_rover_span_mm')) || 50
+  );
+  const setBgRoverSpanMm = useCallback((v) => {
+    const n = Math.max(1, Number(v) || 50);
+    localStorage.setItem('bgmodel_rover_span_mm', String(n));
+    setBgRoverSpanMmState(n);
+  }, []);
+  const [bgRoverStepMm, setBgRoverStepMmState] = useState(
+    () => Number(localStorage.getItem('bgmodel_rover_step_mm')) || 4
+  );
+  const setBgRoverStepMm = useCallback((v) => {
+    const n = Math.max(0.1, Number(v) || 0.4);
+    localStorage.setItem('bgmodel_rover_step_mm', String(n));
+    setBgRoverStepMmState(n);
+  }, []);
+  const [bgRoverDirection, setBgRoverDirectionState] = useState(
+    () => localStorage.getItem('bgmodel_rover_direction') || 'forward'
+  );
+  const setBgRoverDirection = useCallback((v) => {
+    localStorage.setItem('bgmodel_rover_direction', v);
+    setBgRoverDirectionState(v);
+  }, []);
   const [bgModelTesting, setBgModelTesting] = useState(false);
   const [bgModelTestCount, setBgModelTestCount] = useState(0);
   const [bgModelTestResult, setBgModelTestResult] = useState(null);
@@ -374,10 +405,10 @@ export default function App() {
   // changes whenever the head is re-mounted, so it is user-editable and
   // persisted rather than hardcoded.
   //
-  // Measured on the bench 2026-08-28: with the aperture against the wall (true
-  // zero standoff) the lidar reads 164.83 mm +/- 0.68. 160 keeps a 5 mm buffer
-  // so a real zero-standoff pose reports slightly positive rather than negative.
-  // Re-measure after any re-mount.
+  // Measured on the bench 2026-09-07 with the new antenna (80 mm aperture,
+  // 100 mm length): aperture against the wall, lidar reads 136-138 mm.
+  // 132 keeps a ~5 mm buffer so a real zero-standoff pose reports slightly
+  // positive rather than negative. Re-measure after any re-mount.
   //
   // Getting this wrong is not symmetric. A constant offset error *cancels
   // exactly* for a model trained and used under that same offset: the unwind
@@ -392,7 +423,7 @@ export default function App() {
   // out-of-span reporting in sfcwProcessed below.
   const [lidarOffsetMm, setLidarOffsetMmState] = useState(() => {
     const v = parseFloat(localStorage.getItem('lidar_antenna_offset_mm'));
-    return Number.isFinite(v) ? v : 160;
+    return Number.isFinite(v) ? v : 132;
   });
   const setLidarOffsetMm = useCallback((v) => {
     localStorage.setItem('lidar_antenna_offset_mm', String(v));
@@ -1427,6 +1458,33 @@ export default function App() {
     }
   }, [roverScanActive]);
 
+  const requestRoverBgCapture = useCallback(() => {
+    setBgModelCapturing(true);
+    bgModelAccumRef.current = { samples: [], target: bgModelSweepsPerCapture };
+  }, [bgModelSweepsPerCapture]);
+
+  const roverBgScan = useRoverBgScan({
+    roverStatus,
+    roverConnected: roverConnectionStatus === 'connected',
+    sendRover,
+    sfcwRunning,
+    onStartSweep: startSfcwSweep,
+    onStopSweep: stopSfcwSweep,
+    captureCount: bgModelCaptures.length,
+    onRequestCapture: requestRoverBgCapture,
+    sweepsPerCapture: bgModelSweepsPerCapture,
+  });
+
+  const roverBgScanActive = roverBgScan.active;
+  useEffect(() => {
+    if (roverBgScanActive) return;
+    if (bgModelAccumRef.current) {
+      bgModelAccumRef.current = null;
+      setBgModelCapturing(false);
+      setBgModelAccumCount(0);
+    }
+  }, [roverBgScanActive]);
+
   const handleBscanAction = useCallback((action) => {
     if (action === 'start_session') {
       // In rover mode the session ARMS the raster: it starts the sweep and
@@ -1905,6 +1963,15 @@ export default function App() {
         bgModelSweepsPerCapture={bgModelSweepsPerCapture}
         onBgModelSweepsChange={setBgModelSweepsPerCapture}
         onBgModelAction={handleBgModelAction}
+        bgScanMode={bgScanMode}
+        onBgScanModeChange={setBgScanMode}
+        bgRoverSpanMm={bgRoverSpanMm}
+        onBgRoverSpanChange={setBgRoverSpanMm}
+        bgRoverStepMm={bgRoverStepMm}
+        onBgRoverStepChange={setBgRoverStepMm}
+        bgRoverDirection={bgRoverDirection}
+        onBgRoverDirectionChange={setBgRoverDirection}
+        roverBgScan={roverBgScan}
         imagingSnapshot={imagingSnapshot}
         imagingSnapshotName={imagingSnapshotName}
         onLoadImagingSnapshot={handleLoadImagingSnapshot}

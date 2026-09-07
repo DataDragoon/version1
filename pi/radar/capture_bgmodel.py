@@ -48,7 +48,7 @@ DATA_DIR = os.path.join(REPO_ROOT, 'data')
 
 # Must match App.jsx's default. A model is indexed by lidar_reading - offset,
 # so training and inference have to agree on this or every standoff is biased.
-DEFAULT_OFFSET_MM = 160.0
+DEFAULT_OFFSET_MM = 132.0
 
 # Mirrors App.jsx sfcwParams. Pushed before the sweep starts, exactly like
 # sendSfcwParams() does -- the engine carries its own defaults otherwise and
@@ -63,7 +63,7 @@ SFCW_PARAMS = {
     # captured at one reference gain is invalid at another, silently. These are now
     # pushed by App.jsx too, so both sides carry the same numbers.
     'tx1Gain': 50, 'rx1Gain': 25, 'tx2Gain': 45, 'rx2Gain': 5,
-    'rangeOffset': 0.5,
+    'rangeOffset': 0.378,
 }
 
 
