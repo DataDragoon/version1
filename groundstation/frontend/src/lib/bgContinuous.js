@@ -133,6 +133,23 @@ const TRACK_KEEP_S = 5;
 // Viewport.jsx's useSweepRate makes for the same reason.
 const PERIOD_WINDOW = 12;
 
+// A sweep whose complex correlation with the rest of its own bin is below this
+// did not measure the same thing they did. The radar throws the occasional
+// corrupted sweep -- 0.46% idle and 2.05% under client load on the 2026-09-06
+// measurements, plus the NIOS path's ~1.4% fallbacks -- and a 60 s run at 36 Hz
+// is ~2200 sweeps, so tens of them land somewhere. The static protocol diluted
+// one bad sweep across 40 good ones; a continuous bin holding 2 or 3 does not,
+// and its coherent mean becomes a corrupted KNOT, which is the thing CLAUDE.md's
+// leave-one-out scoring calls a weakest knot. Measured with one garbage sweep
+// injected: n=2 scores -0.1 dB, n=3 3.7, n=5 10.6, n=18 21.9, n=40 29.1 -- so
+// the damage is worst exactly where continuous capture is thinnest.
+//
+// 0.90 sits in a very wide empty gap: sweeps of the same scene within one 1 mm
+// bin correlate >0.99 (the wall term rotates only ~12 deg per mm at 5 GHz, and
+// single-sweep SNR is ~21 dB), while a garbled sweep has random phase per step
+// and correlates ~1/sqrt(51) = 0.14.
+const BIN_AGREE_MIN = 0.90;
+
 // How long a run may go with no lidar measurement at all before concluding this
 // Pi does not send timestamped ones and falling back to the legacy path. It
 // cannot be decided on the first sweep -- at the start of EVERY run the track is
@@ -167,7 +184,7 @@ export function createContinuousAccum({
   let legacyMode = false;          // latched once it is clear none are coming
   const pending = [];              // sweeps waiting to be bracketed
   const bins = new Map();          // bin index -> sample array
-  const counts = { total: 0, accepted: 0, no_lidar: 0, motion: 0, bin_full: 0 };
+  const counts = { total: 0, accepted: 0, no_lidar: 0, motion: 0, bin_full: 0, screened: 0 };
   const brackets = [];             // bracket widths of accepted sweeps, for the readout
   let speed = null;
   let minMm = null, maxMm = null;
@@ -398,13 +415,63 @@ export function createContinuousAccum({
   // and extrapolating them is exactly the lag this module exists to remove.
   function flush() { resolve(true); }
 
+  // Magnitude of the normalised complex correlation between two sweeps -- the
+  // same statistic bgCaptureStats uses for sweepCorrelation and the Pi uses to
+  // call a sweep visibly corrupted, so the three agree on what "agrees" means.
+  function corr(a, b) {
+    const S = Math.min(a.h_cal_real.length, b.h_cal_real.length);
+    let dr = 0, di = 0, na = 0, nb = 0;
+    for (let i = 0; i < S; i++) {
+      const aR = a.h_cal_real[i], aI = a.h_cal_imag[i];
+      const bR = b.h_cal_real[i], bI = b.h_cal_imag[i];
+      dr += aR * bR + aI * bI;
+      di += aI * bR - aR * bI;
+      na += aR * aR + aI * aI;
+      nb += bR * bR + bI * bI;
+    }
+    return Math.hypot(dr, di) / (Math.sqrt(na) * Math.sqrt(nb) + 1e-30);
+  }
+
+  // Drop sweeps that disagree with the rest of their own bin. Each sweep is
+  // scored by its MEDIAN correlation against the others, not against their
+  // mean: a mean is dragged by the very outlier being looked for, whereas a
+  // median is unmoved by a minority of bad sweeps, which is the case here.
+  //
+  // Needs 3 sweeps to arbitrate -- with 2 that disagree there is no way to say
+  // which is wrong, so both are kept and the bin's own SNR (negative, in that
+  // case) is left to report it rather than guessing.
+  function screenBin(samples) {
+    const n = samples.length;
+    if (n < 3) return samples;
+    const usable = samples.filter(s => s.h_cal_real && s.h_cal_imag);
+    if (usable.length < 3) return samples;
+    const c = usable.map(() => []);
+    for (let i = 0; i < usable.length; i++) {
+      for (let j = i + 1; j < usable.length; j++) {
+        const v = corr(usable[i], usable[j]);
+        c[i].push(v); c[j].push(v);
+      }
+    }
+    const keep = usable.filter((_, i) => {
+      const m = c[i].sort((x, y) => x - y)[Math.floor(c[i].length / 2)];
+      return m >= BIN_AGREE_MIN;
+    });
+    // Never empty a bin on this evidence: if nothing agrees with anything the
+    // problem is not one outlier, and silently deleting the position would put
+    // a hole in the model instead of a visibly bad knot.
+    if (keep.length < 2) return samples;
+    counts.screened += usable.length - keep.length;
+    return keep;
+  }
+
   // One capture per occupied bin, ordered by standoff. Same {samples, stats}
   // shape the static path produces, so nothing downstream can tell them apart.
   function toCaptures() {
+    counts.screened = 0;
     return [...bins.keys()]
       .sort((a, b) => a - b)
       .map(i => {
-        const samples = bins.get(i);
+        const samples = screenBin(bins.get(i));
         return { samples, stats: computeCaptureStats(samples), continuous: true };
       })
       .filter(c => c.stats != null);

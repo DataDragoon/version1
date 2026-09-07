@@ -296,6 +296,12 @@ export default function BgModelPanel({ isConnected, sdrConnected, sfcwRunning, m
               <div className="p-2.5 rounded-xl border border-green-500/20 bg-green-500/5">
                 <span className="text-[10px] text-green-400">
                   Added {continuousStats.harvested} position{continuousStats.harvested !== 1 ? 's' : ''} from {continuousStats.accepted} sweeps over {continuousStats.spanMm.toFixed(0)} mm
+                  {continuousStats.screened > 0 && (
+                    <span className="text-yellow-400/80">
+                      {' '}· {continuousStats.screened} sweep{continuousStats.screened !== 1 ? 's' : ''} dropped
+                      for disagreeing with their bin
+                    </span>
+                  )}
                 </span>
               </div>
             )}
@@ -305,9 +311,11 @@ export default function BgModelPanel({ isConnected, sdrConnected, sfcwRunning, m
               sweep, so every sweep is filed where it was actually taken rather than where
               the last reading said. Only sweeps the lidar never bracketed, or taken above
               the speed limit, are dropped. Pass back and forth to deepen the bins, and
-              watch Hole rather than Span — the lidar measures at 11–17 Hz, so a fast pass
-              spaces its readings further apart than the bin width and leaves holes no
-              amount of extra time will fill.
+              watch Hole rather than Span. The speed limit is a smear budget: a sweep steps
+              through frequency in order, so moving during one shifts its apparent range by
+              about 0.15 mm at 40 mm/s and 0.38 mm at 100 mm/s. A fast pass also spaces its
+              lidar readings further apart than the bin width, which leaves holes — but
+              further passes fill them, so a fast wave just needs more of them.
             </div>
           </div>
           </>
@@ -555,14 +563,17 @@ export default function BgModelPanel({ isConnected, sdrConnected, sfcwRunning, m
                       <span className="text-white/25"> ±{st.standoffStdMm.toFixed(1)}</span>
                     )}
                   </span>
+                  <span className="font-mono text-white/25 shrink-0 w-7 text-right">
+                    {st ? `×${st.sweepCount}` : ''}
+                  </span>
                   <span className={cn(
-                    'font-mono shrink-0',
-                    !st ? 'text-white/20'
+                    'font-mono shrink-0 w-12 text-right',
+                    !st || st.coherence == null ? 'text-white/20'
                       : st.coherence > 0.95 ? 'text-green-400/70'
                       : st.coherence > 0.85 ? 'text-yellow-400/70'
                       : 'text-red-400/70'
                   )}>
-                    {st ? `${st.snrDbAveraged.toFixed(0)} dB` : '—'}
+                    {st && st.snrDbAveraged != null ? `${st.snrDbAveraged.toFixed(0)} dB` : '—'}
                   </span>
                 </div>
               );

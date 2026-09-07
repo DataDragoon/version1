@@ -2,8 +2,10 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { cn } from '@/lib/utils';
 import { Section, InfoTile } from './Sidebar';
 import { orderedCellForIndex, gridStats, gridRoverExtent, gridRoverExtentContinuous,
-  traverseOverrun, BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
+  traverseOverrun, axisMoveSeconds, accelDistanceSeconds,
+  BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
 import { samplingFor, NOMINAL_SWEEP_MS } from '@/lib/roverTrack';
+import { MIN_MOVE_MS } from '@/hooks/useRoverScan';
 import { listDisplays } from './ProjectorWindow';
 
 const LIDAR_AVG_WINDOW = 20;
@@ -37,7 +39,7 @@ export default function CscanPanel({
     hStep, hCount, vStep, vCount, gateStart, gateEnd, metric,
     focusEnabled, focusAperture,
     scanMode, roverOriginRightMm, roverOriginBelowMm, roverSettleMs,
-    roverTraverse, roverSpeedMmS, roverLatencyMs,
+    roverTraverse, roverSpeedMmS, roverLatencyMs, roverRunupExtraMs,
   } = params;
 
   const update = (key, value) => {
@@ -176,6 +178,27 @@ export default function CscanPanel({
   const starved = sampling.perCell < 1.2;
   const rowSeconds = (hStep * 10 * Math.max(0, hCount - 1) + 2 * overrunMm)
     / Math.max(1, roverSpeedMmS);
+  // The row change is purely VERTICAL -- a snake ends a row at the same x its
+  // successor starts at -- and vertical is the slow axis (25 mm/s against 150,
+  // and 100 mm/s^2 against 500), so on a tall fine-pitch grid it is not a
+  // rounding error. The arrival gate is a floor on it: the board acks a move
+  // before dispatching it, so a move shorter than MIN_MOVE_MS still costs that.
+  // Settling the row gets for free, in motion, before the first cell.
+  const runupSeconds = accelDistanceSeconds(overrunMm, roverSpeedMmS, cfg?.x_accel || 500);
+  // Arrival is now reported exactly by the board (moves_done), so a row change
+  // costs its own move plus roughly one status frame of reporting latency --
+  // no timer. MIN_MOVE_MS only floors it on a Pi too old to report completion.
+  const exactArrival = typeof roverStatus?.moves_done === 'number';
+  const rowChangeSeconds = vCount > 1
+    ? (exactArrival
+        ? axisMoveSeconds(vStep * 10, cfg?.y_max_speed || 25, cfg?.y_accel || 100) + 0.09
+        : Math.max(MIN_MOVE_MS / 1000,
+            axisMoveSeconds(vStep * 10, cfg?.y_max_speed || 25, cfg?.y_accel || 100)))
+      + (roverRunupExtraMs || 0) / 1000
+    : 0;
+  const gridSeconds = rowSeconds * Math.max(1, vCount)
+    + rowChangeSeconds * Math.max(0, vCount - 1);
+  const fmtT = (t) => (t < 100 ? t.toFixed(1) + ' s' : (t / 60).toFixed(1) + ' min');
   const fitsLimits = !(extent && cfg && cfg.limits_enabled) || (
     extent.xMin >= cfg.x_min_mm && extent.xMax <= cfg.x_max_mm
     && extent.yMin >= cfg.y_min_mm && extent.yMax <= cfg.y_max_mm
@@ -431,11 +454,13 @@ export default function CscanPanel({
                     min={1}
                     max={150}
                   />
+                  {/* Zero by default: the run-up below is settling that has
+                      already been paid for, in motion and outside the grid. */}
                   <EditableField
-                    label="Settle at row start"
-                    value={roverSettleMs}
+                    label="Extra settle"
+                    value={roverRunupExtraMs}
                     unit="ms"
-                    onChange={(v) => update('roverSettleMs', Math.round(v))}
+                    onChange={(v) => update('roverRunupExtraMs', Math.max(0, Math.round(v)))}
                     min={0}
                     max={10000}
                   />
@@ -445,24 +470,40 @@ export default function CscanPanel({
                   <InfoTile label="Sweep spacing" value={`${sampling.spacingMm.toFixed(2)} mm`} />
                   <InfoTile label="Sweeps / cell" value={sampling.perCell.toFixed(1)} />
                   <InfoTile
-                    label="Row time"
-                    value={rowSeconds < 100 ? `${rowSeconds.toFixed(1)} s` : `${(rowSeconds / 60).toFixed(1)} min`}
-                  />
-                </div>
-                <div className="grid grid-cols-3 gap-2">
-                  <InfoTile
                     label="Coherent gain"
                     value={sampling.perCell >= 1 ? `${(10 * Math.log10(sampling.perCell)).toFixed(1)} dB` : '—'}
                   />
-                  <InfoTile label="Move / sweep" value={`${sampling.smearMm.toFixed(2)} mm`} />
-                  <InfoTile
-                    label="Grid time"
-                    value={(() => {
-                      const t = (rowSeconds + 1.5) * Math.max(1, vCount);
-                      return t < 100 ? `${t.toFixed(0)} s` : `${(t / 60).toFixed(1)} min`;
-                    })()}
-                  />
                 </div>
+                <div className="grid grid-cols-3 gap-2">
+                  <InfoTile label="Run-up" value={`${(runupSeconds * 1000).toFixed(0)} ms`} />
+                  {/* Purely vertical, and vertical is the slow axis. On a tall
+                      grid with a fine row pitch this is a real share of the
+                      total, so it is shown rather than buried in it. */}
+                  <InfoTile
+                    label="Row change"
+                    value={vCount > 1 ? fmtT(rowChangeSeconds) : '—'}
+                  />
+                  <InfoTile label="Grid total" value={fmtT(gridSeconds)} />
+                </div>
+                <div className="px-2 text-[9px] leading-relaxed text-white/40">
+                  Row {fmtT(rowSeconds)}. The run-up is {(runupSeconds * 1000).toFixed(0)} ms of
+                  travel outside the grid before the first cell — settling that is already paid
+                  for, which is why Extra settle is 0.
+                  {exactArrival
+                    ? ' Row changes wait for the board to report the move finished, not for a timer.'
+                    : ' This Pi does not report move completion, so each move also pays a 500 ms arrival gate — update pi/rover/rover_server.py.'}
+                </div>
+                {vCount > 1 && rowChangeSeconds * (vCount - 1) > 0.25 * gridSeconds && (
+                  <div className="px-2 text-[9px] leading-relaxed text-white/40">
+                    Stepping down between rows is
+                    {' '}{(100 * rowChangeSeconds * (vCount - 1) / gridSeconds).toFixed(0)}% of the
+                    scan — the vertical axis maxes at {(cfg?.y_max_speed || 25).toFixed(0)} mm/s against
+                    {' '}{roverSpeedMmS} mm/s along the row, and a {(vStep * 10).toFixed(0)} mm step is
+                    {' '}{vStep * 10 < 2 * (cfg?.y_max_speed || 25) ** 2 / (cfg?.y_accel || 100)
+                      ? 'too short to even reach that speed' : 'mostly spent at it'}.
+                    A coarser row pitch costs proportionally less here than a slower traverse does.
+                  </div>
+                )}
 
                 {/* A pitch finer than the sweep spacing cannot be filled by
                     scanning for longer -- those sweeps were never taken. */}

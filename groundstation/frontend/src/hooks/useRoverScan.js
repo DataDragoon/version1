@@ -33,12 +33,20 @@ import {
 
 const TICK_MS = 40;
 
+// FALLBACK ONLY, for a Pi that predates `moves_done` in its status.
+//
 // The board acknowledges a move -- advancing the sequence its status stream
 // reports -- BEFORE dispatching it from its queue, so there is a window where
 // status reads "idle, old position" for a move that has not started yet (see
-// CLAUDE.md, the ideal_mm resync note). Status arrives at ~11 Hz, so half a
-// second is roughly five frames of margin on top of that window.
-const MIN_MOVE_MS = 500;
+// CLAUDE.md, the ideal_mm resync note). With no completion signal the only way
+// to sit that window out is to wait, and half a second is roughly five status
+// frames of margin on top of it.
+//
+// It is a pure cost: every move pays max(move time, 500 ms) instead of its own
+// duration. `moves_done` removes it -- the board sends exactly one `done` per
+// dispatched move, when every axis it commanded has stopped, so waiting for
+// that counter to advance is exact and needs no timer at all.
+export const MIN_MOVE_MS = 500;
 
 // Half a step is 65 um on X and 2.5 um on Y, so a millimetre is far looser than
 // the mechanism -- it is here to catch a move that did not happen, not to judge
@@ -185,6 +193,10 @@ export function useRoverScan({
     st.issuedAt = performance.now();
     st.timeoutMs = timeoutMs;
     st.idleSince = null;
+    // Snapshot the completion counter. Safe to read the status we happen to
+    // hold: a move is only ever issued once the previous one is confirmed
+    // finished, so nothing else is in flight to advance it behind our back.
+    st.movesDoneAtIssue = typeof status?.moves_done === 'number' ? status.moves_done : null;
     o.sendRover({ cmd: 'rover_move_abs', x_mm: clamped.x_mm, y_mm: clamped.y_mm });
     publish();
   }, [publish]);
@@ -252,6 +264,28 @@ export function useRoverScan({
           && (status.pending_moves | 0) === 0
           && (status.queue_depth | 0) === 0;
 
+        // "The move has finished" -- exactly, when the Pi reports it. The board
+        // sends one `done` per dispatched move once every axis it commanded has
+        // stopped, so this cannot fire during the ack-before-dispatch window and
+        // there is nothing to wait out. Falls back to the timer on a Pi that does
+        // not report it.
+        const exact = st.movesDoneAtIssue != null && typeof status.moves_done === 'number';
+        const completed = exact
+          ? status.moves_done > st.movesDoneAtIssue
+          : since >= MIN_MOVE_MS;
+
+        // A move that ended as anything but `completed` did not go where it was
+        // told -- a soft limit, a stop, an e-stop. Targets are already clamped
+        // on both sides, so this means the geometry is wrong, and capturing a
+        // row against it would put every cell in the wrong place.
+        if (exact && completed && status.last_done_reason
+            && status.last_done_reason !== 'completed') {
+          finish('error', null,
+            `Move ended as '${status.last_done_reason}' rather than completing — `
+            + 'the rover is not where the grid expects it. Scan aborted.', true);
+          return;
+        }
+
         // A traverse is where the sweep has to keep running -- losing it
         // half way along a row would silently produce a half-empty row rather
         // than a failure.
@@ -263,7 +297,7 @@ export function useRoverScan({
           }
         }
 
-        if (since >= MIN_MOVE_MS && idle) {
+        if (completed && idle) {
           const off = Math.hypot(status.x_mm - st.target.x_mm, status.y_mm - st.target.y_mm);
           if (off <= POS_TOL_MM) {
             if (st.phase === 'homing') {
@@ -454,7 +488,12 @@ export function useRoverScan({
       // Restored by finish(), whatever ends the run.
       prevMaxSpeed: cfg ? cfg.x_max_speed : null,
       speedApplied: false,
-      settleMs: Math.max(0, Number(grid.roverSettleMs) || 0),
+      // Stepped captures standing still and needs the rig to have stopped
+      // ringing; continuous is already moving through its run-up by the time
+      // the first cell arrives, so its extra settle defaults to none.
+      settleMs: continuous
+        ? Math.max(0, Number(grid.roverRunupExtraMs) || 0)
+        : Math.max(0, Number(grid.roverSettleMs) || 0),
       sawRunning: false,
       issuedAt: 0,
       timeoutMs: MOVE_TIMEOUT_FLOOR_MS,

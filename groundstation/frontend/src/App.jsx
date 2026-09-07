@@ -363,13 +363,27 @@ export default function App() {
     localStorage.setItem('bgmodel_cont_bin_mm', String(n));
     setBgContBinMmState(n);
   }, []);
+  // Speed limit for continuous capture, mm/s. 100, not the 40 this shipped with
+  // -- 40 came from a 1 mm-per-sweep smear budget picked before the cost of
+  // smear was worked out. Measured (synthetic sweep with per-step standoff, the
+  // apparent standoff error found by matching against the static background):
+  //
+  //   20 mm/s -> 0.08 mm    60 -> 0.23 mm    150 -> 0.56 mm
+  //   40 mm/s -> 0.15 mm   100 -> 0.38 mm    250 -> 0.93 mm
+  //
+  // The lidar interpolation's own residual is 0.32 mm, so anything under
+  // ~100 mm/s is not the limiting term; 150+ starts to be. Note the sweep
+  // MIDPOINT labelling is what makes this affordable -- labelled by the Pi's
+  // end-of-sweep stamp instead, 40 mm/s would cost 0.40 mm and 100 mm/s 1.00 mm.
+  // The key is versioned because the old default is persisted in browsers that
+  // already ran this panel, and it was chosen on a wrong basis.
   const [bgContMaxSpeed, setBgContMaxSpeedState] = useState(() => {
-    const v = localStorage.getItem('bgmodel_cont_max_speed');
-    return v == null ? 40 : Number(v);
+    const v = localStorage.getItem('bgmodel_cont_max_speed_v2');
+    return v == null ? 100 : Number(v);
   });
   const setBgContMaxSpeed = useCallback((v) => {
     const n = Math.max(0, Math.min(1000, Number(v) || 0));
-    localStorage.setItem('bgmodel_cont_max_speed', String(n));
+    localStorage.setItem('bgmodel_cont_max_speed_v2', String(n));
     setBgContMaxSpeedState(n);
   }, []);
   const [bgScanMode, setBgScanModeState] = useState(
@@ -601,9 +615,16 @@ export default function App() {
     // the second to reach the origin before the raster starts.
     roverOriginRightMm: 0,
     roverOriginBelowMm: 0,
-    // Mechanical settling allowed after a move (stepped) or at the start of a
-    // row (continuous) before sweeping begins.
+    // Mechanical settling after a move, before a STEPPED capture. Needed there
+    // because the sweep is taken standing still, immediately on arrival.
     roverSettleMs: 200,
+    // Extra settling at the start of a CONTINUOUS row, on top of the run-up.
+    // Zero by default and that is deliberate: the traverse starts outside the
+    // grid and spends ~0.4-0.5 s accelerating and running before the first
+    // cell, all of it after the vertical step-down has finished, so the
+    // settling is already paid for in motion. Raise it only if the mast is
+    // actually seen to ring.
+    roverRunupExtraMs: 0,
     // How the rover walks a row.
     //   'continuous' -- one move per row, sweeps binned by the position they
     //                   were taken at. At a 27.5 ms sweep this is 2-4x faster

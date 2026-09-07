@@ -479,6 +479,46 @@ export function traverseOverrun(speedMmS, accelMmS2) {
   return ramp + margin;
 }
 
+// Wall-clock seconds for a single-axis move of `distanceMm`, under the
+// trapezoidal profile the firmware ramps with (motion_core.h). Triangular when
+// the move is too short to reach the axis speed, which the VERTICAL axis
+// usually is: at 25 mm/s and 100 mm/s^2 it takes 6.25 mm just to ramp up and
+// back down, so a 5 mm row step never reaches full speed.
+//
+// This matters because the row change is entirely vertical and vertical is the
+// slow axis. A snake ends row N at `lastX + overrun` and starts row N+1 at
+// `firstX + overrun`, which is the SAME point -- so the move between rows has
+// no X component at all, and its cost is this function plus the arrival gate.
+export function axisMoveSeconds(distanceMm, maxSpeedMmS, accelMmS2) {
+  const d = Math.abs(Number(distanceMm) || 0);
+  const v = Math.max(0.1, Number(maxSpeedMmS) || 25);
+  const a = Math.max(1, Number(accelMmS2) || 100);
+  if (d <= 0) return 0;
+  const rampDist = (v * v) / a;          // accelerate up and back down
+  return d >= rampDist
+    ? (2 * v) / a + (d - rampDist) / v
+    : 2 * Math.sqrt(d / a);
+}
+
+// Seconds to cover `distanceMm` from REST, accelerating to `maxSpeedMmS` and
+// staying there -- no deceleration, because this is the run-up into a row, not
+// a move that stops at the far end.
+//
+// This is the settling a continuous row gets FOR FREE. The traverse starts
+// `overrunMm` outside the grid, so the rig spends this long accelerating and
+// running before the first cell is reached: ~0.45 s at 25 mm/s, 0.40 s at 100,
+// 0.50 s at 150. All of it after the vertical step-down has completed, all of
+// it outside the cells. A static settle on top is redundant unless the mast is
+// actually seen to ring, which is why the extra-settle default is 0.
+export function accelDistanceSeconds(distanceMm, maxSpeedMmS, accelMmS2) {
+  const d = Math.max(0, Number(distanceMm) || 0);
+  const v = Math.max(0.1, Number(maxSpeedMmS) || 25);
+  const a = Math.max(1, Number(accelMmS2) || 500);
+  if (d <= 0) return 0;
+  const accelDist = (v * v) / (2 * a);
+  return d >= accelDist ? v / a + (d - accelDist) / v : Math.sqrt((2 * d) / a);
+}
+
 // Geometry of one continuous row traverse, in the rover's frame.
 //
 // `rowFromTop` counts rows in CAPTURE order (0 = the origin's row, the top

@@ -772,6 +772,55 @@ the plan-view zigzag -- it does not defocus anything.
   stopped. **A grid whose overrun leaves the rail is refused, not clamped** --
   `gridRoverExtentContinuous` is what the soft-limit check uses in this mode, and the
   refusal names the run-up.
+- **Arrival is now reported EXACTLY by the board, not waited out.** `rover_server.py`'s
+  status carries `moves_done` / `last_done_seq` / `last_done_reason`, incremented from the
+  `done` frame the firmware sends once per dispatched move, when every axis it commanded
+  has stopped (`rover.ino`, `movePending` block). The Pi always received it; it just never
+  forwarded it. A client snapshots the counter when it issues a move and waits for it to
+  advance, which is **immune to the ack-before-dispatch window** -- the window that made
+  every other signal a heuristic, since `moving` is false in it and position alone cannot
+  tell a move that has not started from one that has finished.
+
+  `MIN_MOVE_MS` (500 ms) is now a **fallback only**, for a Pi that predates the field, and
+  the panel says so when it is in force. A `done` whose reason is not `completed` (a soft
+  limit, a stop) **aborts the scan**: targets are clamped on both sides, so it means the
+  geometry is wrong and every cell of the row would land in the wrong place.
+
+- **The continuous row has no static settle, and does not need one.** The traverse starts
+  `overrunMm` outside the grid, so the rig spends the whole run-up accelerating and
+  running before the first cell -- **450 ms at 25 mm/s, 400 at 100, 500 at 150** -- all of
+  it after the vertical step-down has completed, all of it outside the cells. That is
+  strictly better settling than standing still for 200 ms, and it is time already being
+  spent. `roverRunupExtraMs` (default **0**) is the escape hatch if the mast is ever
+  actually seen to ring; `roverSettleMs` still applies to the stepped path, which captures
+  standing still and does need it.
+
+- **The row change is purely VERTICAL, and vertical is the slow axis.** A snake ends row
+  N at `lastX + overrun` and starts row N+1 at `firstX + overrun`, which is the *same
+  point*, so the move between rows has no X component at all -- it is one Y step and
+  nothing else. Y runs at 25 mm/s / 100 mm/s^2 against X's 150 / 500, and it takes 6.25 mm
+  just to ramp up and back down, so **any row pitch under 6.25 mm is a triangular move
+  that never reaches full speed**. `axisMoveSeconds()` (`cscanGrid.js`) is the closed form
+  for both cases, checked against numerical integration of the firmware's ramp to <0.1%.
+
+  | row pitch | Y move | old (500 ms gate + 200 ms settle) | now (move + ~1 status frame) |
+  |---|---|---|---|
+  | 2 mm | 0.283 s | 0.70 s | **0.37 s** |
+  | 5 mm | 0.447 s | 0.70 s | **0.54 s** |
+  | 10 mm | 0.650 s | 0.85 s | **0.74 s** |
+  | 20 mm | 1.050 s | 1.25 s | **1.14 s** |
+  | 50 mm | 2.250 s | 2.45 s | **2.34 s** |
+
+  Note the fine pitches gain most, because they were paying the 500 ms gate for a move
+  that took half that. What remains is the Y move itself, which is real mechanics, plus
+  ~90 ms of status-reporting latency at ~11 Hz.
+
+  On a 1 m row the row change is a small share and it grows as the traverse gets faster --
+  15 rows at 10 mm pitch: **2% of the scan at 25 mm/s, 4% at 50, 7% at 100, 10% at 150**.
+  So on a wide grid the vertical axis is not worth optimising, but on a NARROW one (short
+  rows, many of them) it inverts and dominates. The panel shows Run-up, Row change and
+  Grid total separately.
+
 - **Cells are keyed on POSITION, never arrival order.** `Math.round((x - originX)/pitch)`
   is the half-pitch rule; a sweep landing outside the grid is dropped, not clamped. The
   two snake directions visit the same columns in opposite orders and a stuttered link can
@@ -812,7 +861,9 @@ node, and the **real state machine was driven against a simulated ramped gantry 
 centre| of 0.75 mm; the latency bias behaves as derived (above); a stop mid-row harvests
 the partial row and restores the speed; 150 mm/s against a 1 mm pitch reports holes rather
 than hiding them; 20 mm/s at 5 mm pitch gives 8.3 sweeps/cell against the predicted 9.1;
-stepped mode is unchanged; and an overrun that leaves the rail is refused. There is still
+stepped mode is unchanged; an overrun that leaves the rail is refused; exact arrival
+completes a 6x4 grid 5% faster than the 500 ms fallback gate and both fill it identically;
+and a move reported as `limit` aborts before a single cell is captured. There is still
 no test runner in this repo, so these were throwaway scripts. `vite build` passes.
 
 **NOT yet done on hardware, and these are the things to check first:**
@@ -1530,6 +1581,99 @@ the cap expecting it to fill bins that were never visited.
   continuous run turns 30 rows into a few hundred.
 - Rover mode is unchanged; continuous is manual-only (the rover already places positions
   precisely, which is the problem continuous exists to solve).
+
+### The per-bin dB number, and why some bins read 330 dB or negative (2026-09-07)
+
+The number beside each position in the Coverage list is `snrDbAveraged` from
+`bgCaptureStats.computeCaptureStats`: the coherent (complex) mean of that bin's sweeps
+against the scatter about it, plus `10*log10(n)` for the averaging. Roughly 30 dB at n=2
+rising to 44 dB at n=40 on a healthy bin. Two ways it went wrong, both found from a live
+run and both now fixed.
+
+**330 dB was a bin with exactly ONE sweep.** With n=1 the variance about the mean is
+exactly zero -- the sample IS the mean -- so the score is 0/0 and the `|| 1e-30` guard
+turned it into `10*log10(sigPow/1e-30)` = **317-330 dB** depending on `|h_cal|`. Coherence
+came out exactly 1.0 with it, so the panel painted those bins GREEN. The least trustworthy
+position in the set was displaying as the best one, and `BgModelDisplay`'s SNR axis scaled
+itself to 330 dB, flattening every real bar into the bottom eighth of the chart. Static
+capture never produced an n=1 position, so this could not happen before continuous capture;
+now it happens wherever the pass was moving fastest. `computeCaptureStats` returns **null**
+for `snrDbPerSweep` / `snrDbAveraged` / `coherence` when `n < 2` -- undefined, not
+infinite. Both consumers already handled a null SNR; the chart now paints an unscoreable
+position neutral grey, and the panel shows `-` plus the sweep count. **The sweep count
+(`xN`) is now displayed next to every position**, which is the number that explains the
+score.
+
+**Negative dB was a thin bin containing a CORRUPTED sweep.** The radar throws the odd
+garbled sweep -- 0.46% idle and 2.05% under client load on the 2026-09-06 measurements,
+plus the NIOS path's ~1.4% fallbacks -- so a 60 s run at 36 Hz (~2200 sweeps) contains
+tens of them. The static protocol diluted one across 40 good sweeps; a continuous bin
+holding 2 or 3 does not. Measured with one garbage sweep injected:
+
+| bin size | 2 | 3 | 5 | 10 | 18 | 40 |
+|---|---|---|---|---|---|---|
+| score with one corrupted sweep | **-0.1 dB** | 3.7 | 10.6 | 16.8 | 21.9 | 29.1 |
+
+so the damage is worst exactly where continuous capture is thinnest, and the bin's
+coherent mean becomes a corrupted KNOT -- which is what the leave-one-out scoring reports
+as a weakest knot, and what Akima was chosen to stop propagating into its neighbours.
+
+`bgContinuous.toCaptures()` now screens each bin: every sweep is scored by its **median**
+complex correlation against the others and dropped below `BIN_AGREE_MIN = 0.90`.
+
+- **Median against the others, not correlation against their mean** -- a mean is dragged
+  by the very outlier being looked for, a median is not.
+- **0.90 sits in a very wide empty gap.** Sweeps of the same scene inside one 1 mm bin
+  correlate >0.99 (the wall term rotates only ~12 deg per mm at 5 GHz, single-sweep SNR is
+  ~21 dB), while a garbled sweep has random phase per step and correlates ~1/sqrt(51) =
+  0.14. Verified that genuine within-bin standoff spread is never screened.
+- **n < 3 is left alone.** With two sweeps that disagree there is no way to say which is
+  wrong, so both are kept and the bin's own (negative) score is left to report it rather
+  than the code guessing.
+- **A bin where nothing agrees with anything is kept whole.** That is not one outlier, and
+  silently deleting the position would put a hole in the model instead of a visibly bad
+  knot.
+
+Measured on a simulated 60 s run with 1.5% corruption injected: **34 of 34 corrupted
+sweeps caught, 0 negative bins, worst bin 37.8 dB against a median of 39.3.** The count is
+reported in the harvest line.
+
+### Wave speed: 40 mm/s was too conservative, the default is now 100
+
+The first default came from a smear budget of ~1 mm per sweep, picked before the cost of
+smear had been worked out. Working it through: a sweep steps frequency sequentially, so
+motion during it puts both a quadratic phase term (defocus) and a linear one (an apparent
+range shift) on the echo. Defocus is negligible -- it does not reach the classical pi/4
+until ~6.7 mm of motion -- so the binding term is the range shift, which is
+direction-dependent like every other lag in this system.
+
+Measured by synthesising a sweep with a per-step standoff and finding the static standoff
+whose spectrum best matches it:
+
+| speed | 20 | 40 | 60 | 100 | 150 | 250 | 400 mm/s |
+|---|---|---|---|---|---|---|---|
+| motion during one sweep | 0.55 | 1.10 | 1.65 | 2.75 | 4.12 | 6.87 | 10.99 mm |
+| **apparent standoff error** | 0.08 | **0.15** | 0.23 | **0.38** | 0.56 | 0.93 | 1.48 mm |
+| match to the static background | 40.6 | 34.6 | 31.0 | 26.6 | 23.1 | 18.8 | 14.8 dB |
+
+The lidar interpolation's own residual is 0.32 mm, so **anything under ~100 mm/s is not
+the limiting term**; 150+ starts to be, and the "match" column is a ceiling on what a
+model built from moving sweeps can achieve (bench LOO is 20-26 dB, so 100 mm/s does not
+bind and 250 would). Default raised 40 -> 100 mm/s.
+
+**The sweep-MIDPOINT labelling is what makes that affordable.** Labelled by the Pi's
+end-of-sweep stamp instead, the same table reads 0.40 mm at 40 mm/s and 1.00 mm at 100 --
+2.7x worse. The two corrections compound: interpolating the lidar track fixes where the
+sweep was, and the midpoint fixes when.
+
+The localStorage key is versioned (`bgmodel_cont_max_speed_v2`) so browsers that already
+ran the panel pick up the new default rather than keeping a value chosen on a wrong basis.
+
+**Speed still sets PER-PASS granularity** and that is unchanged: a measurement lands every
+`v * lidar_period`, so one 100 mm/s pass spaces them ~7 mm apart and cannot fill 1 mm bins.
+Further passes do, because the lidar cadence and the pass timing are incommensurate. Watch
+Hole; a fast wave is not broken, it just needs more passes.
+
 
 ### Verification
 

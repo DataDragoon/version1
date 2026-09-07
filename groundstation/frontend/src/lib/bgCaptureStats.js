@@ -102,8 +102,17 @@ export function computeCaptureStats(samples) {
     sigPow += mRe[i] * mRe[i] + mIm[i] * mIm[i];
     noisePow += varF[i];
   }
-  const coherence = sigPow / (sigPow + noisePow || 1e-30);
-  const snrDb = 10 * Math.log10(sigPow / (noisePow || 1e-30));
+  // With ONE sweep the variance about the mean is exactly zero -- the sample IS
+  // the mean -- so these are 0/0, and the `|| 1e-30` guard below turns that into
+  // ~318 dB and a coherence of exactly 1. That is not a very good position, it
+  // is an unmeasurable one, and reporting it as the best score in the set is
+  // actively misleading: the panel coloured such bins green and the coverage
+  // chart scaled its whole SNR axis to 318 dB, flattening every real bar.
+  // Continuous capture makes single-sweep bins common (the fast middle of a
+  // pass), where the static protocol never produced one. Undefined, so null.
+  const canScore = n >= 2;
+  const coherence = canScore ? sigPow / (sigPow + noisePow || 1e-30) : null;
+  const snrDb = canScore ? 10 * Math.log10(sigPow / (noisePow || 1e-30)) : null;
 
   // Consecutive sweep-pair complex correlation (same metric as the Phase Test)
   let corrSum = 0, corrN = 0;
@@ -137,7 +146,7 @@ export function computeCaptureStats(samples) {
     noise_var: Array.from(varF),
     snrDbPerSweep: snrDb,
     // Averaging n sweeps cuts the incoherent power by n
-    snrDbAveraged: snrDb + 10 * Math.log10(n),
+    snrDbAveraged: canScore ? snrDb + 10 * Math.log10(n) : null,
     coherence,
     sweepCorrelation: corrN > 0 ? corrSum / corrN : null,
     standoffMm: dMean,

@@ -173,6 +173,22 @@ class Rover:
         self.board_pos_valid = False
         self.last_status_at = None
 
+        # Definitive move completion. The board sends exactly ONE `done` per
+        # dispatched move, when every axis it commanded has stopped -- so this
+        # counter advancing is the only unambiguous "the move is finished"
+        # signal there is. Everything else a client can see is a heuristic:
+        # `moving` is false in the window between acknowledging a move and
+        # dispatching it from the queue (the same window that makes ideal_mm
+        # unresyncable), and position alone cannot tell a move that has not
+        # started from one that has finished.
+        #
+        # Monotonic for the life of this process. A client snapshots it when it
+        # issues a move and waits for it to advance, which is immune to that
+        # window and needs no timer.
+        self.moves_done = 0
+        self.last_done_seq = None
+        self.last_done_reason = None
+
         # Odometer since the last declared position: total commanded travel, in
         # mm, which is the exposure to wheel slip and missed steps. This is the
         # honest replacement for the old "unconfirmed" budget -- the link is now
@@ -345,6 +361,9 @@ class Rover:
             'position_conflict': self.position_conflict,
             'board_pos_valid': self.board_pos_valid,
             'last_status_at': self.last_status_at,
+            'moves_done': self.moves_done,
+            'last_done_seq': self.last_done_seq,
+            'last_done_reason': self.last_done_reason,
             'last_error': self._last_error,
             'config': dict(self.config),
         }
@@ -551,6 +570,11 @@ class Rover:
                     await self._ingest_hello(msg)
                 elif kind == 'done':
                     reason = STOP_REASON.get(int(msg.get('reason', 0)), '?')
+                    # Recorded BEFORE the ideal-position resync below, so the
+                    # broadcast that follows carries both together.
+                    self.moves_done += 1
+                    self.last_done_seq = msg.get('seq')
+                    self.last_done_reason = reason
                     entry = self._note(
                         f"board done: seq={msg.get('seq')} reason={reason}")
                     await self.broadcast_log(entry)
