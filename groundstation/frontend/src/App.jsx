@@ -13,6 +13,7 @@ import { applyBscanBg, bgForStandoff, backgroundFor, coherentMean } from './lib/
 import { computeSharedScale, computeRowScales, computeGridScales, bgDiagnostics, planViewScales } from './lib/cscanGrid';
 import { cellForIndex, orderedCellForIndex, BG_STATUS, BG_STATUS_TEXT } from './lib/cscanGrid';
 import { useRoverScan } from './hooks/useRoverScan';
+import { useRoverBgScan } from './hooks/useRoverBgScan';
 import { DEFAULT_PARAMS as IMAGING_DEFAULT_PARAMS } from './lib/imagingEffects';
 import ProjectorWindow from './components/ProjectorWindow';
 
@@ -276,6 +277,36 @@ export default function App() {
   const [bgModelCapturing, setBgModelCapturing] = useState(false);
   const [bgModelAccumCount, setBgModelAccumCount] = useState(0);
   const bgModelAccumRef = useRef(null);
+  const [bgScanMode, setBgScanModeState] = useState(
+    () => localStorage.getItem('bgmodel_scan_mode') || 'manual'
+  );
+  const setBgScanMode = useCallback((v) => {
+    localStorage.setItem('bgmodel_scan_mode', v);
+    setBgScanModeState(v);
+  }, []);
+  const [bgRoverSpanMm, setBgRoverSpanMmState] = useState(
+    () => Number(localStorage.getItem('bgmodel_rover_span_mm')) || 50
+  );
+  const setBgRoverSpanMm = useCallback((v) => {
+    const n = Math.max(1, Number(v) || 50);
+    localStorage.setItem('bgmodel_rover_span_mm', String(n));
+    setBgRoverSpanMmState(n);
+  }, []);
+  const [bgRoverStepMm, setBgRoverStepMmState] = useState(
+    () => Number(localStorage.getItem('bgmodel_rover_step_mm')) || 4
+  );
+  const setBgRoverStepMm = useCallback((v) => {
+    const n = Math.max(0.1, Number(v) || 0.4);
+    localStorage.setItem('bgmodel_rover_step_mm', String(n));
+    setBgRoverStepMmState(n);
+  }, []);
+  const [bgRoverDirection, setBgRoverDirectionState] = useState(
+    () => localStorage.getItem('bgmodel_rover_direction') || 'forward'
+  );
+  const setBgRoverDirection = useCallback((v) => {
+    localStorage.setItem('bgmodel_rover_direction', v);
+    setBgRoverDirectionState(v);
+  }, []);
   const [bgModelTesting, setBgModelTesting] = useState(false);
   const [bgModelTestCount, setBgModelTestCount] = useState(0);
   const [bgModelTestResult, setBgModelTestResult] = useState(null);
@@ -1427,6 +1458,33 @@ export default function App() {
     }
   }, [roverScanActive]);
 
+  const requestRoverBgCapture = useCallback(() => {
+    setBgModelCapturing(true);
+    bgModelAccumRef.current = { samples: [], target: bgModelSweepsPerCapture };
+  }, [bgModelSweepsPerCapture]);
+
+  const roverBgScan = useRoverBgScan({
+    roverStatus,
+    roverConnected: roverConnectionStatus === 'connected',
+    sendRover,
+    sfcwRunning,
+    onStartSweep: startSfcwSweep,
+    onStopSweep: stopSfcwSweep,
+    captureCount: bgModelCaptures.length,
+    onRequestCapture: requestRoverBgCapture,
+    sweepsPerCapture: bgModelSweepsPerCapture,
+  });
+
+  const roverBgScanActive = roverBgScan.active;
+  useEffect(() => {
+    if (roverBgScanActive) return;
+    if (bgModelAccumRef.current) {
+      bgModelAccumRef.current = null;
+      setBgModelCapturing(false);
+      setBgModelAccumCount(0);
+    }
+  }, [roverBgScanActive]);
+
   const handleBscanAction = useCallback((action) => {
     if (action === 'start_session') {
       // In rover mode the session ARMS the raster: it starts the sweep and
@@ -1905,6 +1963,15 @@ export default function App() {
         bgModelSweepsPerCapture={bgModelSweepsPerCapture}
         onBgModelSweepsChange={setBgModelSweepsPerCapture}
         onBgModelAction={handleBgModelAction}
+        bgScanMode={bgScanMode}
+        onBgScanModeChange={setBgScanMode}
+        bgRoverSpanMm={bgRoverSpanMm}
+        onBgRoverSpanChange={setBgRoverSpanMm}
+        bgRoverStepMm={bgRoverStepMm}
+        onBgRoverStepChange={setBgRoverStepMm}
+        bgRoverDirection={bgRoverDirection}
+        onBgRoverDirectionChange={setBgRoverDirection}
+        roverBgScan={roverBgScan}
         imagingSnapshot={imagingSnapshot}
         imagingSnapshotName={imagingSnapshotName}
         onLoadImagingSnapshot={handleLoadImagingSnapshot}

@@ -10,7 +10,7 @@ function weakestKnotMm(q) {
   return w.d.toFixed(0);
 }
 
-export default function BgModelPanel({ isConnected, sdrConnected, sfcwRunning, modelCaptures, modelCapturing, accumCount, testing, testCount, testResult, trainingState, trainProgress, trainResult, trainError, sweepsPerCapture = 40, onSweepsChange, stopFreq, onModelAction, lidarMm }) {
+export default function BgModelPanel({ isConnected, sdrConnected, sfcwRunning, modelCaptures, modelCapturing, accumCount, testing, testCount, testResult, trainingState, trainProgress, trainResult, trainError, sweepsPerCapture = 40, onSweepsChange, stopFreq, onModelAction, lidarMm, roverConnected, roverStatus, bgScanMode, onBgScanModeChange, bgRoverSpanMm, onBgRoverSpanChange, bgRoverStepMm, onBgRoverStepChange, bgRoverDirection, onBgRoverDirectionChange, roverBgScan, sendRover }) {
   const [modelName, setModelName] = useState('');
   const lidarBuf = useRef([]);
   const [lidarAvg, setLidarAvg] = useState(null);
@@ -25,6 +25,9 @@ export default function BgModelPanel({ isConnected, sdrConnected, sfcwRunning, m
   }, [lidarMm]);
 
   const canActivate = isConnected && sdrConnected;
+  const canRover = canActivate && roverConnected && roverStatus?.board_connected;
+  const isRover = bgScanMode === 'rover';
+  const roverPositions = bgRoverStepMm > 0 ? Math.floor(bgRoverSpanMm / bgRoverStepMm) + 1 : 0;
   const captureCount = modelCaptures.length;
 
   const totalSamples = modelCaptures.reduce((n, c) => n + c.samples.length, 0);
@@ -41,6 +44,25 @@ export default function BgModelPanel({ isConnected, sdrConnected, sfcwRunning, m
   return (
     <>
       <Section label="Session">
+        <div className="flex rounded-lg border border-white/10 overflow-hidden">
+          <button
+            onClick={() => onBgScanModeChange('manual')}
+            className={cn(
+              'flex-1 px-3 py-1.5 text-xs font-medium transition-all',
+              !isRover ? 'bg-[#a78bfa]/15 text-[#a78bfa]' : 'bg-transparent text-white/40 hover:text-white/60',
+            )}
+          >Manual</button>
+          <button
+            onClick={() => canRover && onBgScanModeChange('rover')}
+            disabled={!canRover}
+            className={cn(
+              'flex-1 px-3 py-1.5 text-xs font-medium transition-all',
+              'disabled:opacity-30 disabled:cursor-not-allowed',
+              isRover ? 'bg-[#a78bfa]/15 text-[#a78bfa]' : 'bg-transparent text-white/40 hover:text-white/60',
+            )}
+          >Rover</button>
+        </div>
+
         <button
           onClick={() => onModelAction(sfcwRunning ? 'stop_session' : 'start_session')}
           disabled={!canActivate}
@@ -78,41 +100,181 @@ export default function BgModelPanel({ isConnected, sdrConnected, sfcwRunning, m
       </Section>
 
       <Section label="Capture">
-        <button
-          onClick={() => onModelAction('capture')}
-          disabled={!sfcwRunning || modelCapturing}
-          className={cn(
-            'group relative flex items-center gap-3 w-full p-4 rounded-2xl border',
-            'transition-all duration-500 cursor-pointer',
-            'disabled:cursor-not-allowed disabled:opacity-40',
-            sfcwRunning && !modelCapturing
-              ? 'bg-[#a78bfa]/8 border-[#a78bfa]/30 hover:border-[#a78bfa]/50'
-              : 'bg-[#0a0a0a]/50 border-white/5',
-          )}
-        >
-          <div className={cn(
-            'flex items-center justify-center w-10 h-10 rounded-xl shrink-0 transition-all duration-500',
-            sfcwRunning && !modelCapturing ? 'bg-[#a78bfa]/15' : 'bg-white/5',
-          )}>
-            {modelCapturing ? (
-              <div className="w-3 h-3 rounded-full border-2 border-[#a78bfa] border-t-transparent animate-spin" />
-            ) : (
-              <svg className="w-4 h-4 text-[#a78bfa]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-              </svg>
+        {!isRover ? (
+          <button
+            onClick={() => onModelAction('capture')}
+            disabled={!sfcwRunning || modelCapturing || roverBgScan?.active}
+            className={cn(
+              'group relative flex items-center gap-3 w-full p-4 rounded-2xl border',
+              'transition-all duration-500 cursor-pointer',
+              'disabled:cursor-not-allowed disabled:opacity-40',
+              sfcwRunning && !modelCapturing
+                ? 'bg-[#a78bfa]/8 border-[#a78bfa]/30 hover:border-[#a78bfa]/50'
+                : 'bg-[#0a0a0a]/50 border-white/5',
             )}
-          </div>
-          <div className="flex flex-col gap-0.5 text-left min-w-0">
-            <span className="text-sm font-semibold text-white">
-              {modelCapturing ? `Capturing ${accumCount}/${sweepsPerCapture}` : 'Capture Position'}
-            </span>
-            <span className="text-xs text-[#555555] leading-relaxed">
-              {modelCapturing ? 'Hold still — averaging sweeps...' :
-               !sfcwRunning ? 'Start session first' :
-               `${captureCount} position${captureCount !== 1 ? 's' : ''} captured`}
-            </span>
-          </div>
-        </button>
+          >
+            <div className={cn(
+              'flex items-center justify-center w-10 h-10 rounded-xl shrink-0 transition-all duration-500',
+              sfcwRunning && !modelCapturing ? 'bg-[#a78bfa]/15' : 'bg-white/5',
+            )}>
+              {modelCapturing ? (
+                <div className="w-3 h-3 rounded-full border-2 border-[#a78bfa] border-t-transparent animate-spin" />
+              ) : (
+                <svg className="w-4 h-4 text-[#a78bfa]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+                </svg>
+              )}
+            </div>
+            <div className="flex flex-col gap-0.5 text-left min-w-0">
+              <span className="text-sm font-semibold text-white">
+                {modelCapturing ? `Capturing ${accumCount}/${sweepsPerCapture}` : 'Capture Position'}
+              </span>
+              <span className="text-xs text-[#555555] leading-relaxed">
+                {modelCapturing ? 'Hold still — averaging sweeps...' :
+                 !sfcwRunning ? 'Start session first' :
+                 `${captureCount} position${captureCount !== 1 ? 's' : ''} captured`}
+              </span>
+            </div>
+          </button>
+        ) : (
+          <>
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl border border-white/8 bg-[#0a0a0a]/60">
+                <span className="text-[10px] font-medium uppercase tracking-wider text-[#555555]">Span (mm)</span>
+                <input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={bgRoverSpanMm}
+                  disabled={roverBgScan?.active}
+                  onChange={e => onBgRoverSpanChange(e.target.value)}
+                  className="w-20 px-2 py-1 rounded-lg text-xs font-mono text-right bg-[#0a0a0a] border border-white/10 text-white outline-none focus:border-[#a78bfa]/50 disabled:opacity-40"
+                />
+              </div>
+              <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl border border-white/8 bg-[#0a0a0a]/60">
+                <span className="text-[10px] font-medium uppercase tracking-wider text-[#555555]">Step (mm)</span>
+                <input
+                  type="number"
+                  min={0.1}
+                  step={0.1}
+                  value={bgRoverStepMm}
+                  disabled={roverBgScan?.active}
+                  onChange={e => onBgRoverStepChange(e.target.value)}
+                  className="w-20 px-2 py-1 rounded-lg text-xs font-mono text-right bg-[#0a0a0a] border border-white/10 text-white outline-none focus:border-[#a78bfa]/50 disabled:opacity-40"
+                />
+              </div>
+              <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl border border-white/8 bg-[#0a0a0a]/60">
+                <span className="text-[10px] font-medium uppercase tracking-wider text-[#555555]">Direction</span>
+                <div className="flex rounded-md border border-white/10 overflow-hidden">
+                  <button
+                    onClick={() => onBgRoverDirectionChange('forward')}
+                    disabled={roverBgScan?.active}
+                    className={cn(
+                      'px-2.5 py-1 text-[10px] font-medium transition-all',
+                      'disabled:opacity-40',
+                      bgRoverDirection !== 'backward' ? 'bg-[#a78bfa]/15 text-[#a78bfa]' : 'text-white/40 hover:text-white/60',
+                    )}
+                  >+X</button>
+                  <button
+                    onClick={() => onBgRoverDirectionChange('backward')}
+                    disabled={roverBgScan?.active}
+                    className={cn(
+                      'px-2.5 py-1 text-[10px] font-medium transition-all',
+                      'disabled:opacity-40',
+                      bgRoverDirection === 'backward' ? 'bg-[#a78bfa]/15 text-[#a78bfa]' : 'text-white/40 hover:text-white/60',
+                    )}
+                  >−X</button>
+                </div>
+              </div>
+              <div className="px-3 py-1.5 text-[10px] text-white/40 font-mono">
+                {roverPositions} positions over {bgRoverSpanMm.toFixed(1)} mm ({bgRoverDirection === 'backward' ? '−X' : '+X'})
+              </div>
+            </div>
+
+            <button
+              onClick={() => roverBgScan?.active
+                ? roverBgScan.stop()
+                : roverBgScan?.start({ spanMm: bgRoverSpanMm, stepMm: bgRoverStepMm, direction: bgRoverDirection })
+              }
+              disabled={!canRover || (!roverBgScan?.active && roverPositions < 2)}
+              className={cn(
+                'group relative flex items-center gap-3 w-full p-4 rounded-2xl border',
+                'transition-all duration-500 cursor-pointer',
+                'disabled:cursor-not-allowed disabled:opacity-40',
+                roverBgScan?.active
+                  ? 'bg-orange-500/8 border-orange-500/30 hover:border-orange-500/50'
+                  : canRover
+                    ? 'bg-[#a78bfa]/8 border-[#a78bfa]/30 hover:border-[#a78bfa]/50'
+                    : 'bg-[#0a0a0a]/50 border-white/5',
+              )}
+            >
+              <div className={cn(
+                'flex items-center justify-center w-10 h-10 rounded-xl shrink-0 transition-all duration-500',
+                roverBgScan?.active ? 'bg-orange-500/15' : canRover ? 'bg-[#a78bfa]/15' : 'bg-white/5',
+              )}>
+                {roverBgScan?.active ? (
+                  <div className="w-3 h-3 rounded-sm bg-orange-400" />
+                ) : (
+                  <svg className="w-4 h-4 text-[#a78bfa]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M5 3l14 9-14 9V3z" />
+                  </svg>
+                )}
+              </div>
+              <div className="flex flex-col gap-0.5 text-left min-w-0">
+                <span className="text-sm font-semibold text-white">
+                  {roverBgScan?.active ? 'Stop Scan' : 'Start Scan'}
+                </span>
+                <span className="text-xs text-[#555555] leading-relaxed">
+                  {roverBgScan?.active
+                    ? roverBgScan.message || `Position ${(roverBgScan.index || 0) + 1} of ${roverBgScan.total}`
+                    : !canRover ? 'Rover not connected'
+                    : `${roverPositions} positions, ${sweepsPerCapture} sweeps each`}
+                </span>
+              </div>
+            </button>
+
+            {roverBgScan?.active && (
+              <div className="flex items-center gap-2 px-3 py-2 rounded-xl border border-[#a78bfa]/20 bg-[#a78bfa]/5">
+                <div className="w-3 h-3 rounded-full border-2 border-[#a78bfa] border-t-transparent animate-spin" />
+                <span className="text-[10px] text-[#a78bfa] capitalize">
+                  {roverBgScan.phase} — position {(roverBgScan.index || 0) + 1} of {roverBgScan.total}
+                </span>
+              </div>
+            )}
+
+            {!roverBgScan?.active && roverBgScan?.error && (
+              <div className="p-3 rounded-xl border border-red-500/20 bg-red-500/5">
+                <span className="text-xs text-red-400">{roverBgScan.error}</span>
+              </div>
+            )}
+
+            {!roverBgScan?.active && roverBgScan?.phase === 'done' && (
+              <div className="p-3 rounded-xl border border-green-500/20 bg-green-500/5">
+                <span className="text-xs text-green-400">{roverBgScan.message}</span>
+              </div>
+            )}
+
+            {!roverBgScan?.active && roverBgScan?.phase === 'stopped' && (
+              <div className="p-3 rounded-xl border border-yellow-500/20 bg-yellow-500/5">
+                <span className="text-xs text-yellow-400">{roverBgScan.message}</span>
+              </div>
+            )}
+
+            {isRover && roverStatus?.estop && (
+              <div className="flex flex-col gap-2">
+                <button
+                  onClick={() => sendRover?.({ cmd: 'rover_clear_estop' })}
+                  className="w-full px-3 py-2.5 rounded-lg text-xs font-medium transition-all border bg-amber-500/10 border-amber-500/30 text-amber-400 hover:bg-amber-500/20"
+                >
+                  Clear E-Stop
+                </button>
+                <div className="text-[9px] text-amber-400/60 leading-relaxed px-1">
+                  Position is no longer trustworthy — re-measure offset before resuming.
+                </div>
+              </div>
+            )}
+          </>
+        )}
 
         <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-xl border border-white/8 bg-[#0a0a0a]/60">
           <div className="flex flex-col gap-0.5 min-w-0">
@@ -126,7 +288,7 @@ export default function BgModelPanel({ isConnected, sdrConnected, sfcwRunning, m
             min={1}
             max={500}
             value={sweepsPerCapture}
-            disabled={modelCapturing}
+            disabled={modelCapturing || roverBgScan?.active}
             onChange={e => onSweepsChange && onSweepsChange(e.target.value)}
             className="w-16 px-2 py-1 rounded-lg text-xs font-mono text-right bg-[#0a0a0a] border border-white/10 text-white outline-none focus:border-[#a78bfa]/50 disabled:opacity-40"
           />
@@ -135,10 +297,10 @@ export default function BgModelPanel({ isConnected, sdrConnected, sfcwRunning, m
         <div className="grid grid-cols-2 gap-2">
           <button
             onClick={() => onModelAction('undo')}
-            disabled={captureCount === 0}
+            disabled={captureCount === 0 || roverBgScan?.active}
             className={cn(
               'px-3 py-2 rounded-lg text-xs font-medium transition-all',
-              captureCount > 0
+              captureCount > 0 && !roverBgScan?.active
                 ? 'bg-white/5 border border-white/10 text-white/70 hover:bg-white/10 hover:text-white'
                 : 'bg-white/2 border border-white/5 text-white/20 cursor-not-allowed'
             )}
@@ -147,10 +309,10 @@ export default function BgModelPanel({ isConnected, sdrConnected, sfcwRunning, m
           </button>
           <button
             onClick={() => onModelAction('clear')}
-            disabled={captureCount === 0}
+            disabled={captureCount === 0 || roverBgScan?.active}
             className={cn(
               'px-3 py-2 rounded-lg text-xs font-medium transition-all',
-              captureCount > 0
+              captureCount > 0 && !roverBgScan?.active
                 ? 'bg-white/5 border border-white/10 text-white/70 hover:bg-white/10 hover:text-white'
                 : 'bg-white/2 border border-white/5 text-white/20 cursor-not-allowed'
             )}
