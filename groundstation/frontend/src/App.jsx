@@ -229,7 +229,7 @@ export default function App() {
     // See CLAUDE.md "Sweep-to-sweep variability is set by the REFERENCE channel's level".
     tx2Gain: 45,
     rx2Gain: 5,
-    rangeOffset: 0.5,
+    rangeOffset: 0.378,
   });
 
   const sfcwParamsRef = useRef(sfcwParams);

@@ -63,7 +63,7 @@ SFCW_PARAMS = {
     # captured at one reference gain is invalid at another, silently. These are now
     # pushed by App.jsx too, so both sides carry the same numbers.
     'tx1Gain': 50, 'rx1Gain': 25, 'tx2Gain': 45, 'rx2Gain': 5,
-    'rangeOffset': 0.5,
+    'rangeOffset': 0.378,
 }
 
 
