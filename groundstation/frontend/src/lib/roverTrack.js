@@ -127,9 +127,11 @@ export function createTrack(maxSamples = TRACK_MAX) {
 // Bound on how many sweeps one cell keeps. Every look is stored (the
 // coherent/incoherent choice is a DISPLAY control and has to stay flippable
 // against recorded data), so an unbounded slow pass would grow the export
-// without limit. 64 is far above what any usable speed produces -- 5 mm pitch
-// at 15 mm/s is 12 -- so in practice this never bites; when it does, the count
-// is reported rather than silently swallowed.
+// without limit.
+//
+// It bites more often than it looks: a 50 mm pitch at 20 mm/s is 2.5 s per
+// cell, i.e. ~90 sweeps at 36 Hz. Which is why the cap DECIMATES rather than
+// truncating -- see `add` below.
 const MAX_PER_CELL = 64;
 
 /**
@@ -143,7 +145,7 @@ const MAX_PER_CELL = 64;
  */
 export function createRowBin({ iy, hCount, hStepMm, originXMm, maxPerCell = MAX_PER_CELL }) {
   const bins = new Map();
-  let kept = 0, outside = 0, dropped = 0;
+  let kept = 0, outside = 0, dropped = 0, decimated = 0;
 
   function add(x, sample, meta) {
     // Math.round is the half-pitch rule: a sweep is credited to the cell whose
@@ -155,10 +157,35 @@ export function createRowBin({ iy, hCount, hStepMm, originXMm, maxPerCell = MAX_
       // The Pi's own profile and the sweep geometry are taken from the FIRST
       // sweep to land in the cell and never repeated -- they are identical
       // across a row and storing them per sweep would multiply the export.
-      b = { ix, sweeps: [], xs: [], meta };
+      b = { ix, sweeps: [], xs: [], meta, seen: 0, stride: 1 };
       bins.set(ix, b);
     }
-    if (b.sweeps.length >= maxPerCell) { dropped += 1; return ix; }
+    b.seen += 1;
+    // OVER THE CAP, DECIMATE -- do not truncate. Dropping every sweep past the
+    // 64th keeps the FIRST 64, which are the ones taken over the leading part
+    // of the cell, so both the coherent average and the reported position are
+    // pulled towards the cell's leading edge. Measured on the simulator, 50 mm
+    // pitch at 20 mm/s: every cell's `rover_x_mm` came out 7 mm short of its
+    // own centre, biased in the direction of travel and therefore opposite on
+    // alternate rows of a snake -- the same signature as an uncorrected
+    // latency, and just as invisible.
+    //
+    // Halving the kept set and doubling the stride keeps a set that still
+    // spans the whole cell, at between maxPerCell/2 and maxPerCell looks.
+    if (b.seen % b.stride !== 0) { dropped += 1; return ix; }
+    if (b.sweeps.length >= maxPerCell) {
+      for (let i = 2, j = 1; i < b.sweeps.length; i += 2, j += 1) {
+        b.sweeps[j] = b.sweeps[i];
+        b.xs[j] = b.xs[i];
+      }
+      const half = Math.ceil(b.sweeps.length / 2);
+      decimated += b.sweeps.length - half;
+      kept -= b.sweeps.length - half;
+      b.sweeps.length = half;
+      b.xs.length = half;
+      b.stride *= 2;
+      if (b.seen % b.stride !== 0) { dropped += 1; return ix; }
+    }
     b.sweeps.push(sample);
     b.xs.push(x);
     kept += 1;
@@ -194,7 +221,7 @@ export function createRowBin({ iy, hCount, hStepMm, originXMm, maxPerCell = MAX_
     }
     return {
       iy, filled, total: hCount, holes: hCount - filled, maxHoleRun: worst,
-      kept, outside, dropped,
+      kept, outside, dropped, decimated,
       perCell: filled ? kept / filled : 0,
     };
   }
@@ -321,6 +348,17 @@ export function createRowCollector() {
       bin = null; geom = null; pending = [];
       return out;
     },
+    // The row AS IT STANDS, without closing it -- what the plan view draws
+    // while the rover is still driving the row.
+    //
+    // `cells()` is a pure read of the bins (it re-derives each cell's mean and
+    // spread from the samples it holds), so calling it repeatedly is safe and
+    // changes nothing: a cell returned here and the same cell returned by
+    // closeRow() differ only in the sweeps that landed in between. That is what
+    // lets the live preview and the final harvest go through one code path in
+    // App -- the alternative, a separate "preview" record shape, would be a
+    // second thing to keep in step with buildCellRecord.
+    liveRow: () => (bin ? { geom, cells: bin.cells(), kept: bin.summary().kept } : null),
     isOpen: () => bin !== null,
     summary: () => (bin ? { ...bin.summary(), pending: pending.length } : null),
     trackSize: () => track.size(),

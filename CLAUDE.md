@@ -877,6 +877,182 @@ no test runner in this repo, so these were throwaway scripts. `vite build` passe
    `v_scan/150` of the row time -- 17% at 25 mm/s but 100% at 150).
 3. **Is the ~11 Hz status rate really 11 Hz under load?** Everything above assumes it.
 
+## Continuous rover raster: six bugs found and fixed (2026-09-07)
+
+Driven head-first against a simulated ramped gantry (trapezoidal ramps, a 90 ms
+command link so the ack-before-dispatch window is real, ~11 Hz status frames, the
+Pi's own broadcast-on-`done`-with-a-stale-position behaviour, and a 36 Hz sweep
+stream) with React shimmed to four hooks and a fake clock. 31 checks; `vite build`
+passes, `rover/test/build_check.sh` passes. Throwaway scripts, as usual.
+
+Two symptoms were reported: the drive to the origin "sometimes doesn't go and stop
+at the mentioned values", and the rig "sometimes goes down a row while it's
+sweeping instead of scanning the row then going down". Both reproduce, and they
+are different bugs.
+
+**1. `start()` accepted a MOVING rover, so the origin was read off wherever the
+last status frame caught it.** The origin is `status.x_mm - roverOriginRightMm`,
+i.e. it is only meaningful at rest -- but nothing checked. Reproduced: pressing
+Start 200 ms into a 600 mm nudge anchored the grid on a position the rover was
+already driving away from, and the homing move then timed out chasing it. Gentler
+cases do not error, they just silently put the whole grid somewhere else. `start()`
+now refuses unless `!moving && pending_moves == 0 && queue_depth == 0`.
+
+**2. The origin was RE-DERIVED on every session, including a resume.** The
+"right of / below origin" offsets describe where the head was standing *when they
+were measured*; after a stop it is parked wherever the abandoned row left it, so
+re-deriving anchors the rest of the grid somewhere the operator never measured.
+The origin is now **anchored once per scan** (`roverOriginAnchor` in `App.jsx`,
+published by the hook through `onOriginAnchor`) and reused by every later session
+on that grid. Cleared by New Scan and by import -- deliberately NOT restored from
+an export, for the same reason `scanMode` is not: it is a live property of the rig.
+An anchor whose grid geometry no longer matches is refused rather than reused,
+because changing a count or a step re-keys every cell.
+
+**3. Resume skipped a row that was stopped part way through -- this is the "goes
+down a row while sweeping".** Resume read `capturedRows`, a count of rows holding
+*anything*, so a row stopped mid-traverse counted as done and the next session
+drove down past it. Measured: stopping mid-row-1 of a 3-row grid harvested 6 of 11
+cells and the resume started on row 2, leaving a half-empty row in the middle of
+the grid with nothing on screen saying so -- and, seen from the rig, the raster
+"going down a row" instead of scanning one. Resume is now the first row that is not
+FULL (`firstIncompleteRoverRow` / `roverRowFill` in `cscanGrid.js`, passed to the
+hook as `rowFill`), and `handleRoverRowClose` REPLACES a row's existing columns
+rather than appending beside them -- otherwise a re-driven row leaves two records
+for one cell, which the plan view resolves by drawing the last one while the
+export, SAR and the colour scales all see both.
+
+**4. `traverseOverrun` could be SHORTER THAN HALF A CELL PITCH, so the run-up was
+inside the grid rather than outside it.** Cells are keyed by
+`Math.round((x - originX)/pitch)`, so everything within half a pitch of column 0's
+centre lands in column 0 -- including the rig standing still at the row entry
+waiting for the traverse command to reach the board, and the whole acceleration
+ramp, which is exactly what the overrun exists to exclude. At 25 mm/s the overrun
+was 10.6 mm against a 25 mm half-pitch (50 mm pitch is what this bench uses).
+Measured before the fix, 20 mm/s / 50 mm pitch: end cells took stationary and
+ramping sweeps and every cell reported a position ~7 mm short of its centre.
+`traverseOverrun(speed, accel, hStepMm)` now floors at `pitch/2 + margin`; worst
+cell error over a row went from 6.8 mm to 0.8 mm. **Both the hook and
+`CscanPanel.jsx` must pass the pitch** -- the panel shows the overrun and checks it
+against the soft limits, so a disagreement would refuse or admit the wrong grids.
+
+**5. The per-cell cap TRUNCATED, which biases the coherent average in the
+direction of travel.** `MAX_PER_CELL = 64` dropped everything past the 64th sweep,
+i.e. kept the ones taken over the leading part of the cell. CLAUDE.md's own claim
+that "in practice this never bites" was derived at a 5 mm pitch; at 50 mm and
+20 mm/s a cell holds ~90 sweeps. Measured: every cell's `rover_x_mm` came out 7 mm
+short of its own centre, biased with the direction of travel and therefore opposite
+on alternate rows of a snake -- the same signature as an uncorrected
+`roverLatencyMs`, and just as invisible. `createRowBin` now **decimates**: on
+hitting the cap it halves the kept set (keep every other) and doubles the stride,
+so the retained looks still span the whole cell at between 32 and 64 of them.
+Residual position error after the fix: 0.8 mm. `summary()` reports `decimated`.
+
+**6. `moves_done` advancing does not mean OUR move finished.** The counter is
+snapshotted from whatever status frame the hook happens to hold, so a `done` for
+somebody else's move -- an operator nudge, a stop, a jog ending -- still in flight
+when the raster issues a move makes that snapshot stale by one, and the next frame
+reads as an instant completion. Arrival then collapses back onto position alone,
+which cannot tell a move that has not started from one that has finished: the exact
+ack-before-dispatch window the counter exists to close. It also lets the LATCHED
+`last_done_reason` from a previous session abort a scan on its first move.
+
+Fixed structurally, Pi-side: `rover_move_abs` accepts an opaque **`token`**, which
+`rover_server.py` carries through `_outbox`, maps onto the board sequence the move
+is actually sent with (`pump` now keeps `send_board`'s return), and echoes as
+**`last_done_token`** in status when THAT move's `done` arrives. Waiting for your
+own token back is immune to every other mover on the link and needs no timer. A Pi
+without it falls back to `moves_done` **plus a `MOVE_ACK_FLOOR_MS = 300` floor** (a
+link round trip plus one status period, which no genuine completion can beat), and
+then to the old `MIN_MOVE_MS` timer.
+
+**Also added: a silent-link watchdog.** `board_connected` going false is the Pi
+reporting a known state; a Pi that has simply gone quiet was invisible, and the
+raster would keep issuing moves against a position it could no longer see. The tick
+now aborts after `STATUS_STALE_MS = 4000` without `last_status_at` changing. Note
+it only ever compares the Pi's clock with ITSELF -- what is timed locally is how
+long we have gone without seeing it move.
+
+**Firmware (`rover/rover.ino`): `stop_reason` is per axis and `moveTo` does not
+clear it**, so an axis left out of a move still carried whatever ended its previous
+one -- and `sendDone` read both axes unconditionally. A Y-only move following an X
+move that ended on a limit would report `limit`, and the Pi aborts a raster on any
+reason but `completed`. `dispatchQueued` now clears `stop_reason` on the axes it
+commands and records them in `inFlightAxes`; the done block reads only those.
+Dormant for the raster as it stands (`issueMove` always sends both axes) but live
+for nudges, and one stale byte is a lost scan.
+
+**Also: the hook restores `x_max_speed` on unmount.** `set_config` PERSISTS on the
+Pi, so a tab closed mid-raster left the rail at the scan speed and quietly slowed
+every later nudge and jog. Best effort -- a hard close can outrun the send.
+
+### The plan view now fills DURING a row, not at the end of one (2026-09-08)
+
+Reported: "each row scan updates at the end, can we get the grid to update real
+time, like before." Correct -- the continuous raster emits a row WHOLE, so on a
+1 m row at 25 mm/s the plan view sat blank for ~25 s and then filled in one jump.
+The stepped raster had always drawn each cell as it was captured. The plan view is
+the only thing on screen that says the scan is working, so it should not go dark
+for the length of a row.
+
+`createRowCollector` gained **`liveRow()`** -- `{ geom, cells, kept }` read from
+the open bin WITHOUT closing it. `cells()` was already a pure re-derivation of
+each bin's mean and spread, so calling it repeatedly changes nothing; a cell it
+returns and the same cell from `closeRow()` differ only in the sweeps that landed
+in between.
+
+App's `publishRowStats` (already throttled to 250 ms for the fill counter) now
+also flushes those cells into `bscanData`. **The live flush and the end-of-row
+harvest go through ONE function, `writeRoverRowCells`** -- the replace-by-(ix,iy)
+merge that already existed for resume. That is what makes it safe to call
+repeatedly (each flush supersedes the last, so the close is just the final flush)
+and it is why there is no separate "preview" record shape to keep in step with
+`buildCellRecord`. A cell drawn while the rover is still driving is built by
+exactly the same code as the one that reaches the export.
+
+Verified against the simulated gantry: a row's on-screen fill climbs **1 cell at
+3 s to 11 by 23 s** where it used to show nothing until 25 s; the completed grid
+is **byte-identical** to the close-only path (ix, iy, sweep count, xMean, xStd,
+target, and array ORDER -- so START and the dashed path still read right); no
+duplicate cells; and a stop mid-row keeps at least what the flushes had already
+shown. 17 checks.
+
+Three things that are load-bearing:
+
+- **The flush is skipped unless the bin's `kept` count changed** (`roverRowKeptRef`,
+  reset to -1 on open and on close so those two always write). Rewriting identical
+  cells would churn every downstream memo for no visible change -- which matters
+  during the run-up and wherever the rover is over ground the grid does not cover.
+- **4 Hz is a considered rate, not a default.** The cost is the whole derive chain
+  re-running: `applyBscanBg` over every cell, then the shared scale and the focused
+  cell values. Measured on the Pi at 8 sweeps a cell, **32 ms for a 147-cell grid
+  and 52 ms for 303 cells** -- ~13-21% of one core at 4 Hz there, less on the
+  groundstation. Raising the rate is not free, and 4 Hz already puts two updates
+  inside a 50 mm cell at 100 mm/s. If it ever needs to go faster, memoise
+  `applyBscanBg` PER CELL first (it is a pure per-cell map with no cross-cell
+  dependency, so a WeakMap on the record keyed by the subtraction options works);
+  do not just lower the interval.
+- **The SAR worker's 300 ms debounce therefore never fires DURING a traverse**
+  (250 < 300). Deliberate: a reconstruction of a half-driven row is discarded by
+  the next flush anyway, and it still runs at every row change, where the flushes
+  stop because `publishRowStats` is gated on `isOpen()`.
+
+### What the harness checks, and what it cannot
+
+31 checks: a clean 11x3 raster (33 cells, every cell within 2 mm of its column
+centre, scan speed applied and restored); start refused while moving and accepted
+once at rest; stop mid-row then resume (same anchor, no duplicate cells, grid ends
+full); the counter fallback with no token support; a silent link aborting while
+still harvesting the partial row; a run-up that leaves the rail refused; stepped
+mode still snaking `0,1 1,1 2,1 3,1 3,0 2,0 1,0 0,0`; every row change purely
+vertical with one row_start and one traverse per row; and an anchor from a
+different geometry refused.
+
+The gantry is a KINEMATIC model of a perfect machine -- no missed steps, no slip,
+no WiFi jitter beyond a fixed link delay, and the sweep stream never drops. It
+validates protocol and control flow only. `pi/rover/rover_sim.py` remains the way to
+exercise the real server end to end. **Not yet run on the rig.**
+
 ## Imaging Bench Panel — Offline Effect Comparison (2026-08-23)
 
 Panel id `imaging` (`ImagingPanel.jsx` + `ImagingDisplay.jsx` + `lib/imagingEffects.js`),

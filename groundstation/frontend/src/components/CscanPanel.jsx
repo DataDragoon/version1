@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { cn } from '@/lib/utils';
 import { Section, InfoTile } from './Sidebar';
 import { orderedCellForIndex, gridStats, gridRoverExtent, gridRoverExtentContinuous,
-  traverseOverrun, axisMoveSeconds, accelDistanceSeconds,
+  traverseOverrun, axisMoveSeconds, accelDistanceSeconds, firstIncompleteRoverRow,
   BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
 import { samplingFor, NOMINAL_SWEEP_MS } from '@/lib/roverTrack';
 import { MIN_MOVE_MS } from '@/hooks/useRoverScan';
@@ -34,6 +34,7 @@ export default function CscanPanel({
   scaleLink, onScaleLinkChange, gridScales, liveDiag,
   projection, onProjectionChange, projector, onProjectorChange,
   roverConnected, roverStatus, sendRover, roverScan, roverRowStats, sweepPeriodMs,
+  originAnchor,
 }) {
   const {
     hStep, hCount, vStep, vCount, gateStart, gateEnd, metric,
@@ -152,6 +153,9 @@ export default function CscanPanel({
   // operator says the head is standing relative to it. Shown before the scan
   // starts so a wrong entry is visible against the soft limits, not discovered
   // by driving into the end of a rail that has no endstop.
+  // The row the next session will (re)start on: the first that is not FULL.
+  const resumeRow = roverMode ? firstIncompleteRoverRow(scanData, params) : 0;
+
   const originPreview = (roverMode && roverStatus)
     ? {
         x: roverStatus.x_mm - (Number(roverOriginRightMm) || 0),
@@ -164,7 +168,12 @@ export default function CscanPanel({
   const continuous = roverTraverse !== 'stepped';
   // A continuous raster reaches past the grid at both ends of every row, so the
   // run-up is part of what has to fit inside the soft limits.
-  const overrunMm = continuous ? traverseOverrun(roverSpeedMmS, cfg?.x_accel || 500) : 0;
+  // The pitch is part of the overrun: cells are keyed by rounding position to
+  // the nearest column, so a run-up shorter than half a pitch lands INSIDE the
+  // first column instead of outside the grid.
+  const overrunMm = continuous
+    ? traverseOverrun(roverSpeedMmS, cfg?.x_accel || 500, hStep * 10)
+    : 0;
   const extent = originPreview
     ? (continuous
         ? gridRoverExtentContinuous(params, originPreview, overrunMm)
@@ -407,6 +416,29 @@ export default function CscanPanel({
                 max={100000}
               />
             </div>
+            {/* Once a raster has been armed on this grid its origin is FIXED and
+                every later session reuses it. The offsets above describe where
+                the head was standing when they were measured, so re-deriving
+                them on a resume -- with the head parked wherever the last row
+                was abandoned -- would anchor the rest of the grid somewhere
+                the operator never measured. Shown so the operator can see which
+                of the two is in force. */}
+            {originAnchor ? (
+              <div className="px-2 py-1.5 rounded-lg bg-[#6B9BD2]/8 border border-[#6B9BD2]/20 text-[9px] text-white/55 leading-relaxed">
+                <span className="text-[#6B9BD2] font-medium">Origin anchored</span>
+                {' '}at ({originAnchor.x.toFixed(1)}, {originAnchor.y.toFixed(1)}) mm.
+                This scan keeps that anchor for every session on it, so the
+                offsets above are ignored until New Scan — a resume lands on the
+                same grid wherever the head happens to be parked.
+                {resumeRow > 0 && ` Next session resumes on row ${resumeRow + 1} of ${vCount}.`}
+              </div>
+            ) : (
+              <div className="px-2 py-1.5 rounded-lg bg-[#0a0a0a]/60 border border-white/5 text-[9px] text-white/40 leading-relaxed">
+                The rover must be at rest when the session starts — the origin is
+                measured from where the head is standing, and it is fixed for the
+                rest of this scan.
+              </div>
+            )}
             {/* How a row is walked. Continuous drives the whole row in one
                 move and bins the sweeps by the position they were taken at;
                 stepped stops at every cell. At a 27.5 ms sweep the per-cell

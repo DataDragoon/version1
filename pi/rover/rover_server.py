@@ -189,6 +189,23 @@ class Rover:
         self.last_done_seq = None
         self.last_done_reason = None
 
+        # Exact, per-move completion. `moves_done` advancing is unambiguous
+        # about SOMETHING having finished, but a client that snapshots the
+        # counter when it issues a move can snapshot a status frame that
+        # predates a `done` for somebody else's move -- an operator nudge, a
+        # stop, a jog ending -- and then read that stale advance as its own move
+        # completing instantly. That collapses arrival detection back onto
+        # position alone, which is exactly the ack-before-dispatch window the
+        # counter exists to close.
+        #
+        # So a client may attach an opaque `token` to a move; it is carried
+        # through the outbox, mapped onto the board sequence the move is
+        # actually sent with, and echoed here when THAT move's `done` arrives.
+        # Waiting for `last_done_token` to equal your own is immune to every
+        # other mover on the link, and needs no timer.
+        self.last_done_token = None
+        self._move_tokens = {}          # board seq -> caller's token
+
         # Odometer since the last declared position: total commanded travel, in
         # mm, which is the exposure to wheel slip and missed steps. This is the
         # honest replacement for the old "unconfirmed" budget -- the link is now
@@ -364,6 +381,7 @@ class Rover:
             'moves_done': self.moves_done,
             'last_done_seq': self.last_done_seq,
             'last_done_reason': self.last_done_reason,
+            'last_done_token': self.last_done_token,
             'last_error': self._last_error,
             'config': dict(self.config),
         }
@@ -575,6 +593,13 @@ class Rover:
                     self.moves_done += 1
                     self.last_done_seq = msg.get('seq')
                     self.last_done_reason = reason
+                    # None for a move nobody tagged, which is the honest answer:
+                    # it says "that done was not yours" to every waiting client.
+                    try:
+                        done_seq = int(msg.get('seq', -1))
+                    except (TypeError, ValueError):
+                        done_seq = -1
+                    self.last_done_token = self._move_tokens.pop(done_seq, None)
                     entry = self._note(
                         f"board done: seq={msg.get('seq')} reason={reason}")
                     await self.broadcast_log(entry)
@@ -671,9 +696,16 @@ class Rover:
             if m['y'] is not None:
                 cmd['v'] = self.to_steps('y', m['y'])
             self._board_queue += 1
-            await self.send_board(**cmd)
+            seq = await self.send_board(**cmd)
+            if m.get('token') is not None:
+                # Bounded: the board's queue is 4 deep and a token is only ever
+                # resolved by its own `done`, but a caller that abandons moves
+                # (a jog, an E-stop) leaves entries nothing will ever pop.
+                if len(self._move_tokens) > 64:
+                    self._move_tokens.clear()
+                self._move_tokens[seq] = m['token']
 
-    async def move_to_mm(self, x_mm=None, y_mm=None):
+    async def move_to_mm(self, x_mm=None, y_mm=None, token=None):
         """Absolute move, always sent as an absolute step target.
 
         Absolute targets are what keep quantisation from accumulating: the error
@@ -717,7 +749,7 @@ class Rover:
             self.ideal_mm['x'] = x_mm
         if y_mm is not None:
             self.ideal_mm['y'] = y_mm
-        self._outbox.append({'x': x_mm, 'y': y_mm})
+        self._outbox.append({'x': x_mm, 'y': y_mm, 'token': token})
         await self.pump()
 
     async def move_rel_mm(self, dx_mm=0.0, dy_mm=0.0):
@@ -882,7 +914,8 @@ async def dispatch(rover, ws, cmd):
         elif action == 'rover_move_abs':
             await rover.move_to_mm(
                 x_mm=float(cmd['x_mm']) if 'x_mm' in cmd else None,
-                y_mm=float(cmd['y_mm']) if 'y_mm' in cmd else None)
+                y_mm=float(cmd['y_mm']) if 'y_mm' in cmd else None,
+                token=cmd.get('token'))
         elif action == 'rover_calibrate':
             await rover.calibrate(cmd.get('axis'),
                                   float(cmd.get('commanded_mm', 0)),

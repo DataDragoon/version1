@@ -92,7 +92,7 @@ export default function Sidebar({
   bscanParams,
   onBscanParamsChange,
   onBscanAction,
-  roverScan, roverRowStats, sweepPeriodMs,
+  roverScan, roverRowStats, sweepPeriodMs, roverOriginAnchor,
   bscanScaleMode,
   onBscanScaleModeChange,
   bscanDisplayMode,
@@ -435,6 +435,7 @@ export default function Sidebar({
                   sendRover={sendRover}
                   roverScan={roverScan}
                   roverRowStats={roverRowStats}
+                  originAnchor={roverOriginAnchor}
                   sweepPeriodMs={sweepPeriodMs}
                   params={bscanParams}
                   onParamsChange={onBscanParamsChange}

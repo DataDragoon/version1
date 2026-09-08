@@ -4,6 +4,13 @@ import {
   gridRoverExtentContinuous, rowTraverse, traverseOverrun,
 } from '../lib/cscanGrid';
 
+// Unique per move for the life of this page, and unique ACROSS pages: the Pi
+// echoes the last token it saw, so a reloaded tab must not be able to mistake
+// the previous tab's completion for its own.
+const TOKEN_PREFIX = `cs${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+let tokenCounter = 0;
+const nextMoveToken = () => `${TOKEN_PREFIX}-${++tokenCounter}`;
+
 // Automated C-scan raster driven by the rover gantry.
 //
 // The machine is deliberately a ref + interval rather than a chain of effects:
@@ -48,6 +55,30 @@ const TICK_MS = 40;
 // that counter to advance is exact and needs no timer at all.
 export const MIN_MOVE_MS = 500;
 
+// Floor under "the move has finished" on the FALLBACK completion paths only.
+//
+// `moves_done` advancing says something finished, not that OUR move did: the
+// counter is snapshotted from whatever status frame we happen to hold, and a
+// `done` for somebody else's move (an operator nudge, a stop, a jog ending)
+// that is still in flight when the raster issues a move makes that snapshot
+// stale by one -- so the very next frame reads as an instant completion, and
+// arrival collapses back onto position alone. Position alone cannot tell a
+// move that has not started from one that has finished, which is the whole
+// reason the counter is here.
+//
+// A move cannot possibly be reported finished before it has reached the board
+// and a status frame has come back, so requiring a link round trip plus one
+// status period closes that window. The token path below is exact and skips
+// it entirely.
+const MOVE_ACK_FLOOR_MS = 300;
+
+// The link is up but the Pi has stopped telling us anything. Distinct from
+// `board_connected` going false, which is the Pi reporting a known state; this
+// is the Pi (or the browser tab) having gone quiet while the gantry may still
+// be driving. There are no endstops, so a raster must not keep issuing moves
+// against a position it can no longer see.
+const STATUS_STALE_MS = 4000;
+
 // Half a step is 65 um on X and 2.5 um on Y, so a millimetre is far looser than
 // the mechanism -- it is here to catch a move that did not happen, not to judge
 // precision.
@@ -72,8 +103,20 @@ const CAPTURE_MS_PER_SWEEP = 2000;
 const IDLE = {
   active: false, phase: 'idle', index: 0, total: 0,
   cell: null, target: null, origin: null, message: null, error: null,
-  row: null, rowsTotal: 0, traverse: 'stepped',
+  row: null, rowsTotal: 0, traverse: 'stepped', anchored: false, resumeRow: 0,
 };
+
+// A stored anchor only means anything for the grid it was taken on: changing a
+// count or a step re-keys every cell, so an anchor from a different geometry
+// would place the raster somewhere the operator never measured. Refuse it and
+// fall back to deriving a fresh one.
+function originAnchorFor(anchor, grid) {
+  if (!anchor || !isFinite(anchor.x) || !isFinite(anchor.y)) return null;
+  const same = (a, b) => Math.abs((Number(a) || 0) - (Number(b) || 0)) < 1e-9;
+  if (!same(anchor.hCount, grid.hCount) || !same(anchor.vCount, grid.vCount)
+      || !same(anchor.hStep, grid.hStep) || !same(anchor.vStep, grid.vStep)) return null;
+  return { x: anchor.x, y: anchor.y };
+}
 
 function clampAxis(value, lo, hi) {
   if (lo > hi) [lo, hi] = [hi, lo];
@@ -95,10 +138,20 @@ export function useRoverScan({
   params, roverStatus, roverConnected, sendRover,
   sfcwRunning, onStartSweep, onStopSweep,
   capturedCount, onRequestCapture, sweepsPerCell,
-  // Continuous mode only. `capturedRows` is how many grid rows already hold
-  // data, which is what a continuous raster resumes on -- a row emits however
-  // many cells its bins filled, so the flat capture count is not a row counter.
-  capturedRows, onRowOpen, onRowClose,
+  // Continuous mode only. `rowFill[r]` is how many DISTINCT columns grid row
+  // `r` (counted from the top, the order the rover walks them) already holds,
+  // from lib/cscanGrid `roverRowFill`. A row emits however many cells its bins
+  // filled, so the flat capture count is not a row counter -- and a COUNT of
+  // non-empty rows is not one either, because it reads a row that was stopped
+  // part way through as finished and starts the resume below it.
+  rowFill, onRowOpen, onRowClose,
+  // Where the grid's top-left corner stands in the rover's frame, if this grid
+  // has already been anchored. A raster derives the origin from the operator's
+  // "I am this far right of / below it" offsets, which are only true where they
+  // were measured; after a stop the head is somewhere in the middle of a row,
+  // so re-deriving would silently anchor the resumed grid somewhere else. The
+  // anchor is stored with the scan and reused for every later session on it.
+  originAnchor, onOriginAnchor,
 }) {
   // Everything the tick reads, refreshed every render. The interval closes over
   // this ref, never over the props themselves.
@@ -106,7 +159,7 @@ export function useRoverScan({
   optsRef.current = {
     params, roverStatus, roverConnected, sendRover,
     sfcwRunning, onStartSweep, onStopSweep, capturedCount, onRequestCapture, sweepsPerCell,
-    capturedRows, onRowOpen, onRowClose,
+    rowFill, onRowOpen, onRowClose, originAnchor, onOriginAnchor,
   };
 
   const [ui, setUi] = useState(IDLE);
@@ -129,6 +182,8 @@ export function useRoverScan({
       row: st.row,
       rowsTotal: st.rowsTotal,
       traverse: st.traverse,
+      anchored: !!st.anchored,
+      resumeRow: st.resumeRow || 0,
     });
   }, []);
 
@@ -197,7 +252,16 @@ export function useRoverScan({
     // hold: a move is only ever issued once the previous one is confirmed
     // finished, so nothing else is in flight to advance it behind our back.
     st.movesDoneAtIssue = typeof status?.moves_done === 'number' ? status.moves_done : null;
-    o.sendRover({ cmd: 'rover_move_abs', x_mm: clamped.x_mm, y_mm: clamped.y_mm });
+    // Exact completion, when the Pi supports it: it echoes this token back in
+    // `last_done_token` when THIS move's `done` arrives, so no other mover on
+    // the link can be mistaken for us and no timer is involved. A Pi that
+    // predates it simply never echoes anything, and the counter path below
+    // takes over.
+    st.moveToken = nextMoveToken();
+    st.tokenSupported = typeof status?.last_done_token !== 'undefined';
+    o.sendRover({
+      cmd: 'rover_move_abs', x_mm: clamped.x_mm, y_mm: clamped.y_mm, token: st.moveToken,
+    });
     publish();
   }, [publish]);
 
@@ -253,6 +317,19 @@ export function useRoverScan({
       finish('error', null, 'E-stop latched — scan aborted.', false);
       return;
     }
+    // A link that is up but silent. `last_status_at` is the Pi's clock, so it is
+    // only ever compared with ITSELF -- what is timed locally is how long we
+    // have gone without seeing it change. Nothing may be commanded against a
+    // position that is no longer being reported.
+    if (status.last_status_at !== st.lastStatusAt) {
+      st.lastStatusAt = status.last_status_at;
+      st.lastStatusSeenAt = now;
+    } else if (st.lastStatusSeenAt != null && now - st.lastStatusSeenAt > STATUS_STALE_MS) {
+      finish('error', null,
+        `No rover status for ${(STATUS_STALE_MS / 1000).toFixed(0)} s — the link is up but silent. `
+        + 'Scan aborted; check the rover server and the controller.', false);
+      return;
+    }
 
     switch (st.phase) {
       case 'homing':
@@ -269,10 +346,21 @@ export function useRoverScan({
         // stopped, so this cannot fire during the ack-before-dispatch window and
         // there is nothing to wait out. Falls back to the timer on a Pi that does
         // not report it.
-        const exact = st.movesDoneAtIssue != null && typeof status.moves_done === 'number';
-        const completed = exact
-          ? status.moves_done > st.movesDoneAtIssue
-          : since >= MIN_MOVE_MS;
+        // Three completion signals, best first:
+        //  1. our own token echoed back -- exact, and immune to anyone else's
+        //     move finishing while ours is in flight;
+        //  2. `moves_done` advancing, floored by a link round trip so a `done`
+        //     already in flight when we issued cannot be read as ours;
+        //  3. a plain timer, for a Pi that reports neither.
+        const tokenPath = st.tokenSupported && st.moveToken != null
+          && typeof status.last_done_token !== 'undefined';
+        const counterPath = st.movesDoneAtIssue != null && typeof status.moves_done === 'number';
+        const exact = tokenPath || counterPath;
+        const completed = tokenPath
+          ? status.last_done_token === st.moveToken
+          : counterPath
+            ? (status.moves_done > st.movesDoneAtIssue && since >= MOVE_ACK_FLOOR_MS)
+            : since >= MIN_MOVE_MS;
 
         // A move that ended as anything but `completed` did not go where it was
         // told -- a soft limit, a stop, an e-stop. Targets are already clamped
@@ -420,29 +508,57 @@ export function useRoverScan({
     }
     if (status.estop) return fail('E-stop is latched — clear it before scanning.');
 
+    // THE ROVER MUST BE AT REST. The origin is derived from where the head is
+    // standing right now, so reading it off a rig that is still moving anchors
+    // the whole grid wherever the last status frame happened to catch it --
+    // and then every cell in the scan is somewhere other than the operator
+    // measured. Reproduced on the simulator: pressing Start 200 ms into a
+    // 600 mm nudge anchored the grid 1.5 mm off and the homing move timed out
+    // chasing a target the rover was driving away from.
+    if (status.moving || (status.pending_moves | 0) > 0 || (status.queue_depth | 0) > 0) {
+      return fail('The rover is still moving — wait for it to stop before starting. '
+                  + 'The grid origin is measured from where the head is standing.');
+    }
+
     const grid = { ...o.params };
     const stats = gridStats(grid);
     const continuous = grid.roverTraverse !== 'stepped';
     const cfg = status.config;
 
     const speedMmS = Math.max(1, Number(grid.roverSpeedMmS) || 60);
+    // The pitch is part of the overrun: cells are keyed by rounding position to
+    // the nearest column, so a run-up shorter than half a pitch is inside the
+    // first column rather than outside the grid.
     const overrunMm = continuous
-      ? traverseOverrun(speedMmS, cfg?.x_accel || 500)
+      ? traverseOverrun(speedMmS, cfg?.x_accel || 500, (Number(grid.hStep) || 0) * 10)
       : 0;
 
+    // Where a continuous raster picks up. The first row that is not FULL, not
+    // the number of rows holding anything: a row stopped part way through would
+    // otherwise count as done and be abandoned half empty.
+    const fill = Array.isArray(o.rowFill) ? o.rowFill : [];
+    const hCount = Math.max(1, grid.hCount);
+    let resumeRow = 0;
+    while (resumeRow < grid.vCount && (fill[resumeRow] || 0) >= hCount) resumeRow += 1;
+
     if (continuous) {
-      if ((Number(o.capturedRows) || 0) >= grid.vCount) {
+      if (resumeRow >= grid.vCount) {
         return fail('The grid is already full — start a new scan first.');
       }
     } else if (Math.min(o.capturedCount, stats.total) >= stats.total) {
       return fail('The grid is already full — start a new scan first.');
     }
 
-    // Where the rover has to stand for the grid's top-left corner. The operator
-    // declares where they currently are relative to that corner, so the origin
-    // is behind them: left by however far right of it they are, up by however
-    // far below it they are.
-    const origin = {
+    // Where the rover has to stand for the grid's top-left corner.
+    //
+    // ANCHORED ONCE PER SCAN. The operator declares where they currently are
+    // relative to that corner, which is only true where they measured it -- so
+    // re-deriving it on a resume, when the head is parked wherever the last row
+    // was abandoned, would put the rest of the grid somewhere else entirely.
+    // The first session on an empty grid derives and publishes the anchor; every
+    // later one reuses it.
+    const anchored = originAnchorFor(o.originAnchor, grid);
+    const origin = anchored || {
       x: status.x_mm - (Number(grid.roverOriginRightMm) || 0),
       y: status.y_mm + (Number(grid.roverOriginBelowMm) || 0),
     };
@@ -468,14 +584,26 @@ export function useRoverScan({
       }
     }
 
+    // Publish the anchor only once the grid has passed the soft-limit check, so
+    // a refused geometry does not leave one behind.
+    if (!anchored && typeof o.onOriginAnchor === 'function') {
+      o.onOriginAnchor({
+        x: origin.x, y: origin.y,
+        hCount: grid.hCount, vCount: grid.vCount,
+        hStep: grid.hStep, vStep: grid.vStep,
+      });
+    }
+
     machine.current = {
       phase: 'homing',
       traverse: continuous ? 'continuous' : 'stepped',
       grid,
       total: stats.total,
       rowsTotal: Math.max(1, grid.vCount),
-      index: continuous ? (Number(o.capturedRows) || 0) * grid.hCount : Math.min(o.capturedCount, stats.total),
+      index: continuous ? resumeRow * grid.hCount : Math.min(o.capturedCount, stats.total),
       origin,
+      anchored: !!anchored,
+      resumeRow,
       cell: null,
       target: null,
       message: null,
@@ -501,11 +629,18 @@ export function useRoverScan({
       settleUntil: 0,
       capturedBefore: 0,
       captureIssuedAt: 0,
+      moveToken: null,
+      tokenSupported: false,
+      lastStatusAt: status.last_status_at,
+      lastStatusSeenAt: performance.now(),
     };
 
     o.onStartSweep();
     // One move on both axes, so the rover travels left and up together.
-    issueMove('homing', { x_mm: origin.x, y_mm: origin.y }, 'Returning to grid origin');
+    issueMove('homing', { x_mm: origin.x, y_mm: origin.y },
+      anchored
+        ? `Returning to the grid origin this scan was anchored at — resuming on row ${resumeRow + 1} of ${grid.vCount}`
+        : 'Returning to grid origin');
 
     if (timer.current) clearInterval(timer.current);
     timer.current = setInterval(() => tick(), TICK_MS);
@@ -528,9 +663,14 @@ export function useRoverScan({
         o.sendRover({ cmd: 'rover_set_config', config: { x_max_speed: st.speedMmS } });
         st.speedApplied = true;
       }
-      // Rows already holding data are skipped. A row emits however many cells
-      // its bins filled, so the flat capture count cannot be used here.
-      const startRow = Math.max(0, Number(o.capturedRows) || 0);
+      // Rows already FULL are skipped; a row stopped part way through is
+      // re-driven, and its columns replace what that row already holds. Read
+      // afresh here rather than trusting what arming saw, since the operator
+      // may have undone cells while parked.
+      const fill = Array.isArray(o.rowFill) ? o.rowFill : [];
+      const hCount = Math.max(1, st.grid.hCount);
+      let startRow = 0;
+      while (startRow < st.rowsTotal && (fill[startRow] || 0) >= hCount) startRow += 1;
       if (startRow >= st.rowsTotal) {
         finish('done', `Grid already full — ${st.rowsTotal} rows scanned.`, null, false);
         return;
@@ -563,7 +703,20 @@ export function useRoverScan({
 
   const clearStatus = useCallback(() => setUi(IDLE), []);
 
-  useEffect(() => () => { if (timer.current) clearInterval(timer.current); }, []);
+  // Unmounting mid-scan (the tab closing, a reload) is the one exit finish()
+  // never sees. The rail's maximum speed PERSISTS on the Pi, so leaving it at
+  // the scan speed would quietly slow every later nudge and jog with nothing on
+  // screen explaining it. Best effort -- a hard tab close may outrun the send.
+  useEffect(() => () => {
+    if (timer.current) clearInterval(timer.current);
+    const st = machine.current;
+    if (st && st.speedApplied && st.prevMaxSpeed != null) {
+      try {
+        optsRef.current.sendRover({ cmd: 'rover_set_config', config: { x_max_speed: st.prevMaxSpeed } });
+      } catch { /* link already gone */ }
+    }
+    machine.current = null;
+  }, []);
 
   return { ...ui, start, beginRaster, stop, clearStatus };
 }

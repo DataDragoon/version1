@@ -84,6 +84,13 @@ static uint32_t idleDisableMs = IDLE_DISABLE_MS;
 static uint32_t lastSeq = 0;
 static uint32_t inFlightSeq = 0;
 static bool movePending = false;
+// Which axes the in-flight move actually commanded. `stop_reason` is per axis
+// and is NOT cleared by moveTo, so an axis left out of a move still carries
+// whatever ended its previous one -- and reporting that as this move's outcome
+// makes a perfectly good move come back as 'limit' or 'requested'. The Pi
+// aborts a raster on any reason but 'completed', so that is a scan lost to a
+// stale byte.
+static bool inFlightAxes[NUM_AXES] = { false, false };
 
 static bool linkUp = false;
 static uint32_t lastStatusMs = 0;
@@ -353,7 +360,11 @@ static void dispatchQueued() {
     movePending = true;
     noInterrupts();
     for (uint8_t i = 0; i < NUM_AXES; ++i) {
+        inFlightAxes[i] = m.has[i];
         if (!m.has[i]) continue;
+        // Clear the previous move's outcome before starting this one, so the
+        // reason reported below can only have come from this move.
+        axes[i].stop_reason = STOP_NONE;
         axes[i].moveTo(m.rel ? axes[i].position + m.value[i] : m.value[i]);
     }
     interrupts();
@@ -866,8 +877,9 @@ void loop() {
     if (movePending && !axes[AXIS_V].isMoving() && !axes[AXIS_H].isMoving()) {
         movePending = false;
         noInterrupts();
-        const StopReason vr = axes[AXIS_V].stop_reason;
-        const StopReason hr = axes[AXIS_H].stop_reason;
+        // Only the axes this move commanded have anything to say about it.
+        const StopReason vr = inFlightAxes[AXIS_V] ? axes[AXIS_V].stop_reason : STOP_NONE;
+        const StopReason hr = inFlightAxes[AXIS_H] ? axes[AXIS_H].stop_reason : STOP_NONE;
         axes[AXIS_V].done_flag = false;
         axes[AXIS_H].done_flag = false;
         interrupts();

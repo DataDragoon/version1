@@ -13,7 +13,7 @@ import { createRowCollector } from './lib/roverTrack';
 import { computeRangeProfile } from './lib/rangeProfile';
 import { applyBscanBg, bgForStandoff, backgroundFor, coherentMean } from './lib/bscanBg';
 import { computeSharedScale, computeRowScales, computeGridScales, bgDiagnostics, planViewScales } from './lib/cscanGrid';
-import { cellForIndex, orderedCellForIndex, BG_STATUS, BG_STATUS_TEXT } from './lib/cscanGrid';
+import { cellForIndex, orderedCellForIndex, BG_STATUS, BG_STATUS_TEXT, roverRowFill } from './lib/cscanGrid';
 import { useRoverScan } from './hooks/useRoverScan';
 import { useRoverBgScan } from './hooks/useRoverBgScan';
 import { DEFAULT_PARAMS as IMAGING_DEFAULT_PARAMS } from './lib/imagingEffects';
@@ -524,6 +524,10 @@ export default function App() {
   const roverCollectorRef = useRef(createRowCollector());
   const [roverRowStats, setRoverRowStats] = useState(null);
   const roverRowStatsAtRef = useRef(0);
+  // Sweeps binned into the open row at the last live flush, so a flush that
+  // would rewrite identical cells is skipped. -1 means "flush unconditionally",
+  // which is what opening and closing a row both want.
+  const roverRowKeptRef = useRef(-1);
 
   // Measured sweep period, ms. Published at ~1 Hz from a ref so the sidebar is
   // not re-rendered at the sweep rate to move a readout.
@@ -662,35 +666,25 @@ export default function App() {
   // bracketing position, and the row being binned; see lib/roverTrack.js. This
   // is only the React-facing shell around it.
 
-  // Row fill, published at ~4 Hz. Sweeps land at ~36 Hz and publishing per
-  // sweep would re-render the sidebar that often to move a counter.
-  const publishRowStats = useCallback(() => {
-    const now = performance.now();
-    if (now - roverRowStatsAtRef.current < 250) return;
-    roverRowStatsAtRef.current = now;
-    setRoverRowStats(roverCollectorRef.current.summary());
-  }, []);
-
-  // A row's traverse is starting: open a fresh bin for it.
-  const handleRoverRowOpen = useCallback((geom) => {
-    const col = roverCollectorRef.current;
-    col.setLatencyMs(bscanParamsRef.current.roverLatencyMs);
-    col.openRow(geom);
-    roverRowStatsAtRef.current = 0;
-    setRoverRowStats(col.summary());
-  }, []);
-
-  // The traverse has ended -- completed, stopped, or failed. Harvest whatever
-  // the bins hold; a partial row is still data, and a row is a minute of
-  // driving. Idempotent: the state machine calls it on arrival and again from
-  // finish().
-  const handleRoverRowClose = useCallback(() => {
-    const out = roverCollectorRef.current.closeRow();
-    if (!out) return;
+  // Writes a row's cells into the scan. Shared by the LIVE flush below and by
+  // the harvest at the end of the row, so a cell drawn while the rover is still
+  // driving is built by exactly the same code as the one that ends up in the
+  // export -- there is no separate "preview" record shape to keep in step.
+  //
+  // Columns this pass filled REPLACE what that row already held, rather than
+  // being appended beside them. That is what makes it safe to call repeatedly:
+  // each flush supersedes the last. It is also what a resume needs -- a row
+  // stopped part way through is re-driven on the next session (the resume
+  // starts on the first row that is not full), and without this the overlap
+  // would leave two records for one cell, with the grid drawing whichever came
+  // last while the export, SAR and the colour scales all saw both.
+  const writeRoverRowCells = useCallback((geom, cells) => {
+    if (!geom || !cells.length) return;
     const grid = bscanParamsRef.current;
-    const geom = out.geom;
-    if (out.cells.length) {
-      setBscanData(prev => [...prev, ...out.cells.map(c => buildCellRecord({
+    const replaced = new Set(cells.map(c => `${c.ix},${c.iy}`));
+    setBscanData(prev => [
+      ...prev.filter(d => !replaced.has(`${d.grid_ix},${d.grid_iy}`)),
+      ...cells.map(c => buildCellRecord({
         sweeps: c.sweeps,
         meta: c.meta,
         cell: { ix: c.ix, iy: c.iy },
@@ -700,10 +694,67 @@ export default function App() {
         rover: { x: c.xMean, y: geom.y_mm },
         target: { x_mm: geom.originXMm + c.ix * geom.hStepMm, y_mm: geom.y_mm },
         roverXStd: c.xStd,
-      }))]);
-    }
-    setRoverRowStats(out.summary);
+      })),
+    ]);
   }, []);
+
+  // Row fill AND the row's cells, published at ~4 Hz while the rover drives.
+  // Sweeps land at ~36 Hz and publishing per sweep would re-render the sidebar
+  // that often to move a counter.
+  //
+  // The continuous raster used to show nothing until a row ENDED, because a row
+  // is emitted whole -- so on a 1 m row at 25 mm/s the plan view sat blank for
+  // 45 s and then filled in one jump. The stepped raster had always drawn each
+  // cell as it was captured, and that is the behaviour to keep: the plan view is
+  // the only thing on screen that says the scan is working.
+  //
+  // Cost is the whole derive chain re-running (applyBscanBg over every cell,
+  // then the shared scale and the focused cell values). Measured on the Pi at
+  // 8 sweeps a cell: 32 ms for a 147-cell grid, 52 ms for 303 cells -- so ~13-21%
+  // of one core at 4 Hz there, and less on the groundstation. Raising the rate
+  // is not free; 4 Hz already puts 2 updates inside a 50 mm cell at 100 mm/s.
+  //
+  // Note this also means the SAR worker's 300 ms debounce never fires DURING a
+  // traverse (250 < 300). That is deliberate: a reconstruction of a half-driven
+  // row is thrown away by the next flush anyway, and it still runs at every row
+  // change, where the flushes stop.
+  const publishRowStats = useCallback(() => {
+    const now = performance.now();
+    if (now - roverRowStatsAtRef.current < 250) return;
+    roverRowStatsAtRef.current = now;
+    const col = roverCollectorRef.current;
+    setRoverRowStats(col.summary());
+    const live = col.liveRow();
+    // Nothing new landed since the last flush -- during the run-up, while the
+    // rover is over ground the grid does not cover, or before the first sweep
+    // has been bracketed at all. Rewriting identical cells would churn every
+    // downstream memo for no visible change.
+    if (!live || !live.cells.length || live.kept === roverRowKeptRef.current) return;
+    roverRowKeptRef.current = live.kept;
+    writeRoverRowCells(live.geom, live.cells);
+  }, [writeRoverRowCells]);
+
+  // A row's traverse is starting: open a fresh bin for it.
+  const handleRoverRowOpen = useCallback((geom) => {
+    const col = roverCollectorRef.current;
+    col.setLatencyMs(bscanParamsRef.current.roverLatencyMs);
+    col.openRow(geom);
+    roverRowStatsAtRef.current = 0;
+    roverRowKeptRef.current = -1;
+    setRoverRowStats(col.summary());
+  }, []);
+
+  // The traverse has ended -- completed, stopped, or failed. Harvest whatever
+  // the bins hold; a partial row is still data, and a row is a minute of
+  // driving. Idempotent: the state machine calls it on arrival and again from
+  // finish(), and it supersedes whatever the live flushes above already wrote.
+  const handleRoverRowClose = useCallback(() => {
+    const out = roverCollectorRef.current.closeRow();
+    if (!out) return;
+    roverRowKeptRef.current = -1;
+    writeRoverRowCells(out.geom, out.cells);
+    setRoverRowStats(out.summary);
+  }, [writeRoverRowCells]);
 
   // B-scan display toggles
   const [bscanScaleMode, setBscanScaleMode] = useState('linear');
@@ -1696,11 +1747,25 @@ export default function App() {
     setBscanCapturing(true);
   }, [bscanProcParams.avgCount]);
 
-  // How many grid rows already hold data. Rows are captured top-down and a row
-  // is emitted whole, so the count of distinct rows IS the resume point.
-  const capturedRowCount = useMemo(
-    () => new Set(bscanData.map(d => d.grid_iy).filter(v => v != null)).size,
-    [bscanData]);
+  // How full each grid row is, in the order the rover walks them (0 = the row
+  // the origin sits on). This, not a count of non-empty rows, is what a
+  // continuous raster resumes on: a row stopped part way through is not done,
+  // and counting it as done abandoned it half empty with nothing saying so.
+  const roverRowFillCounts = useMemo(
+    () => roverRowFill(bscanData, bscanParams),
+    [bscanData, bscanParams]);
+
+  // Where this scan's grid origin stands in the rover's frame, fixed the first
+  // time a raster is armed on it and reused by every later session.
+  //
+  // The operator's "right of / below origin" offsets describe where the head
+  // was standing WHEN THEY MEASURED THEM. After a stop the head is parked
+  // wherever the abandoned row left it, so re-deriving the origin from those
+  // same offsets anchors the rest of the grid somewhere the operator never
+  // measured -- which reads on the rig as the raster "not going to the values
+  // I typed". Cleared with the scan, not with the session.
+  const [roverOriginAnchor, setRoverOriginAnchor] = useState(null);
+  const handleRoverOriginAnchor = useCallback((a) => setRoverOriginAnchor(a), []);
 
   const roverScan = useRoverScan({
     params: bscanParams,
@@ -1716,11 +1781,13 @@ export default function App() {
     // with it or a high Avg would trip the timeout before the cell completes.
     sweepsPerCell: Math.max(1, bscanProcParams.avgCount),
     // Continuous mode. A row emits however many cells its bins filled, so the
-    // flat capture count is not a row counter -- resume is on distinct rows
-    // present in the data instead.
-    capturedRows: capturedRowCount,
+    // flat capture count is not a row counter -- resume is on the first row
+    // that is not FULL instead.
+    rowFill: roverRowFillCounts,
     onRowOpen: handleRoverRowOpen,
     onRowClose: handleRoverRowClose,
+    originAnchor: roverOriginAnchor,
+    onOriginAnchor: handleRoverOriginAnchor,
   });
 
   // A raster that ends -- completed, stopped or failed -- must not leave a tag
@@ -1801,6 +1868,8 @@ export default function App() {
       };
     } else if (action === 'new') {
       setBscanData([]);
+      // A new scan is a new grid: the origin has to be re-declared for it.
+      setRoverOriginAnchor(null);
     } else if (action === 'undo') {
       setBscanData(prev => prev.slice(0, -1));
     } else if (action === 'export') {
@@ -1837,6 +1906,11 @@ export default function App() {
             const imported = JSON.parse(ev.target.result);
             if (imported.data && Array.isArray(imported.data)) {
               setBscanData(imported.data);
+              // An imported grid was captured on a rail that is not necessarily
+              // this one, and certainly not at this session's declared origin.
+              // Deliberately NOT restored from the file: the anchor is a live
+              // property of the rig, like scanMode, not data.
+              setRoverOriginAnchor(null);
               // A fresh scan gets one shot at fitting Max Depth to what it can reach.
               sarDepthAutoFitRef.current = true;
               // The FREQUENCY PLAN only -- deliberately not the whole sfcwParams. SAR
@@ -2210,6 +2284,7 @@ export default function App() {
         onBscanAction={handleBscanAction}
         roverScan={roverScan}
         roverRowStats={roverRowStats}
+        roverOriginAnchor={roverOriginAnchor}
         sweepPeriodMs={sweepPeriodMs}
         bscanScaleMode={bscanScaleMode}
         onBscanScaleModeChange={setBscanScaleMode}

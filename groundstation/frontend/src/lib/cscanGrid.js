@@ -420,6 +420,42 @@ export function orderedCellForIndex(index, hCount, vCount, scanMode) {
     : cellForIndex(index, hCount);
 }
 
+// How full each grid ROW is, indexed by rowFromTop (0 = the row the origin
+// sits on, which is iy = vCount-1). A continuous raster emits a row whole, so
+// this -- not a flat capture count -- is what a resume has to read.
+//
+// Counting DISTINCT columns rather than records: re-scanning a row that was
+// stopped part way through re-emits columns it already holds, and two records
+// for one cell is one cell, not two.
+export function roverRowFill(scanData, params) {
+  const h = Math.max(1, params.hCount);
+  const v = Math.max(1, params.vCount);
+  const seen = Array.from({ length: v }, () => new Set());
+  for (const pos of scanData || []) {
+    if (pos == null || pos.grid_ix == null || pos.grid_iy == null) continue;
+    const row = v - 1 - pos.grid_iy;            // rowFromTop
+    if (row < 0 || row >= v) continue;
+    if (pos.grid_ix < 0 || pos.grid_ix >= h) continue;
+    seen[row].add(pos.grid_ix);
+  }
+  return seen.map(s => s.size);
+}
+
+// The row a continuous raster should (re)start on: the first that is not FULL.
+//
+// Resuming on a count of non-empty rows is what silently abandoned a row that
+// was stopped part way through -- the partial row counted as done and the next
+// session began below it, leaving a half-empty row in the middle of the grid
+// with nothing on screen saying so. Measured on the simulator: stopping mid
+// row 1 of a 3-row grid harvested 6 of 11 cells, and the resume started on
+// row 2.
+export function firstIncompleteRoverRow(scanData, params) {
+  const h = Math.max(1, params.hCount);
+  const fill = roverRowFill(scanData, params);
+  for (let r = 0; r < fill.length; r++) if (fill[r] < h) return r;
+  return fill.length;          // every row is full
+}
+
 // Rover-frame target of a grid cell, in mm.
 //
 // `origin` is where the rover has to stand for the grid's top-left corner, in
@@ -469,14 +505,27 @@ export function gridRoverExtent(params, origin) {
 //    ~91 ms of a traverse resolves after the rover has already stopped. The
 //    margin makes sure that stretch is overrun rather than grid.
 //
-// Cheap either way: 10.6 mm at 25 mm/s, 30 mm at 100 mm/s -- a few tenths of a
-// second per row against a row that takes tens of seconds.
-export function traverseOverrun(speedMmS, accelMmS2) {
+//  * HALF A CELL PITCH. Cells are keyed by `Math.round((x - originX)/pitch)`,
+//    so everything within half a pitch of the first column's centre lands IN
+//    that column -- including the rig standing still at the row's entry point
+//    waiting for the traverse command to reach the board, and the whole ramp.
+//    An overrun shorter than half a pitch therefore does not put the run-up
+//    outside the grid at all, it files it into the end columns. Measured on
+//    the simulator at 20 mm/s over a 50 mm pitch (overrun 10.4 mm against a
+//    25 mm half-pitch): the end cells absorbed stationary and ramping sweeps
+//    and every cell's reported position came out 7 mm short of its centre.
+//
+// Cheap either way: 35.6 mm at 25 mm/s, 40 mm at 100 mm/s on a 50 mm pitch --
+// a few tenths of a second per row against a row that takes tens of seconds.
+export function traverseOverrun(speedMmS, accelMmS2, hStepMm = 0) {
   const v = Math.max(0, Number(speedMmS) || 0);
   const a = Math.max(1, Number(accelMmS2) || 500);
+  const pitch = Math.max(0, Number(hStepMm) || 0);
   const ramp = (v * v) / (2 * a);
   const margin = Math.max(10, v * 0.2);
-  return ramp + margin;
+  // The binning clearance is a floor on the whole overrun, not an addition to
+  // it: the ramp may well already be longer than half a pitch.
+  return Math.max(ramp + margin, pitch / 2 + margin);
 }
 
 // Wall-clock seconds for a single-axis move of `distanceMm`, under the
