@@ -1,0 +1,145 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v5.rbf
+==================================================
+
+Status:  First image with the MIXER wired in -- the gap v4 documented as its
+         known limitation. Misses timing by 84 ps at the 0 C corner, and this
+         time the failing path IS in the DSP chain. Test build, not a release.
+
+Build date:        2026-09-08 21:09 IST
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-08_21.09.05
+md5    (.rbf):     2f90a2545171f9a6d07b7645d958b076 (see .rbf.md5)
+sha256 (.rbf):     4e560e0dec1909561c... (see .rbf.sha256)
+Source tree:       bladerf-src @ 90edb729, branch sfcw-fpga-dsp, clean.
+Quartus:           18.1.0.625 STANDARD, device 5CEBA9F23C8, fitter seed 1.
+
+TOOLCHAIN CHANGE -- READ THIS
+-----------------------------
+v2/v3/v4 were built with Quartus 25.1std LITE. Lite cannot generate the
+Nios II/f core, so those images carry Nios II/e regardless of what the
+filename says.
+
+v5 is built with Quartus 18.1 Standard Edition on a different machine, and
+the Fast core is verified two independent ways:
+
+    work/bladerf-micro-A9-hosted/nios_system.qsys
+        <parameter name="impl" value="Fast" />
+
+    BSP compiled with -mhw-div -mhw-mul -mhw-mulx
+        (the Tiny builds use -mno-hw-div -mno-hw-mul -mno-hw-mulx)
+
+build_bladerf.sh SKIPS qsys-generate when nios_system.qsys already exists, so
+a stale work dir silently keeps the old core no matter what -n says. The work
+dir was deleted before generation. hdl/quartus/build_18_1.sh in bladerf-src
+wraps this and does the deletion every time.
+
+Because the toolchain differs from v4, resource and timing numbers here are NOT
+comparable to v3/v4 like-for-like.
+
+WHAT CHANGED SINCE v4
+---------------------
+v4's closing note: "This image's DSP chain has NO MIXER ... cw_nco.vhd and
+cw_mixer.vhd are in the tree for exactly this reason and are being wired in for
+the next image." This is that image.
+
+  - cw_nco.vhd and cw_mixer.vhd added to bladerf-hosted.qip
+  - rx.vhd DSP chain: NCO + 2 mixers + 2 accumulators + divider + result FIFO
+    + metadata, read mux on dsp_path_en
+  - complex_div.vhd: PRODUCTS2 pipeline stage (DSP output -> adder had been a
+    57-bit path in one clock)
+  - cw_mixer.vhd: registered products between multipliers and the sum
+  - bladerf-hosted.vhd: ENABLE_DSP_AVERAGE => true, dsp_path_en from GPO bit 6,
+    dsp_restart from RFFE bit 24
+
+The mixer brings the CW to DC before accumulation, so the whole window adds
+constructively instead of cancelling to a fractional residual. That is what v4
+could not do.
+
+TIMING
+------
+    Slow 1100mV 85C setup, AD9361 pll_sclk   +0.284
+    Slow 1100mV  0C setup, AD9361 pll_sclk   -0.084   <-- 84 ps short
+    Design-wide TNS at that corner           -1.179
+
+Both Fast corners pass by >2 ns. altera_reserved_tck is clean everywhere
+(worst +0.013 hold, Fast 0 C); SignalTap is not enabled in this build.
+
+Unlike v4, the failing path is IN THE NEW RTL. All 8 failing endpoints:
+
+    From rx:U_rx|cw_mixer:\dsp_average:U_mix_rx1|Add1~mac_pl[0][15]
+    To   rx:U_rx|cw_mixer:\dsp_average:U_mix_rx1|out_q[0,1,2,3,4,11,12,13]
+
+    period 8.000 ns (125 MHz), data delay 7.311 ns
+
+U_mix_rx0 closes. Only U_mix_rx1 fails.
+
+The registered-products fix DID work: Add1~mac_pl is the MAC pipeline register
+*inside* the DSP block, so Quartus absorbed the product register exactly as the
+comment in cw_mixer.vhd anticipated. What is still long is the leg after it --
+DSP MAC output -> scale() -> out_q, with no register in between:
+
+    out_i <= scale(acc_i);
+    out_q <= scale(acc_q);
+
+scale() does a rounding add, a shift, AND two saturation comparisons against
+SAT_MAX/SAT_MIN, all combinational ahead of the output register. That chain is
+the 84 ps. The fix is the same treatment the products already got: a register
+between the accumulator and scale(), or split rounding from saturation across
+two stages.
+
+HOW MUCH THIS MATTERS IN PRACTICE
+---------------------------------
+Two things have to be true at once for it to bite:
+
+  1. bladerf.sdc:25 constrains adi_rx_clock at 250 MHz -- the AD9361's maximum
+     DDR LVDS rate, giving the 125 MHz pll_sclk. STA always analyses against
+     that ceiling, but the real DATA_CLK scales with the configured sample
+     rate. A sweep well below 61.44 MSPS clocks this path far slower than
+     analysed.
+  2. 0 C is a JUNCTION temperature. A powered board self-heats well above it,
+     which is why the 85 C corner (+0.284) is the one that describes steady
+     operation.
+
+So at normal sweep rates in a normal room this should not appear. But the
+failure mode is worse than 84 ps suggests: out_q is 16 bits (DATA_W := 16) and
+the failing endpoints include bits 11, 12 and 13. A stale bit 13 puts that
+sample off by ~8192 of +/-32767 -- a quarter of full scale. It would show up as
+occasional large impulses in sweep data, easy to misread as RF interference
+rather than a timing fault.
+
+Fine for bring-up and for taking real measurements at working sample rates.
+Not a build to trust results from near max rate, and not sign-off clean.
+
+RESOURCES
+---------
+    Logic (ALMs)        8,460 / 113,560   (7 %)
+    Registers           17,979
+    DSP blocks          34 / 342          (10 %)
+    Block memory        2,511,296 bits    (20 %)
+    RAM blocks          316 / 1,220       (26 %)
+    PLLs                3 / 8             (38 %)
+    Pins                173 / 224         (77 %)
+
+Analysis & Synthesis: 0 errors, 143 warnings. All benign -- synthesized-away
+dcfifo outputs (65), unconnected WYSIWYG RAM ports (32), unread signals (14),
+a set_max_skew on pwr_scl_pin matching no path (4). One Critical Warning, on
+nios_system|wishbone_master_0 addr: Qsys wiring a 24-bit Avalon address span
+into a 32-bit port and tying off the top 8 bits. Pre-existing, unrelated to the
+DSP work.
+
+VERIFICATION
+------------
+RTL testbenches (8 green, incl. dsp_valid_skew_tb and fx3_gpif_dsp_tb) were run
+on the authoring machine against this same commit, NOT re-run here. This build
+is a synthesis/fit/timing result only. The image has not been flashed or run on
+hardware.
+
+HOW TO USE THE DSP PATH
+-----------------------
+Unchanged from v4. Flashing alone changes nothing: dsp_path_en defaults to 0 and
+the board behaves as a normal bladeRF. All three are still required:
+
+  1. The updated Python bindings on the Pi (Format.SC16_Q11_PACKED enum fix,
+     dsp_path_enabled property, unpack_dsp_results). These live in bladerf-src
+     and are not in the Pi's installed bladerf package.
+  2. PACKET_META instead of SC16_Q11 in bladerf_driver.py.
+  3. sfcw_engine.py reading one complex result per step.
