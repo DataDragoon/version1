@@ -3761,6 +3761,34 @@ pixel (the half of the span inside the hole's own cell is overdrawn), and an
 iterative flood would fabricate more AND cost passes over the whole grid on
 every frame of a mostly-empty raster.
 
+**1b. A colour-map dropdown (jet / viridis / inferno)** in the same section
+(`cscanColormap`, `localStorage.cscan_colormap`, default **jet** so every stored
+screenshot and habit still reads). It redraws on the next frame -- nothing is
+recomputed.
+
+It drives **both panes and the projector**, not just the plan view: they are
+scaled off ONE population of bins precisely so that a colour means the same dB
+in each, and colouring them differently would break exactly that. So
+`CscanDisplay` and `BscanDisplay` both dropped their local `jet` copies and now
+import `COLORMAPS` from `lib/imagingEffects.js` -- one implementation, the same
+rule CFAR, `windowFn` and the SAFT kernel follow. **The swap is bit-identical**:
+the library's `jet` matched both local copies over 100k samples plus NaN /
++-Infinity / -0. (`SfcwDisplay.jsx` still carries its own 9-knot ramp versions of
+viridis/inferno for the waterfall -- pre-existing, untouched here.)
+
+**The uncaptured-cell colour had to change, and the reason generalises.** The
+sentinel fills are chosen to be colours "no colormap produces", which held while
+jet was the only map: jet's bottom is saturated blue. **inferno's bottom is
+near-black**, so `EMPTY_FILL` (#0d0d0d) sat **15 RGB units** from a legitimately
+low-valued cell -- an uncaptured cell reading as data, on a percentile-clipped
+scale that genuinely reaches the bottom of the map. Measured across 2001 samples
+of each map, no dark fill fixes it (every candidate under ~#333 stays inside 45)
+and #333 itself collides with `GATED_OUT_FILL`. **So the OUTLINE is now the
+discriminator**: `EMPTY_STROKE` #1f1f1f -> **#4a4a4a** at 1 px, a mid grey >= 56
+units from all three maps, and structurally different from the gated-out cell's
+solid grey fill. `INVALID_FILL` is 39 from inferno but carries a bright #ff4d6d
+cross (67), so it was left alone. **Check this before adding a fourth map.**
+
 **2. The Live Sweep pane is gone from the C-Scan viewport.** The plan view now
 holds the whole area until a row is opened. That pane's controls bar was the
 ONLY place `procParams` could be set (see "The Live Sweep controls bar now

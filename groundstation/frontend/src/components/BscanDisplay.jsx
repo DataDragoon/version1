@@ -1,17 +1,13 @@
 import { useRef, useEffect, useState } from 'react';
 import { BG_STATUS, BG_STATUS_TEXT, bgFailed } from '@/lib/cscanGrid';
+// Shared with the plan view beside it -- the two panes are scaled off one
+// population of bins, so they must also be coloured by one map or a colour
+// would stop meaning the same dB in both. Checked bit-identical to the local
+// `jet` this replaces.
+import { COLORMAPS } from '@/lib/imagingEffects';
 
 const BG = '#000000';
 const GRID_COLOR = '#1a1a1a';
-
-function jet(t) {
-  t = Math.max(0, Math.min(1, t));
-  return [
-    Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 3)))),
-    Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 2)))),
-    Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 1)))),
-  ];
-}
 
 // ── Orientation ─────────────────────────────────────────────────────────────
 //
@@ -123,8 +119,9 @@ function makeGeom(orientation, pad, plotW, plotH, numBins, totalRows, rowGridIx,
   };
 }
 
-function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, bgDisplay, scaleRange, sharedScale, subMode, showGate, scaleScope, scaleLink, orientation, align) {
+function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, bgDisplay, scaleRange, sharedScale, subMode, showGate, scaleScope, scaleLink, orientation, align, colormap) {
   if (!canvas) return;
+  const cmap = COLORMAPS[colormap] || COLORMAPS.jet;
   const ctx = canvas.getContext('2d');
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
@@ -288,7 +285,7 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
       }
       for (let binIdx = 0; binIdx < numBins; binIdx++) {
         const db = (startBin + binIdx < mags.length) ? mags[startBin + binIdx] : dbMin;
-        const [r, g, b] = jet(normOf(db));
+        const [r, g, b] = cmap(normOf(db));
         ctx.fillStyle = `rgb(${r},${g},${b})`;
         const c = G.cell(binIdx, rowIdx);
         ctx.fillRect(c.x, c.y, Math.ceil(c.w) + 1, Math.ceil(c.h) + 1);
@@ -590,7 +587,7 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
     const barY = pad.top;
     for (let i = 0; i < barH; i++) {
       const t = 1 - i / barH;
-      const [r, g, b] = jet(t);
+      const [r, g, b] = cmap(t);
       ctx.fillStyle = `rgb(${r},${g},${b})`;
       ctx.fillRect(barX, barY + i, barW, 1);
     }
@@ -667,7 +664,7 @@ function drawBscan(canvas, scanData, params, crosshair, isLinear, displayMode, b
   }
 }
 
-export default function BscanDisplay({ scanData, bgDisplay, params, capturing, sfcwProgress, scaleMode, displayMode, scaleRange, sharedScale, subMode, showGate, scaleScope, scaleLink, orientation, alignRef }) {
+export default function BscanDisplay({ scanData, bgDisplay, params, capturing, sfcwProgress, scaleMode, displayMode, scaleRange, sharedScale, subMode, showGate, scaleScope, scaleLink, orientation, alignRef, colormap }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
   const [crosshair, setCrosshair] = useState(null);
@@ -688,12 +685,12 @@ export default function BscanDisplay({ scanData, bgDisplay, params, capturing, s
   // own frame, so the two stay registered without a re-render at 60 Hz.
   useEffect(() => {
     const render = () => {
-      drawBscan(canvasRef.current, scanData, params, crosshair, isLinear, mode, bgDisplay, scaleRange, sharedScale, subMode, showGate, scaleScope, scaleLink, orient, alignRef ? alignRef.current : null);
+      drawBscan(canvasRef.current, scanData, params, crosshair, isLinear, mode, bgDisplay, scaleRange, sharedScale, subMode, showGate, scaleScope, scaleLink, orient, alignRef ? alignRef.current : null, colormap);
       animRef.current = requestAnimationFrame(render);
     };
     animRef.current = requestAnimationFrame(render);
     return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
-  }, [scanData, params, crosshair, isLinear, mode, bgDisplay, scaleRange, sharedScale, subMode, showGate, scaleScope, scaleLink, orient, alignRef]);
+  }, [scanData, params, crosshair, isLinear, mode, bgDisplay, scaleRange, sharedScale, subMode, showGate, scaleScope, scaleLink, orient, alignRef, colormap]);
 
   return (
     <div className="flex flex-col w-full h-full">

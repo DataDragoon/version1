@@ -806,6 +806,19 @@ export default function App() {
     setCscanSmoothState(!!v);
   }, []);
 
+  // Which colour map the C-scan's two panes are drawn with. Both, not just the
+  // plan view: they are scaled off ONE population of bins so that a colour means
+  // the same dB in each, and colouring them differently would break exactly that.
+  // Default jet, which every screenshot and habit on this bench is calibrated to;
+  // viridis and inferno are perceptually uniform, so a smooth gradient reads as
+  // smooth rather than banding post-subtraction noise into apparent structure.
+  const [cscanColormap, setCscanColormapState] = useState(
+    () => localStorage.getItem('cscan_colormap') || 'jet');
+  const setCscanColormap = useCallback((v) => {
+    localStorage.setItem('cscan_colormap', v);
+    setCscanColormapState(v);
+  }, []);
+
   // The projector output window: `null` when closed, otherwise the display it
   // was opened on (or `{}` when the operator has to place it by hand because
   // the browser will not enumerate displays). Held in App rather than in the
@@ -2312,6 +2325,8 @@ export default function App() {
         onCscanProjectionChange={setCscanProjection}
         cscanSmooth={cscanSmooth}
         onCscanSmoothChange={setCscanSmooth}
+        cscanColormap={cscanColormap}
+        onCscanColormapChange={setCscanColormap}
         cscanProjector={cscanProjector}
         onCscanProjectorChange={setCscanProjector}
         bscanScaleLink={bscanScaleLink}
@@ -2460,6 +2475,7 @@ export default function App() {
         bscanScaleLink={bscanScaleLink}
         cscanProjection={cscanProjection}
         cscanSmooth={cscanSmooth}
+        cscanColormap={cscanColormap}
         cscanRowScales={cscanRowScales}
         cscanGridScales={cscanGridScales}
         sarResult={sarResult}
@@ -2512,6 +2528,7 @@ export default function App() {
             scanMode={bscanParams.scanMode}
             projection={cscanProjection}
             smooth={cscanSmooth}
+            colormap={cscanColormap}
             rootRef={cscanProjectorRootRef}
           />
         </ProjectorWindow>

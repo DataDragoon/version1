@@ -1,9 +1,22 @@
 import { useRef, useEffect, useState } from 'react';
 import { orderedCellForIndex, buildCscanGrid, cscanLayout, BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
+// One implementation, shared with the Imaging Bench and the SAR panel -- the
+// same rule CFAR and the window functions follow. The local `jet` this replaces
+// was checked bit-identical to the library's over 100k samples plus the
+// non-finite cases, so the default image is unchanged.
+import { COLORMAPS } from '@/lib/imagingEffects';
 
 const BG = '#000000';
+// Uncaptured. The FILL cannot be the discriminator once a perceptually-uniform
+// map is selectable: inferno's own bottom is near-black, so #0d0d0d sits 15 RGB
+// units from a legitimately low-valued cell and no dark fill does better --
+// measured, every candidate under ~#333 stays inside 45, and #333 itself
+// collides with GATED_OUT_FILL instead. The OUTLINE carries it: a mid grey no
+// map produces (>= 56 units from all three across 2001 samples each), one pixel
+// wide, which is also structurally different from the gated-out cell's solid
+// grey fill.
 const EMPTY_FILL = '#0d0d0d';
-const EMPTY_STROKE = '#1f1f1f';
+const EMPTY_STROKE = '#4a4a4a';
 const GATED_OUT_FILL = '#3a3a3a';
 // A cell whose background could not be resolved. Deliberately a colour no
 // colormap produces, so it can never be read as a value: an un-subtracted cell
@@ -11,15 +24,6 @@ const GATED_OUT_FILL = '#3a3a3a';
 // the strongest target in the scan.
 const INVALID_FILL = '#2a0a10';
 const INVALID_STROKE = '#ff4d6d';
-
-function jet(t) {
-  t = Math.max(0, Math.min(1, t));
-  return [
-    Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 3)))),
-    Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 2)))),
-    Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 1)))),
-  ];
-}
 
 // A cell's rectangle, SNAPPED so the grid tiles exactly.
 //
@@ -85,7 +89,7 @@ function canvasOffsetIn(rootRef, rect) {
 //
 // Returns false if there is nothing to draw, in which case the caller falls
 // back to the flat tiles.
-function drawSmoothField(ctx, canvas, grid, L, valueAt) {
+function drawSmoothField(ctx, canvas, grid, L, valueAt, cmap) {
   const { hCount, vCount } = grid;
   const n = hCount * vCount;
   if (n < 2) return false;
@@ -145,7 +149,7 @@ function drawSmoothField(ctx, canvas, grid, L, valueAt) {
     // Source row 0 is the TOP of the image, grid row 0 is the BOTTOM.
     const row = vCount - 1 - iy;
     for (let ix = 0; ix < hCount; ix++) {
-      const [r, g, b] = jet(patched[iy * hCount + ix]);
+      const [r, g, b] = cmap(patched[iy * hCount + ix]);
       const o = (row * hCount + ix) * 4;
       px[o] = r; px[o + 1] = g; px[o + 2] = b; px[o + 3] = 255;
     }
@@ -158,7 +162,7 @@ function drawSmoothField(ctx, canvas, grid, L, valueAt) {
   return true;
 }
 
-function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth) {
+function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth, colormap) {
   // `isConnected` is false for a frame or two while the projector window is
   // being torn down, and drawing into a canvas whose document is going away
   // throws in some browsers.
@@ -185,6 +189,9 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   // would be the expensive way to do it.
   if (onLayout) onLayout(L);
   const { hStep, vStep, gateStart, gateEnd, metric } = params;
+  // Falls back to jet, which is what every stored screenshot and every habit on
+  // this bench is calibrated to.
+  const cmap = COLORMAPS[colormap] || COLORMAPS.jet;
   const grid = buildCscanGrid(scanData, params);
   const total = grid.hCount * grid.vCount;
 
@@ -263,7 +270,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
     const cell = grid.cells[iy * grid.hCount + ix];
     if (!cell || cell.invalid || !isFinite(cell.value)) return null;
     return norm(cell.value, limitsFor(iy));
-  });
+  }, cmap);
 
   for (let iy = 0; iy < grid.vCount; iy++) {
     for (let ix = 0; ix < grid.hCount; ix++) {
@@ -285,7 +292,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
         ctx.stroke();
       } else if (cell && isFinite(cell.value)) {
         if (!smoothed) {
-          const [cr, cg, cb] = jet(norm(cell.value, limitsFor(iy)));
+          const [cr, cg, cb] = cmap(norm(cell.value, limitsFor(iy)));
           ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
           ctx.fillRect(r.x, r.y, r.w, r.h);
         }
@@ -309,8 +316,8 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
         ctx.fillStyle = EMPTY_FILL;
         ctx.fillRect(r.x, r.y, r.w, r.h);
         ctx.strokeStyle = EMPTY_STROKE;
-        ctx.lineWidth = 0.5;
-        ctx.strokeRect(r.x + 0.25, r.y + 0.25, r.w - 0.5, r.h - 0.5);
+        ctx.lineWidth = 1;
+        ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
       }
     }
   }
@@ -477,7 +484,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   const barX = w - L.pad.right + 16;
   const barY = L.pad.top;
   for (let i = 0; i < barH; i++) {
-    const [r, g, b] = jet(1 - i / barH);
+    const [r, g, b] = cmap(1 - i / barH);
     ctx.fillStyle = `rgb(${r},${g},${b})`;
     ctx.fillRect(barX, barY + i, barW, 1);
   }
@@ -557,7 +564,7 @@ export default function CscanDisplay({
   scanData, params, capturing, sfcwProgress, scaleMode, scaleRange,
   nextIndex, selectedCell, onSelectCell, scanMode, sharedScale, subMode,
   rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless,
-  smooth,
+  smooth, colormap,
 }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
@@ -579,7 +586,7 @@ export default function CscanDisplay({
       if (start === null) start = t;
       // Breathing highlight on the next target cell, only while a capture is pending.
       const pulse = capturing ? 0.5 + 0.5 * Math.sin((t - start) / 180) : 0;
-      drawCscan(canvas, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth);
+      drawCscan(canvas, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth, colormap);
       if (win.closed) return;
       animRef.current = win.requestAnimationFrame(render);
     };
@@ -590,7 +597,7 @@ export default function CscanDisplay({
       // cancelling an unknown id is a no-op either way.
       if (animRef.current && !win.closed) win.cancelAnimationFrame(animRef.current);
     };
-  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth]);
+  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth, colormap]);
 
   const pick = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();

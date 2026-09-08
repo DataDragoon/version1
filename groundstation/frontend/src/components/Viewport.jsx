@@ -56,6 +56,7 @@ export default function Viewport({
   bscanShowGate,
   cscanProjection,
   cscanSmooth,
+  cscanColormap,
   bscanScaleLink,
   cscanRowScales,
   cscanGridScales,
@@ -472,6 +473,7 @@ export default function Viewport({
                 scanMode={bscanParams.scanMode}
                 projection={cscanProjection}
                 smooth={cscanSmooth}
+                colormap={cscanColormap}
                 onLayout={publishCscanLayout}
                 rootRef={cscanRootRef}
               />
@@ -503,6 +505,7 @@ export default function Viewport({
                 showGate={bscanShowGate}
                 subMode={bscanBgSubMode}
                 orientation="vertical"
+                colormap={cscanColormap}
                 alignRef={cscanLayoutRef}
               />
               {rowData.length === 0 && (

@@ -107,6 +107,8 @@ export default function Sidebar({
   cscanProjection,
   cscanSmooth,
   onCscanSmoothChange,
+  cscanColormap,
+  onCscanColormapChange,
   onCscanProjectionChange,
   cscanProjector,
   onCscanProjectorChange,
@@ -464,6 +466,8 @@ export default function Sidebar({
                   onProjectionChange={onCscanProjectionChange}
                   smooth={cscanSmooth}
                   onSmoothChange={onCscanSmoothChange}
+                  colormap={cscanColormap}
+                  onColormapChange={onCscanColormapChange}
                   projector={cscanProjector}
                   onProjectorChange={onCscanProjectorChange}
                   lidarMm={lidarMm}

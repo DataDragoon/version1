@@ -33,7 +33,7 @@ export default function CscanPanel({
   scaleScope, onScaleScopeChange, rowScales, showGate, onShowGateChange,
   scaleLink, onScaleLinkChange, gridScales, liveDiag,
   projection, onProjectionChange, projector, onProjectorChange,
-  smooth, onSmoothChange,
+  smooth, onSmoothChange, colormap, onColormapChange,
   roverConnected, roverStatus, sendRover, roverScan, roverRowStats, sweepPeriodMs,
   originAnchor,
 }) {
@@ -1064,6 +1064,23 @@ export default function CscanPanel({
           >
             {displayMode === 'color' ? 'Color' : 'Profile'}
           </button>
+        </div>
+
+        {/* Colour map. Drives BOTH panes and the projector, because they are
+            scaled off one population of bins so that a colour means the same dB
+            in each -- colouring them differently would break exactly that.
+            Redraws on the next frame; nothing is recomputed. */}
+        <div className="flex flex-col gap-1">
+          <span className="px-1 text-[9px] font-medium uppercase tracking-wider text-[#555555]">Colour map</span>
+          <select
+            value={colormap || 'jet'}
+            onChange={(e) => onColormapChange && onColormapChange(e.target.value)}
+            className="w-full px-2 py-1.5 rounded-lg text-[10px] bg-white/5 border border-white/10 text-white/70 outline-none"
+          >
+            <option value="jet" className="bg-[#0a0a0a]">jet</option>
+            <option value="viridis" className="bg-[#0a0a0a]">viridis</option>
+            <option value="inferno" className="bg-[#0a0a0a]">inferno</option>
+          </select>
         </div>
 
         {/* Smoothing. A DISPLAY transform only: the plan view is resampled
