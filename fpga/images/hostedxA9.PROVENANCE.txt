@@ -1,0 +1,88 @@
+PROVENANCE: hostedxA9.rbf / hostedxA9.sof
+==================================================
+
+*** DOES NOT MEET TIMING -- TEST BUILD ONLY, DO NOT USE FOR MEASUREMENTS ***
+
+Build date:        2026-09-08 12:44 -> 13:00 UTC
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-08_13.00.49
+
+Quartus:
+    Quartus Prime 25.1std.0 Build 1129 10/21/2025 SC Lite Edition
+    install: C:/altera_lite/25.1std
+    device 5CEBA9F23C8 (Cyclone V E), BOARD=bladeRF-micro REV=hosted SIZE=A9
+
+Source tree:       bladerf-src @ 3bb67fa0 ("Autonomous SFCW sweep on the Nios"),
+                   branch sfcw-nios-sweep, working directory DIRTY.
+
+First image to contain the on-FPGA DSP chain (ENABLE_DSP_AVERAGE => true):
+    seq_adder x2 (per-channel coherent sum) -> complex_div (one divide per
+    step) -> sample_fifo_51 -> read-side mux on dsp_path_en.
+
+Also contains the shared-valid fix in rx.vhd:
+    dsp_sample_v <= mux_streams(0).data_v and mux_streams(1).data_v;
+    Both accumulators now advance on one valid. Previously each ran off its own
+    per-channel valid while complex_div was started by RX1 alone, so if RX2 fell
+    behind, the divide silently used RX2's HELD sum from a PREVIOUS step and
+    reported it with div_by_zero clear. Demonstrated in dsp_valid_skew_tb:
+    truth 98304, reported 49152 -- wrong by 2x, unflagged.
+
+Resources (vs the pre-DSP baseline of 6,722 ALMs / 8 DSP / 2,209,280 bits):
+    Logic utilization   7,105 / 113,560  ( 6 %)     +383 ALMs
+    Registers          15,315                       +761
+    Block memory bits   2,213,376 / 12,492,800 (18%)  +4,096
+    DSP Blocks             26 / 342  ( 8 %)         +18
+
+WHY THIS IMAGE IS NOT TRUSTWORTHY
+---------------------------------
+Timing Analyzer, Slow 1100mV models, setup:
+
+    AD9361 rx clock (pll_sclk divclk)   85C : -0.310 ns
+    AD9361 rx clock (pll_sclk divclk)    0C : -0.828 ns
+
+rx_clock is an alias of ad9361.clock, so complex_div, both seq_adders and the
+DSP FIFO write side all sit in the failing domain. That same clock closed at
++0.096 ns on 2026-09-05 with none of this logic present, so the DSP chain cost
+roughly 0.4 ns in the one domain with no margin.
+
+An image that fails setup still loads and often appears to work. The symptom is
+intermittent, temperature-dependent corruption on the sample capture path --
+worse cold (-0.828) than hot -- which reads as an RF problem rather than a
+timing one. Do not trust measurements taken with this image.
+
+The failure is combinational depth, not capacity (6% of the device is used), so
+the fix is pipelining, not rearchitecting.
+
+altera_reserved_tck is +5.083 ns here, up from -3.608 ns on 2026-09-05. That
+earlier failure was SignalTap loading the JTAG hub, not a design problem; this
+build has no SignalTap.
+
+KNOWN GAP: DELIVERY TO THE HOST
+-------------------------------
+Separately from timing, the DSP path does not yet stream to the host.
+fx3_gpif.vhd:270-273 sets its burst threshold as:
+
+    packet_enable = '1'  ->  rx_meta_fifo_empty = '0'
+    packet_enable = '0'  ->  (rx_fifo_full & rx_fifo_usedw) >= gpif_buf_size
+
+The DSP route bypasses fifo_writer, so nothing writes the meta FIFO and packet
+mode never bursts. In non-packet mode gpif_buf_size is 2048 while the DSP FIFO
+holds at most 51 words (102 read-side); the concatenated full flag satisfies the
+comparison anyway, and fx3_gpif has no underflow check during a burst
+(rx_fifo_empty is an input port but is never referenced in the state machine),
+so it would over-read by ~1946 words.
+
+Fixing this needs either meta-FIFO writes on the DSP path or the results routed
+back through fifo_writer's packet port.
+
+SIMULATION STATUS
+-----------------
+Passing (ModelSim ASE 20.1, bladerf-src/run_tb.do):
+    seq_adder_tb          ALL PASS
+    iq_dword_packer_tb    ALL PASS
+    dsp_chain_tb          PASSED
+    dsp_valid_skew_tb     PASS    (new; proves the shared-valid fix)
+    rx_dsp_fifo_tb        PASSED
+    rx_sweep_tb           PASSED  50 steps x 4096, worst error 1 count (tol 250)
+
+Not yet covered: fx3_gpif draining the DSP FIFO. The delivery gap above was
+found by reading the RTL, not by simulation.
