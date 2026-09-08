@@ -1094,6 +1094,83 @@ finished row. Normalising by contributor count would change a kernel shared
 bit-identically with the 2D Map, so it was left alone; the final image is
 unaffected.
 
+### Long-scan failures: a 282 MB worker clone and a 258-byte cfg (2026-09-08)
+
+Two unrelated reports from one long scan, both reproduced and both fixed.
+
+**BROWSER: `DataCloneError: ... out of memory` + "Maximum update depth exceeded".**
+`useSarWorker` posted the WHOLE C-scan record list to the SAR worker, and
+`postMessage` structured-clones -- a synchronous deep copy on the main thread on
+every job. Since v7 every cell carries `sweeps`, every raw look taken there, which
+the worker never reads: it uses only `h_cal_real/imag`, `magnitudes`, `distances`,
+`lidar_standoff_mm`, `step_size`, `range_offset`. Measured cost of one clone:
+
+| grid | whole record | SAR's fields only |
+|---|---|---|
+| 21x7, 18 sweeps/cell | 8.9 MB, 76 ms | 1.6 MB, 7 ms |
+| 101x15, 18 sweeps/cell | 91.5 MB, 916 ms | 16.6 MB, 69 ms |
+| 101x15, 64 sweeps/cell | **282.2 MB, 3176 ms** | 16.6 MB, 70 ms |
+
+282 MB is the OOM. The **multi-second synchronous block** is also the most likely
+explanation for the update-depth error and the `performance.measure` OOM beside it:
+the live flush sets state at 4 Hz and the websockets keep delivering throughout, so
+React resumes into a huge batch under memory pressure. `SAR_INPUT_FIELDS` +
+`projectForSar()` now trim the payload at the postMessage, **5.5-17x less memory and
+11-45x faster**. Projected in the HOOK, not at the call site, so a future caller
+cannot re-widen it; `sar.worker.js` carries a matching comment because a field that
+is not projected arrives as `undefined` rather than raising.
+
+Verified on a real 20-position scan through the actual worker (`self` shimmed,
+`sweeps` fabricated so the projection had something to strip): the full `image` and
+`coherence` arrays and all 23 scalar result fields are **bit-identical** between the
+full and projected inputs. Only `computeTimeMs` differs, being a measurement.
+
+**I did NOT positively identify a self-triggering setState loop.** All eight App
+effects and the component effects were checked and each is either ref-only or
+guarded; the memory/stall explanation is what the measurement supports. **If
+"Maximum update depth exceeded" survives this fix, there is a real loop and it needs
+a profile** -- do not assume it is gone.
+
+Note `bscanData` itself still reaches **32 MB at 101x15x18 and 83 MB at 64
+sweeps/cell**. That is the data, and `sweeps` has to stay for the coherent/incoherent
+toggle, but it bounds how long a scan can get in one tab.
+
+**PI: `board error: too_long: command exceeds the receive buffer` -- the cfg was
+being silently rejected.** Measured against the real bench config, the `cfg` command
+serialised to **258 bytes against the firmware's 256-byte `RX_BUFFER_SIZE`**, so the
+board dropped it.
+
+This is not cosmetic. `cfg` is what carries the **soft limits** to the board, and on
+a rig with no endstops those are the backstop that is supposed to survive this Pi
+crashing. It also carries the scan speed a raster pushes at `beginRaster` and
+restores at the end -- so a rejected cfg means the traverse runs at whatever speed
+the board happened to hold.
+
+Cause: `x_steps_per_mm` is `1600/(pi*66) = 7.716603301425229`, so every speed and
+acceleration derived from it serialises at full 17-digit double precision --
+`"h_speed": 1157.4904952137842` is 19 characters where 10 would do. **The overflow is
+DATA-DEPENDENT**, which is why it appeared only once X had been calibrated to an
+awkward number: Y is exactly 200 steps/mm and serialises short.
+
+Two fixes, both in `send_board`/`push_config`:
+- **3-decimal rounding** on the six float fields. 3 dp of a steps/s figure is
+  ~0.0004 mm/s, orders below anything the mechanism can express. 258 -> 226 bytes.
+- **Compact JSON separators** (`separators=(',', ':')`), worth another 27 bytes.
+  Verified against the FIRMWARE'S OWN PARSER compiled natively from
+  `rover/protocol_core.h`: `findValue` terminates a bare value on `,`/`}`/`]`/
+  whitespace, so spaced and compact parse identically -- every field of a cfg and a
+  move checked both ways.
+
+Result: real config **201 bytes (55 spare)**, and the worst case `CONFIG_BOUNDS`
+allows **231 bytes (25 spare)** -- rounding alone did NOT cover that worst case
+(258), which is why both changes were needed. `BOARD_RX_LIMIT = 256` now mirrors the
+firmware and `send_board` logs and surfaces an oversized command by name rather than
+leaving a bare `too_long` in the board log to be correlated by hand. It still sends:
+the board's refusal is the authority, and silently dropping would be worse.
+
+Raising `RX_BUFFER_SIZE` in the firmware would add margin but needs a reflash; the
+Pi-side fix deploys now and the guard makes a future overflow loud.
+
 ### What the harness checks, and what it cannot
 
 31 checks: a clean 11x3 raster (33 cells, every cell within 2 mm of its column

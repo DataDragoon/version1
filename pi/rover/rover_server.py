@@ -76,6 +76,14 @@ BOARD_QUEUE_ROOM = 3
 # groundstation axis -> firmware axis
 BOARD_AXIS = {'x': 'h', 'y': 'v'}
 
+# The firmware's receive buffer, `RX_BUFFER_SIZE` in rover/config.h. A command
+# whose JSON reaches this length is REJECTED outright with
+# `err too_long: command exceeds the receive buffer` -- and because nothing on
+# this side was checking, the rejection was silent apart from one line in the
+# rover log. Mirrored here so an oversized command is caught and named rather
+# than discovered as a config that mysteriously never took effect.
+BOARD_RX_LIMIT = 256
+
 LOG_LINES = 80
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rover_state.json')
 
@@ -420,7 +428,25 @@ class Rover:
         # their own seq. Sequence numbers were jumping by ~380 per move.
         if 'seq' not in cmd:
             cmd['seq'] = self.next_seq()
-        payload = json.dumps(cmd)
+        # COMPACT separators: no space after ':' or ','. Worth 27 bytes on a cfg
+        # (228 -> 201) against a 256-byte board buffer, which is the difference
+        # between fitting and not at the extremes of CONFIG_BOUNDS. Verified
+        # against the FIRMWARE'S OWN PARSER (rover/protocol_core.h compiled
+        # natively): `findValue` terminates a bare value on ',', '}', ']' or
+        # whitespace and skips whitespace before it, so spaced and compact parse
+        # identically -- every field of a cfg and a move checked both ways.
+        payload = json.dumps(cmd, separators=(',', ':'))
+        # The board drops anything at or past its receive buffer and answers with
+        # `err too_long`. Catch it HERE so the offending command is named, rather
+        # than leaving a one-line board error to be correlated by hand against
+        # whatever setting stopped taking effect. Sent anyway -- the board's own
+        # refusal is the authority, and truncating or silently dropping a command
+        # would be a worse failure than a logged rejection.
+        if len(payload) >= BOARD_RX_LIMIT:
+            self._last_error = (
+                f"command '{cmd.get('c')}' is {len(payload)} bytes, at or over the "
+                f"board's {BOARD_RX_LIMIT}-byte receive buffer -- it will be REJECTED")
+            self._note(self._last_error)
         try:
             await self.board.send(payload)
         except Exception as e:
@@ -441,15 +467,37 @@ class Rover:
         """
         x_lo, x_hi = self.limit_steps('x')
         y_lo, y_hi = self.limit_steps('y')
+        # ROUNDED TO 3 DECIMALS, and that is load-bearing, not tidiness.
+        #
+        # `x_steps_per_mm` is 1600/(pi*66) = 7.716603301425229, so every speed and
+        # acceleration derived from it serialises as a full 17-digit double:
+        # `"h_speed": 1157.4904952137842` is 19 characters where 10 would do. Three
+        # such fields pushed the cfg command to **258 bytes against the firmware's
+        # 256-byte receive buffer**, and the board answered
+        # `err too_long: command exceeds the receive buffer` -- so the config was
+        # silently never applied.
+        #
+        # That is not cosmetic. `cfg` is what carries the SOFT LIMITS to the board,
+        # and on a rig with no endstops the board-side limits are the backstop that
+        # is supposed to survive this Pi crashing. It also carries the scan speed a
+        # raster pushes at `beginRaster` and restores at the end, so a rejected cfg
+        # means the traverse runs at whatever speed the board happened to hold.
+        #
+        # 3 dp of a steps/s figure is ~0.0004 mm/s -- orders below anything the
+        # mechanism can express. Measured: 258 -> 226 bytes, 30 bytes of headroom.
+        # Note the overflow is DATA-DEPENDENT (the Y axis is exactly 200 steps/mm
+        # and serialises short), which is why it appeared only once X had been
+        # calibrated to an awkward number.
+        r3 = lambda v: round(v, 3)
         await self.send_board(
             c='cfg',
-            h_speed=self.config['x_max_speed'] * self.spmm('x'),
-            h_jog=self.config['x_jog_speed'] * self.spmm('x'),
-            h_accel=self.config['x_accel'] * self.spmm('x'),
+            h_speed=r3(self.config['x_max_speed'] * self.spmm('x')),
+            h_jog=r3(self.config['x_jog_speed'] * self.spmm('x')),
+            h_accel=r3(self.config['x_accel'] * self.spmm('x')),
             h_lo=x_lo, h_hi=x_hi,
-            v_speed=self.config['y_max_speed'] * self.spmm('y'),
-            v_jog=self.config['y_jog_speed'] * self.spmm('y'),
-            v_accel=self.config['y_accel'] * self.spmm('y'),
+            v_speed=r3(self.config['y_max_speed'] * self.spmm('y')),
+            v_jog=r3(self.config['y_jog_speed'] * self.spmm('y')),
+            v_accel=r3(self.config['y_accel'] * self.spmm('y')),
             v_lo=y_lo, v_hi=y_hi,
             limits=bool(self.config['limits_enabled']),
             idle_ms=int(self.config['idle_disable_s'] * 1000),
