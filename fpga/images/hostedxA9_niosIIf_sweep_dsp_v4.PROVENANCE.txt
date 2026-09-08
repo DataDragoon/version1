@@ -1,0 +1,111 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v4.rbf
+==================================================
+
+Status:  The DSP path can now DELIVER. Raw path unaffected.
+         Misses timing by 17 ps at the 0 C corner only.
+
+Build date:        2026-09-08 16:13 UTC
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-08_16.13.20
+sha256 (.rbf):     e380b636c08a4ec8... (see .rbf.sha256)
+Source tree:       bladerf-src @ 3bb67fa0, branch sfcw-nios-sweep, dirty.
+Quartus:           25.1std.0 Lite, device 5CEBA9F23C8, fitter seed 1.
+
+WHAT CHANGED SINCE v3
+---------------------
+v3 could compute results but could not get them to the host. fx3_gpif decides
+whether to read at all from:
+
+    packet_enable = '1' -> rx_fifo_enough <= rx_meta_fifo_empty = '0'
+    packet_enable = '0' -> (rx_fifo_full & rx_fifo_usedw) >= gpif_buf_size (2048)
+
+The read mux swapped the two FIFOs' DATA ports but not the metadata, and nothing
+wrote metadata on the DSP route -- so packet mode never burst, and a 51-word
+sweep (102 read-side DWORDs) never reaches 2048. FX3 looked straight at the DSP
+FIFO and never decided to read it.
+
+v4 adds:
+  - a second meta FIFO for the DSP path (fifo_writer owns the stock one and
+    writes it from its own FSM, so injecting into that would mean two writers
+    on one port),
+  - a writer that emits ONE header per completed sweep with the length field
+    set to 2*DSP_FIFO_WORDS = 102 DWORDs,
+  - the meta read ports muxed alongside the data ports.
+
+The header is written a few clocks after the last sample word: both FIFOs cross
+into the FX3 read domain through their own gray-coded pointers, and the header
+must not become visible over there before the samples it describes.
+
+In packet mode fx3_gpif takes the transfer length FROM THE HEADER
+(fx3_gpif.vhd:483) and skips the 2048-word countdown entirely, which is what
+lets one sweep move as a single short burst instead of waiting to fill a DMA
+buffer.
+
+VERIFICATION
+------------
+fx3_gpif_dsp_tb runs rx -> fx3_gpif -> fx3_model and counts FX3 reads:
+
+    DSP_PATH_SEL = 1    102 rreq pulses, FSM back at IDLE
+                        Exactly one sweep, one burst, matching the declared
+                        length.
+    DSP_PATH_SEL = 0    24576 rreq pulses, 0 errors
+                        Stock path unaffected.
+
+Also passing: seq_adder_tb, dsp_chain_tb, dsp_valid_skew_tb, rx_dsp_fifo_tb,
+rx_sweep_tb.
+
+TIMING
+------
+    Slow 1100mV 85C setup, AD9361 rx clock   +0.152
+    Slow 1100mV  0C setup, AD9361 rx clock   -0.017   <-- 17 ps short
+
+Everything else passes. The failing path is NOT in the DSP chain:
+
+    From tx|fifo_reader|meta_current.meta_p_time_r[13]
+    To   tx|fifo_reader|meta_current.meta_time_go_OTERM1531
+
+That is the TX fifo_reader's 64-bit scheduled-timestamp comparator, pre-existing
+Nuand code. The v4 metadata logic (+100 ALMs, +209 registers, +262 Kbit)
+consumed enough placement resource to push an already-marginal path over at the
+cold corner. Rebuilding with fitter seed 3 made it worse (-0.108 at 0 C, +0.023
+at 85 C), which confirms it is a marginal path rather than bad luck.
+
+0 C is a JUNCTION temperature. A board that has been running self-heats well
+above it, so the practical exposure is a cold power-up, not steady operation.
+Not a release image; fine for bring-up.
+
+Untried levers: OPTIMIZATION_MODE "High Performance Effort" (no RTL change), or
+pipelining fifo_reader's comparator (fixes it at source, but that is shared TX
+code needing its own testing).
+
+HOW TO USE THE DSP PATH
+-----------------------
+Flashing alone changes nothing: dsp_path_en defaults to 0 and the board behaves
+as a normal bladeRF, with the Pi doing the averaging and division as before.
+To actually use it, all three are required:
+
+  1. The updated Python bindings on the Pi (Format.SC16_Q11_PACKED enum fix,
+     dsp_path_enabled property, unpack_dsp_results). These live in bladerf-src
+     and are not in the Pi's installed bladerf package.
+  2. PACKET_META instead of SC16_Q11 in bladerf_driver.py -- packet mode is the
+     only branch that takes its burst length from metadata.
+  3. sfcw_engine.py reading one complex result per step instead of capturing
+     4096 samples per step and reducing them itself.
+
+KNOWN LIMITATION -- READ THIS BEFORE SWITCHING THE HOST OVER
+------------------------------------------------------------
+This image's DSP chain has NO MIXER. It accumulates the raw stream, in which
+the CW sits at cw_offset rather than DC, so whole tone cycles cancel and only a
+fractional residual survives -- about 60 dB below the input (a 900-count input
+gives |sum|/N = 0.88).
+
+The ratio is arithmetically correct, because both channels lose the same
+factor. But it is computed from two small residuals, so noise on them dominates:
+error 0.144 against 0.00013 for a demodulated average.
+
+sfcw_engine.py's reduce_steps() multiplies by the tone BEFORE summing, which
+brings the signal to DC so the whole window adds constructively. Switching the
+host to this image's results as they stand would therefore trade roughly three
+orders of magnitude of accuracy for throughput.
+
+cw_nco.vhd and cw_mixer.vhd are in the tree for exactly this reason and are
+being wired in for the next image.
