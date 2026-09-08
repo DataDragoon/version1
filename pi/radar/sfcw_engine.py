@@ -180,6 +180,14 @@ NIOS_WINDOW_GUARD = 64
 # (The Nios II/e floor was 20544 -- 2.003 ms/step, 42 SPI transactions at
 # ~47.7 us of CPU each; that constant does not apply to this image.)
 NIOS_MIN_DWELL = 4096
+# Shortest dwell the on-FPGA DSP chain can work in, in samples.
+#
+# rx.vhd fixes DSP_FLUSH_N = 1088 (settle discard, matching the host's
+# nios_settle 1024 + NIOS_WINDOW_GUARD 64) and DSP_ACCUM_N = 2900 (29 whole CW
+# cycles) at COMPILE time. Both must fit inside one step or seq_adder's restart
+# throws away a part-accumulated window and that step returns garbage. Changing
+# this needs a new FPGA image, not a set_params call.
+DSP_MIN_DWELL = 1088 + 2900
 # Hard cap on a bulk capture, in RX buffers (~0.25 s at 2048-sample buffers).
 # A pipelined inflight capture between on-demand sweeps (warm B-scan mode)
 # would otherwise grow without bound at ~78 MB/s. The sweep itself completes
@@ -554,7 +562,18 @@ class SFCWEngine:
                 self.bscan_primer = bool(kwargs['bscan_primer'])
             if 'sweep_mode' in kwargs:
                 mode = str(kwargs['sweep_mode'])
-                if mode in ('standard', 'nios') and mode != self.sweep_mode:
+                if mode in ('standard', 'nios', 'dsp') and mode != self.sweep_mode:
+                    # 'dsp' streams PACKET_META and the others stream SC16_Q11,
+                    # and the format is fixed when the stream is configured --
+                    # so crossing into or out of 'dsp' needs the RX stream torn
+                    # down and rebuilt, which only happens in _start_tx_rx.
+                    # Flag it rather than silently running the new mode over a
+                    # stream configured for the old one.
+                    if ('dsp' in (mode, self.sweep_mode)
+                            and self.driver.rx_running):
+                        print(f"[sfcw] sweep_mode {self.sweep_mode} -> {mode} "
+                              f"needs the RX stream restarted (different "
+                              f"sample format); stop and start the sweep.")
                     self.sweep_mode = mode
                     if self._nios_inflight is not None:
                         self._nios_discard_inflight()
@@ -969,7 +988,13 @@ class SFCWEngine:
         # against a system limited at ~42 dB S_repeat. 55 dB of margin.
         self._ref_tone_c64 = self._ref_tone_scaled.astype(np.complex64)
         self.driver.start_tx_dual()
-        self.driver.start_rx_dual(self._rx_capture, num_samples=n)
+        if self.sweep_mode == 'dsp':
+            # PACKET_META and synchronous reads -- no callback thread, because
+            # there is no continuous stream to consume. _rx_capture, the bulk
+            # capture and everything downstream of them are unused in this mode.
+            self.driver.start_rx_dsp()
+        else:
+            self.driver.start_rx_dual(self._rx_capture, num_samples=n)
         time.sleep(0.05)
 
         # enable_module() resets gain state, so re-push after modules are enabled.
@@ -1004,7 +1029,12 @@ class SFCWEngine:
         self._nios_primed = False
         self._nios_period_hist = []
         self._diag_dump()
-        self.driver.stop_rx_dual()
+        if self.sweep_mode == 'dsp':
+            # Also drops the DSP mux back to the raw path, so the next stream
+            # (calib panel, standard sweep) sees ordinary samples.
+            self.driver.stop_rx_dsp()
+        else:
+            self.driver.stop_rx_dual()
         self.driver.stop_tx_dual()
         # Restore single-channel config so calib panel works after SFCW
         self.driver._configure_channels()
@@ -1915,12 +1945,120 @@ class SFCWEngine:
         self._last_sweep_core = 'nios'
         return h_cal, dropped, adc_peak
 
+    def _sweep_core_dsp(self, freqs, qt_rx, qt_tx, num_buffers, settle_count,
+                        progress_cb=None):
+        """One command, one 408-byte read. The FPGA has already done the work.
+
+        The NIOS still steps the synthesizers exactly as in 'nios' mode, but
+        nothing raw is captured: rx.vhd mixes each channel down by the CW
+        offset, accumulates DSP_ACCUM_N samples per step, divides the two sums
+        and writes one 64-bit ratio per step. The host reads DSP_FIFO_WORDS of
+        those and has h_cal directly.
+
+        That deletes the whole slice-and-reduce apparatus the 'nios' core needs
+        -- no capture offset to refine, no transient detection, no span gate --
+        because there is no continuous stream to align. The FPGA gate releases
+        the FIFO only when a WHOLE sweep is in it, so a read either returns a
+        complete sweep or nothing.
+
+        Returns (h_cal, dropped, adc_peak) like the other cores.
+
+        adc_peak is None here: it is measured from raw samples, and there are
+        none. _warn_if_adc_hot therefore cannot fire in this mode -- see the
+        note in _process_h_cal. Watch gain in 'nios' or 'standard' mode first.
+        """
+        num_steps = len(freqs)
+        self._nios_sweeps_since += 1
+        if self._stop_event.is_set():
+            # THREE values, like _sweep_core's own early return.
+            return None, 0, None
+
+        def fallback(reason, reprime=False):
+            self._nios_last_score = -1.0
+            self._last_sweep_core = 'fallback'
+            self._nios_fallbacks += 1
+            self._log_nios_fallback(reason)
+            if reprime:
+                self._nios_primed = False
+                self._nios_clear_queue()
+            return self._sweep_core(freqs, qt_rx, qt_tx, num_buffers,
+                                    settle_count, progress_cb)
+
+        # DSP_FIFO_WORDS is a COMPILE-TIME generic in rx.vhd, and the metadata
+        # header hard-codes 2*DSP_FIFO_WORDS as the transfer length. A sweep of
+        # any other length would have the FPGA declare a burst that does not
+        # match what the host wants, so refuse rather than mis-read.
+        if num_steps != self.driver.DSP_SWEEP_WORDS:
+            return fallback(f"DSP path is built for "
+                            f"{self.driver.DSP_SWEEP_WORDS} steps, this sweep "
+                            f"has {num_steps}")
+
+        if qt_rx is None or qt_tx is None:
+            return fallback("no quick-tune profiles", reprime=True)
+
+        key = (int(freqs[0]), int(freqs[-1]), num_steps)
+        if not self._nios_primed or self._nios_primed_key != key:
+            if not self._nios_prime(freqs, qt_rx, qt_tx):
+                return fallback("priming failed", reprime=True)
+
+        dwell = int(self.nios_dwell)
+        units = dwell // NIOS_INTERVAL_UNIT
+        if units < 1 or units > 0xFFFF:
+            return fallback(f"dwell {dwell} out of range")
+        dwell = units * NIOS_INTERVAL_UNIT
+
+        # The FPGA's own DSP_FLUSH_N + DSP_ACCUM_N (1088 + 2900 = 3988) must fit
+        # inside one step, or seq_adder's restart discards a part-accumulated
+        # window and the step returns garbage. That bound lives in rx.vhd, so
+        # the host can only check the dwell it is asking for.
+        if dwell < DSP_MIN_DWELL:
+            return fallback(f"dwell {dwell} is below the {DSP_MIN_DWELL} the "
+                            f"FPGA DSP chain needs (FLUSH_N + ACCUM_N)")
+
+        try:
+            ts0 = self._nios_timestamp()
+            rc = self._nios_command(NIOS_CMD_EXEC,
+                                    (units << 16) | (num_steps & 0xFFFF))
+            if rc != 0 or self._nios_timestamp() <= ts0:
+                self._nios_unavailable = True
+                print("[sfcw] NIOS autonomous sweep unavailable on this FPGA "
+                      "image (sample counter not running) -- using the "
+                      "standard sweep for this session.")
+                return fallback("EXEC rejected, or the sample counter is not "
+                                "running", reprime=True)
+
+            # One sweep of acquisition, plus slack for the USB round trip.
+            budget = (num_steps * dwell) / float(self.driver.sample_rate) + 1.0
+            h_cal = self.driver.dsp_read_sweep(num_steps, timeout_s=budget)
+            if h_cal is None:
+                return fallback("DSP FIFO read returned no complete sweep")
+        except Exception as e:
+            return fallback(f"DSP sweep raised {e!r}")
+
+        h_cal = np.asarray(h_cal, dtype=np.complex128)
+
+        # complex_div flags a zero denominator by returning zero, so a step with
+        # no reference signal arrives as exactly 0 rather than as a NaN.
+        dropped = int(np.count_nonzero(h_cal == 0))
+        if dropped > num_steps // 5:
+            return fallback(f"{dropped}/{num_steps} steps had no reference "
+                            f"signal")
+
+        if progress_cb:
+            progress_cb(num_steps - 1)
+
+        self._last_sweep_core = 'dsp'
+        return h_cal, dropped, None
+
     def _sweep_dispatch(self, freqs, qt_rx, qt_tx, num_buffers, settle_count,
                         progress_cb=None):
         """Route one sweep to the selected core. 'standard' is the validated
         USB-retune-per-step path and stays the default; 'nios' is the FPGA
         autonomous sweep, and every failure inside it falls back to standard,
         so a regression is one set_params away from being undone."""
+        if self.sweep_mode == 'dsp' and not self._nios_unavailable:
+            return self._sweep_core_dsp(freqs, qt_rx, qt_tx, num_buffers,
+                                        settle_count, progress_cb)
         if self.sweep_mode == 'nios' and not self._nios_unavailable:
             return self._sweep_core_nios(freqs, qt_rx, qt_tx, num_buffers,
                                          settle_count, progress_cb)

@@ -494,3 +494,130 @@ class BladeRFDriver:
             'chirp_bw': self.chirp_bw,
             'chirp_duration': self.chirp_duration,
         }
+
+    # ------------------------------------------------------------------
+    # On-FPGA DSP path
+    #
+    # With this selected the FPGA divides RX1/RX2 per sample, averages N of
+    # them per step, and writes one 64-bit word per step into a small FIFO.
+    # The host reads DSP_FIFO_WORDS words and has h_cal directly -- no demod,
+    # no accumulate, no divide.
+    #
+# It computes the SAME quantity the standard sweep does. rx.vhd accumulates
+    # each channel into its own seq_adder and divides the two sums once per step
+    # (dsp_chain_tb prints [acc1] sum, [acc2] sum, then one [div]), so the result
+    # is sum1/sum2 == mean1/mean2. There is no E[X/Y] vs E[X]/E[Y] divergence --
+    # an earlier version of this comment claimed there was.
+    #
+    # Selected by control-register bit 6, which the fabric does not decode
+    # (bladerf_p.vhd unpack() covers 31:30 and 21:7).
+    # ------------------------------------------------------------------
+
+    DSP_PATH_BIT     = 6
+    DSP_FRAC_BITS    = 14        # Q14: 16384 == 1.0
+    DSP_WORD_BYTES   = 8         # 32-bit I + 32-bit Q
+    DSP_SWEEP_WORDS  = 51        # rx.vhd DSP_FIFO_WORDS -- must match the FPGA
+
+    # bladerf_metadata.flags: take whatever the FIFO has, do not schedule.
+    _META_FLAG_RX_NOW = 1 << 31
+
+    def dsp_path_enable(self, on=True):
+        """Route the sample FIFO ports to the DSP result FIFO, or back.
+
+        Not safe to flip mid-transfer: the multiplexer is combinational, so a
+        change while the FX3 is reading swaps the source underneath it. Call
+        with RX stopped.
+
+        Read-modify-write: this register also carries the RX mux selection,
+        packet/8-bit mode, the LEDs and the clock selects, so a bare mask would
+        clear all of them.
+        """
+        val = self.device.get_config_gpio()
+        if on:
+            val |= (1 << self.DSP_PATH_BIT)
+        else:
+            val &= ~(1 << self.DSP_PATH_BIT)
+        self.device.set_config_gpio(val & 0xFFFFFFFF)
+
+    def start_rx_dsp(self):
+        """Configure RX to receive DSP results instead of raw samples.
+
+        PACKET_META, not SC16_Q11. This is not cosmetic: fx3_gpif only takes a
+        transfer length from the metadata header in packet mode. In sample mode
+        it waits for 2048 words to accumulate, and one sweep is 102 DWORDs, so
+        a transfer would never trigger and the sweep would sit in the FIFO.
+
+        Layout stays RX_X2 -- the FPGA still needs both AD9361 channels running
+        to have a signal and a reference to divide. Only the FIFO read port is
+        muxed; the channels themselves are untouched.
+        """
+        if self.rx_running:
+            raise RuntimeError("stop RX before switching to the DSP path")
+        self.device.sync_config(
+            layout=ChannelLayout.RX_X2,
+            fmt=Format.PACKET_META,
+            num_buffers=RX_RING_DEPTH,
+            buffer_size=4096,
+            num_transfers=8,
+            stream_timeout=3500
+        )
+        self.device.enable_module(bladerf.CHANNEL_RX(0), True)
+        self.device.enable_module(bladerf.CHANNEL_RX(1), True)
+        self.dsp_path_enable(True)
+        self.rx_running = True
+        self._dual_channel = True
+
+    def stop_rx_dsp(self):
+        if not self.rx_running:
+            return
+        try:
+            self.dsp_path_enable(False)
+        except Exception:
+            pass
+        try:
+            self.device.enable_module(bladerf.CHANNEL_RX(0), False)
+            self.device.enable_module(bladerf.CHANNEL_RX(1), False)
+        except Exception:
+            pass
+        self.rx_running = False
+        self._dual_channel = False
+
+    def dsp_read_sweep(self, num_steps=None, timeout_s=2.0):
+        """Read one sweep of per-step ratios as complex64.
+
+        Returns None on a short or failed read rather than a partial array: the
+        FPGA gate holds the FIFO 'empty' until a WHOLE sweep has landed, so
+        anything short means something upstream stalled and the caller should
+        fall back rather than process a torn sweep.
+
+        One sweep is num_steps 64-bit words, which the 32-bit read side and
+        therefore libbladeRF's packet mode count as 2*num_steps DWORDs -- the
+        same number the FPGA writes into the header's length field.
+        """
+        if num_steps is None:
+            num_steps = self.DSP_SWEEP_WORDS
+        want_bytes  = num_steps * self.DSP_WORD_BYTES
+        want_dwords = want_bytes // 4
+
+        buf = bytearray(want_bytes)
+        meta = ffi.new("struct bladerf_metadata *")
+        meta.flags = self._META_FLAG_RX_NOW
+        try:
+            # sync_rx raises on error and returns None -- the count comes back
+            # in meta.actual_count, NOT as a return value. Treating the return
+            # as a count is what made the previous version of this function
+            # loop until its deadline and always return None.
+            self.device.sync_rx(buf, want_dwords,
+                                timeout_ms=int(timeout_s * 1000), meta=meta)
+        except Exception as e:
+            print(f"[bladerf] DSP sweep read failed: {e}")
+            return None
+
+        got = int(meta.actual_count)
+        if got < want_dwords:
+            return None
+
+        raw = np.frombuffer(bytes(buf), dtype='<i4')
+        scale = float(1 << self.DSP_FRAC_BITS)
+        return ((raw[0::2].astype(np.float32) / scale)
+                + 1j * (raw[1::2].astype(np.float32) / scale)).astype(np.complex64)
