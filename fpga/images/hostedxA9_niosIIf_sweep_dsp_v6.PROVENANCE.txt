@@ -1,0 +1,149 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v6.rbf
+==================================================
+
+Status:  v5 with the mixer's timing violation FIXED. cw_mixer no longer appears
+         in any failing path. One violation remains, -86 ps at the 85 C corner,
+         and it is the pre-existing TX timestamp comparator v4 already hit --
+         not DSP-chain code.
+
+         FUNCTIONALLY IDENTICAL TO v5. Same data path, same 51-word burst, same
+         DSP_ACCUM_N. This is a numerical-trust fix, NOT a throughput change.
+         If v5 measured 37 Hz, v6 will also measure 37 Hz. See THROUGHPUT below.
+
+Build date:        2026-09-08 22:02 IST
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-08_22.02.06
+md5    (.rbf):     07cfd4af957748aaefbb290fe144e13a (see .rbf.md5)
+Source tree:       bladerf-src @ 90edb729, branch sfcw-fpga-dsp, DIRTY.
+Quartus:           18.1.0.625 Standard, device 5CEBA9F23C8, fitter seed 1.
+
+REPRODUCIBILITY WARNING: the tree was dirty. The only uncommitted change is the
+cw_mixer.vhd edit described below; nothing else differs from 90edb729. That
+edit is not yet committed to bladerf-src, so this exact image cannot be
+regenerated from a commit hash alone until it is.
+
+WHAT CHANGED SINCE v5
+---------------------
+cw_mixer.vhd only. scale() was round, shift AND clamp in one function,
+evaluated entirely between the DSP block's output register and out_*:
+
+    out_i <= scale(acc_i);          -- +HALF, shift, 2 saturation compares, mux
+
+Quartus infers a multiply-add per channel and absorbs both the products and the
+adder into the DSP block, so that whole chain hung off Add1~mac_pl with nothing
+to break it. Split into two stages:
+
+    s_i_r <= round_shift(acc_i);    -- stage 2: +HALF and shift, registered at
+                                    --   SHIFT_W = SUM_W-TONE_FRAC = 19 bits
+    out_i <= clamp(s_i_r);          -- stage 3: two 19-bit compares and a mux
+
+Registering at 19 bits rather than 33 also shrinks the stage-3 comparators. The
+value provably fits -- 16x16 products, sum of two is 33 bits, >>14 leaves
+exactly 19 -- so the narrower register is lossless and clamp() behaves
+identically. Rounding and saturation are bit-for-bit unchanged.
+
+Note what did NOT work and was not tried twice: adding a register between the
+sum and scale() would have bought nothing, because the sum is already
+registered inside the DSP block. The combinational length was scale() itself.
+
+Costs one more clock: mixer latency is now 3 (multiply, round/shift, clamp).
+out_valid is delayed to match. Both channels use identical instances, so the
+accumulators stay in step and the ratio picks up no skew.
+
+TIMING
+------
+                                        v5        v6
+    Slow 1100mV 85C setup, pll_sclk    +0.284    -0.086
+    Slow 1100mV  0C setup, pll_sclk    -0.084    +0.082
+
+The mixer path is gone: grep for cw_mixer across the failing-path report returns
+ZERO hits. The 0 C corner it used to fail now passes at +82 ps.
+
+What remains at 85 C:
+
+    -0.086  FROM nios_system|time_tamer:tx_tamer|timestamp[7]
+            TO   tx:U_tx|fifo_reader|meta_current.meta_time_go_OTERM1645
+    -0.053  FROM nios_system|axi_ad9361_0|...|up_xfer_cntrl|d_data_cntrl[72]
+            TO   rx:U_rx|fifo_writer|fifo_current.fifo_12b_buf[66]
+
+The first is the TX fifo_reader's 64-bit scheduled-timestamp comparator --
+the same pre-existing Nuand path v4 documented (as OTERM1531; different OTERM
+number, different fit, same comparator). The second is the AD9361 AXI
+clock-domain transfer control into fifo_writer. Neither is DSP-chain code.
+
+The corner flipped because these are marginal paths that move with placement,
+which is also why a seed change is not a fix -- v4 tried seed 3 and made its
+path worse. Still a test build, not a release image.
+
+altera_reserved_tck clean everywhere. Both Fast corners pass by >2 ns.
+
+RESOURCES
+---------
+    Logic (ALMs)   8,460 / 113,560  (7 %)    unchanged from v5
+    Registers      18,098                    +119 (the new pipeline stage)
+    DSP blocks     34 / 342         (10 %)   unchanged
+Analysis & Synthesis: 0 errors, 145 warnings (143 in v5; +2 from the new
+signals). Same benign classes as v5.
+
+VERIFICATION
+------------
+All eight testbenches re-run against this RTL and green:
+
+    seq_adder_tb           PASS
+    iq_dword_packer_tb     PASS
+    dsp_chain_tb           PASS  0 errors, 4 acc1 / 4 acc2 / 4 divisions
+    rx_dsp_fifo_tb         PASS
+    rx_sweep_tb            PASS  50/50 words, worst error 7 counts (tol 250)
+    dsp_valid_skew_tb      PASS
+    fx3_gpif_dsp_tb SEL=0  PASS  24576 reads, stock path unaffected
+    fx3_gpif_dsp_tb SEL=1  PASS  102 reads, one sweep as one burst
+
+rx_sweep_tb's 7-count worst error confirms the extra pipeline stage did not
+disturb the numerics, as expected from the bit-identical rounding.
+
+Run with ModelSim ASE (intelFPGA_lite/20.1), NOT Questa -- Questa FSE in this
+tree wants a SALT_LICENSE_SERVER that is not configured. compile_tb.do and
+run_all_tb.sh in bladerf-src compile once and give each testbench its own vsim
+process, so one severity-failure assertion cannot hide the tests after it.
+
+NOT flashed, NOT run on hardware.
+
+THROUGHPUT -- WHY THIS IMAGE WILL NOT CHANGE YOUR SWEEP RATE
+------------------------------------------------------------
+The measured 37 Hz on v5 is not caused by anything this image changes. As of
+this build the Pi is still capturing RAW SAMPLES and reducing them itself:
+
+    pi/radar/bladerf_driver.py   no dsp_path_enabled, no PACKET_META,
+                                 no unpack_dsp_results, no SC16_Q11_PACKED
+                                 -- zero occurrences of any of them
+    pi/radar/sfcw_engine.py:972  start_rx_dual(self._rx_capture, num_samples=n)
+    pi/radar/sfcw_engine.py:402  nios_dwell = 4096 samples per step
+
+So the DSP result path has never actually run. dsp_path_en defaults to 0 and
+nothing sets it. What has been measured on v5 is the ordinary raw-capture path,
+which is also why the engine reports
+
+    NIOS sweep: RX delivery lagged 86 ms at harvest -- possible ring overflow
+
+86 ms is three sweeps of backlog, and the engine responds by discarding the
+autonomous sweep and falling back to one standard sweep.
+
+The acquisition ceiling is fixed and the DSP path cannot beat it, only reach it:
+
+    51 steps x 4096 samples = 208,896 samples
+    208,896 / 10 MS/s       = 20.89 ms  ->  47.9 Hz
+
+37 Hz is 27.0 ms, so ~6.1 ms/sweep (~120 us/step) is overhead the DSP path
+exists to delete: 51 x 4096 x 4 = 835 KB per sweep over USB becomes 408 bytes,
+and the Pi stops computing 51 means and 51 divisions.
+
+All three host-side changes from v4's list are still required, and none are in
+place yet. Flashing v6 alone will measure 37 Hz again.
+
+SEPARATE ISSUE SEEN IN THE SAME RUN
+-----------------------------------
+    RX ADC running hot -- RX1=2048/2047 (100% FS)
+
+The front end is compressing. cw_mixer saturates rather than wraps by design,
+but these samples are already clipped BEFORE they reach the FPGA, so the
+accumulated result carries a bias no amount of averaging removes. Worth turning
+RX1 gain down before trusting measurements from either image.
