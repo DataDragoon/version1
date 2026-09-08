@@ -1,0 +1,139 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v2.rbf / .sof
+==================================================
+
+Status:  RAW RX PATH WORKS. TIMING STILL MARGINALLY NEGATIVE.
+         Usable for bring-up. Not yet a release image.
+
+Build date:        2026-09-08 13:35 -> 14:19 UTC
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-08_14.19.31
+sha256 (.rbf):     582a6648d82aaf0b... (see .rbf.sha256)
+
+Quartus:
+    Quartus Prime 25.1std.0 Build 1129 10/21/2025 SC Lite Edition
+    install: C:/altera_lite/25.1std
+    device 5CEBA9F23C8 (Cyclone V E), BOARD=bladeRF-micro REV=hosted SIZE=A9
+
+Source tree:       bladerf-src @ 3bb67fa0 ("Autonomous SFCW sweep on the Nios"),
+                   branch sfcw-nios-sweep, working directory DIRTY.
+
+WHAT THIS IMAGE IS
+------------------
+Second image containing the on-FPGA DSP chain (ENABLE_DSP_AVERAGE => true):
+
+    seq_adder x2 (per-channel coherent sum, N = 4096)
+        -> complex_div (ONE divide per step, sum(RX1)/sum(RX2))
+        -> sample_fifo_51
+        -> read-side mux selected by dsp_path_en (config GPIO bit 6)
+
+The 1/N of a mean cancels in the ratio, so the sums are divided directly and no
+mean is ever computed.
+
+WHAT CHANGED SINCE v1 (hostedxA9.rbf, 13:00 build -- DO NOT USE THAT ONE)
+------------------------------------------------------------------------
+1. THE RAW PATH IS NO LONGER DESTROYED BY THE GENERIC.
+
+   The ENABLE_DSP_AVERAGE generate branch used to end with
+
+       fw_streams  <= (others => ZERO_SAMPLE);
+       fw_controls <= (others => SAMPLE_CONTROL_DISABLE);
+       fw_packet   <= PACKET_CONTROL_DEFAULT;
+
+   intending to keep the stock FIFO "quiescent". That starved fifo_writer, so
+   the stock 8192-word FIFO was never written. Since nothing sets dsp_path_en,
+   the read mux sat on a FIFO that could never fill, and EVERY RX transfer timed
+   out -- with the DSP path not even selected. Observed on hardware as:
+
+       [ERROR] Transfer timed out for RX buffer ...
+       [bladerf] RX dual error: Operation timed out
+
+   fw_streams/fw_controls/fw_packet are now driven unconditionally from
+   mux_streams/adc_controls/packet_control. The generic may only ADD a second
+   path, never remove the first.
+
+2. Shared valid for the two accumulators (carried over from the 13:00 build):
+
+       dsp_sample_v <= mux_streams(0).data_v and mux_streams(1).data_v;
+
+   Previously each accumulator ran off its own per-channel valid while
+   complex_div was started by RX1 alone. If RX2 fell behind, the divide used
+   RX2's HELD sum from a PREVIOUS step and reported it with div_by_zero clear.
+   dsp_valid_skew_tb case 2: truth 98304, reported 49152 -- wrong by 2x,
+   unflagged.
+
+VERIFICATION
+------------
+fx3_gpif_dsp_tb (new) runs rx -> fx3_gpif -> fx3_model with the DSP chain
+compiled in, and counts FX3 reads:
+
+    DSP_PATH_SEL = 0   24576 rreq pulses, 0 errors
+                       The stock path streams correctly, and the testbench's own
+                       sample-integrity checker passes. This is the regression
+                       above, now covered in simulation instead of on hardware.
+
+Also passing (bladerf-src/run_tb.do):
+    seq_adder_tb          ALL PASS
+    iq_dword_packer_tb    ALL PASS
+    dsp_chain_tb          PASSED
+    dsp_valid_skew_tb     PASS
+    rx_dsp_fifo_tb        PASSED
+    rx_sweep_tb           PASSED  50 steps x 4096, worst error 1 count (tol 250)
+
+REMAINING PROBLEMS
+------------------
+1. TIMING IS STILL NEGATIVE, though much closer than the 13:00 build:
+
+                                   13:00 build   this build
+       AD9361 rx clock, 85C          -0.310        -0.081
+       AD9361 rx clock,  0C          -0.828        -0.632
+
+   rx_clock is an alias of ad9361.clock, so complex_div, both seq_adders and the
+   DSP FIFO write side sit in the failing domain. That clock closed at +0.096 ns
+   on 2026-09-05 with none of this logic present.
+
+   This is combinational depth, not capacity -- 7% of the device is used. The
+   fix is pipelining, and the failing path has not yet been identified with
+   report_timing.
+
+   Practical consequence: intermittent, temperature-dependent corruption on the
+   capture path, worse cold than hot. Fine for bring-up, not for measurements
+   you intend to trust.
+
+2. THE DSP PATH STILL CANNOT DELIVER (dsp_path_en = 1).
+
+   fx3_gpif.vhd:270-273:
+       packet_enable = '1'  ->  rx_fifo_enough <= rx_meta_fifo_empty = '0'
+       packet_enable = '0'  ->  (rx_fifo_full & rx_fifo_usedw) >= gpif_buf_size
+
+   The DSP route bypasses fifo_writer, so nothing writes the meta FIFO and
+   packet mode never bursts. In non-packet mode gpif_buf_size is 2048 while the
+   DSP FIFO holds at most 51 words (102 read-side); the concatenated full flag
+   satisfies the comparison anyway, and fx3_gpif has no underflow check during a
+   burst (rx_fifo_empty is an input port never referenced in the state machine),
+   so it would over-read by ~1946 words.
+
+   Needs either meta-FIFO writes on the DSP path, or the results routed back
+   through fifo_writer's packet port.
+
+3. No host API yet for the NIOS SFCW sweep commands (SWPR/SWEP/SWST/SWQG).
+
+RESOURCES
+---------
+    Logic utilization   7,400 / 113,560  ( 7 %)
+    Registers          15,862
+    DSP Blocks             26 / 342  ( 8 %)
+
+    Pre-DSP baseline was 6,722 ALMs / 8 DSP blocks.
+
+altera_reserved_tck is healthy here. The -3.608 ns TCK failure seen on
+2026-09-05 was SignalTap loading the JTAG hub, not a design problem; no
+SignalTap in this build.
+
+USAGE
+-----
+    bladeRF-cli -l hostedxA9_niosIIf_sweep_dsp_v2.rbf
+
+Loads volatile; a power cycle reverts to whatever is in flash. Do not -L this
+image while timing is negative.
+
+With dsp_path_en left at 0 (the default) this behaves as a normal bladeRF and
+the Pi continues to do the averaging and division itself.
