@@ -1037,6 +1037,63 @@ Three things that are load-bearing:
   the next flush anyway, and it still runs at every row change, where the flushes
   stop because `publishRowStats` is gated on `isOpen()`.
 
+### Plan-view pixels: exact tiling, and the dashed path is gone (2026-09-08)
+
+Audit of the colouring pipeline after the live flush went in. The cell -> pixel
+mapping and the value pipeline were checked end to end; two things were wrong.
+
+**1. EVERY CELL OVERDREW ITS NEIGHBOURS BY UP TO 1.5 px.** `cellRect` returned the
+raw fractional rectangle and the three fills compensated for the resulting
+hairline gaps with `Math.ceil(r.w) + 0.5, Math.ceil(r.h) + 0.5`. That is a smear,
+and it scales with how fine the grid is: measured against the shipped function,
+**11.6% of a cell wide on a 101-column raster** (the pitch this rig actually
+captures at) and 12.5% tall on an awkward-fraction layout, against ~1.9% on the
+21x7 bench grid. A plan view is a measurement -- a cell must cover its own area
+and nothing else.
+
+`cellRect` now snaps each edge by rounding the cell BOUNDARY rather than a
+position plus a width, so column ix's right edge and column ix+1's left edge are
+the same expression and therefore the same pixel. Verified head-first against the
+function pulled out of the shipped file (not a retyped copy): **zero gaps, zero
+overlaps, zero zero-area cells** across four geometries including to-scale, and
+total width within 1 px of the exact extent. Rounding does NOT accumulate --
+every edge is rounded from its own absolute boundary -- so the to-scale
+projection stays true to within a pixel across the whole grid, which is far
+better than the 1.5 px bleed it replaces.
+
+**2. The dashed capture path is REMOVED.** It drew dotted lines joining captured
+cell centres in capture order, over the very pixels the plan view exists to show.
+It had also become wrong once the grid filled live: a row is written sorted by
+COLUMN, so on a right-to-left traverse the path was drawn back to front, and the
+open row's records are rewritten on every flush so its `order` churned at 4 Hz.
+START still marks where the raster began -- that part reads from the data and is
+worth keeping. The pulsing cyan NEXT-cell marker is also dashed but is a single
+outline, not lines across the image, and stays.
+
+**What was checked and found correct, so do not go looking again:**
+
+- **`cellRect`'s iy flip** (`originY - (iy+1)*cellH`) and `cellAt`'s inverse agree,
+  and `buildCscanGrid`'s `cells[iy*h + ix]` matches the draw loop's indexing. No
+  row mirroring, no off-by-one.
+- **SAFT addresses neighbours by GRID COLUMN** (`t.n`), not array position, so a
+  partial row -- which under live flushing is now the normal case -- does not
+  close the gap up and give every later column the wrong lateral offset.
+- **The live flush does not change the final image.** Simulated a full 11-column
+  traverse (36 Hz sweeps, 11 Hz positions) with flushing on and off and pushed
+  both through `applyBscanBg` -> `computeCellValues` -> `buildCscanGrid`:
+  **coloured values identical to 0 dB with focusing both on and off**, identical
+  shared and grid colour scales, no duplicate cells, a planted target landing in
+  the column it was planted in, and every cell within 1 mm of its column centre.
+
+**Known transient, NOT a defect in the final image.** While a row is filling, a
+cell at the leading edge has neighbours on one side only, and
+`saftFocusedProfile` accumulates a SUM over whatever contributors exist -- so with
+Focus on, the leading cells read dim and brighten as the row completes. It is the
+same truncated-aperture effect that permanently applies at the two ENDS of every
+finished row. Normalising by contributor count would change a kernel shared
+bit-identically with the 2D Map, so it was left alone; the final image is
+unaffected.
+
 ### What the harness checks, and what it cannot
 
 31 checks: a clean 11x3 raster (33 cells, every cell within 2 mm of its column

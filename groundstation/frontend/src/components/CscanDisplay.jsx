@@ -21,13 +21,30 @@ function jet(t) {
   ];
 }
 
+// A cell's rectangle, SNAPPED so the grid tiles exactly.
+//
+// Each edge is rounded from the cell BOUNDARY, not from a position plus a
+// width, so column ix's right edge and column ix+1's left edge are the same
+// expression and therefore the same pixel: no gap, and no overlap.
+//
+// It used to return the raw fractional rectangle, and the fills compensated for
+// the resulting hairline gaps with `Math.ceil(r.w) + 0.5` -- which overdraws
+// each cell by up to 1.5 px into the neighbour below and to its right. On a
+// coarse grid that is a few percent of a cell; on the 101-column rasters this
+// rig actually captures (~10 px a cell at a typical pane width) it is ~15% of
+// the cell, i.e. every cell visibly bleeding into the next. A plan view is a
+// measurement, so a cell must cover its own area and nothing else.
+//
+// Rounding costs at most half a pixel of placement against the exact geometry,
+// and it does NOT accumulate -- each edge is rounded from its own absolute
+// boundary rather than from the previous edge -- so the to-scale projection
+// stays true to within a pixel across the whole grid.
 function cellRect(ix, iy, L) {
-  return {
-    x: L.originX + ix * L.cellW,
-    y: L.originY - (iy + 1) * L.cellH,
-    w: L.cellW,
-    h: L.cellH,
-  };
+  const x0 = Math.round(L.originX + ix * L.cellW);
+  const x1 = Math.round(L.originX + (ix + 1) * L.cellW);
+  const y1 = Math.round(L.originY - iy * L.cellH);
+  const y0 = Math.round(L.originY - (iy + 1) * L.cellH);
+  return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 
 function cellAt(px, py, L, hCount, vCount) {
@@ -157,7 +174,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
         // Captured, but no background could be produced for it. Drawn as an
         // explicit error rather than given a colour it has not earned.
         ctx.fillStyle = INVALID_FILL;
-        ctx.fillRect(r.x, r.y, Math.ceil(r.w) + 0.5, Math.ceil(r.h) + 0.5);
+        ctx.fillRect(r.x, r.y, r.w, r.h);
         ctx.strokeStyle = INVALID_STROKE;
         ctx.lineWidth = 1;
         const inset = Math.min(r.w, r.h) * 0.28;
@@ -170,7 +187,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
       } else if (cell && isFinite(cell.value)) {
         const [cr, cg, cb] = jet(norm(cell.value, limitsFor(iy)));
         ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
-        ctx.fillRect(r.x, r.y, Math.ceil(r.w) + 0.5, Math.ceil(r.h) + 0.5);
+        ctx.fillRect(r.x, r.y, r.w, r.h);
         // The model was applied but clamped to the edge of its captured span.
         // Measured cost: 19 dB at 5 mm outside, NEGATIVE suppression past 10 mm.
         // The value is real enough to draw, but not to trust unmarked.
@@ -186,7 +203,7 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
       } else if (cell) {
         // Captured, but the depth gate falls outside its range profile.
         ctx.fillStyle = GATED_OUT_FILL;
-        ctx.fillRect(r.x, r.y, Math.ceil(r.w) + 0.5, Math.ceil(r.h) + 0.5);
+        ctx.fillRect(r.x, r.y, r.w, r.h);
       } else {
         ctx.fillStyle = EMPTY_FILL;
         ctx.fillRect(r.x, r.y, r.w, r.h);
@@ -220,23 +237,14 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
     .sort((a, b) => a.order - b.order);
   const cellOf = (idx) => ({ ix: idx % grid.hCount, iy: Math.floor(idx / grid.hCount) });
 
-  // Path through the cells already captured — makes the raster order, and any
-  // hole left by an undo, visible at a glance.
-  if (!chromeless && grid.filled > 1 && L.cellW > 6 && L.cellH > 6) {
-    ctx.strokeStyle = '#ffffff33';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([3, 3]);
-    ctx.beginPath();
-    captureOrder.forEach((e, n) => {
-      const { ix, iy } = cellOf(e.idx);
-      const r = cellRect(ix, iy, L);
-      const cx = r.x + r.w / 2;
-      const cy = r.y + r.h / 2;
-      if (n === 0) ctx.moveTo(cx, cy); else ctx.lineTo(cx, cy);
-    });
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
+  // The dashed capture path that used to be drawn here -- a zig-zag joining the
+  // captured cells' centres in capture order -- is GONE (2026-09-08). It laid
+  // dotted lines over the very pixels the plan view exists to show, and once the
+  // grid started filling live it was wrong as well: a row is written sorted by
+  // COLUMN, so on a right-to-left traverse the path was drawn back to front, and
+  // the open row's records are rewritten on every flush, so its `order` churned
+  // at 4 Hz. It was ornament over a measurement. START still marks where the
+  // raster began, which is the part worth keeping.
 
   // Start marker on the cell the raster actually began at. With nothing
   // captured yet there is no fact to read, so it falls back to where the
