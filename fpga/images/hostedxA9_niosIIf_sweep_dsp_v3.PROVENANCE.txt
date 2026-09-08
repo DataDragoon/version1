@@ -1,0 +1,143 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v3.rbf / .sof
+==================================================
+
+Status:  TIMING CLEAN. Raw RX path works. This supersedes v2.
+         The DSP path itself (dsp_path_en = 1) still cannot deliver -- see
+         REMAINING below. With the bit at its default 0 this behaves as a
+         normal bladeRF and the Pi continues to do the averaging and division.
+
+Build date:        2026-09-08 14:39 -> 15:10 UTC
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-08_15.10.19
+sha256 (.rbf):     cf085aa224919d53... (see .rbf.sha256)
+
+Quartus:
+    Quartus Prime 25.1std.0 Build 1129 10/21/2025 SC Lite Edition
+    device 5CEBA9F23C8 (Cyclone V E), BOARD=bladeRF-micro REV=hosted SIZE=A9
+
+Source tree:       bladerf-src @ 3bb67fa0, branch sfcw-nios-sweep, dirty.
+
+TIMING
+------
+Zero negative slack anywhere in the design.
+
+The AD9361 receive clock (pll_sclk divclk), which carries the whole DSP chain:
+
+                        13:00 build   14:19 build   THIS BUILD
+    Slow 85C  setup       -0.310        -0.081       +0.266
+    Slow  0C  setup       -0.828        -0.632       +0.165
+
+For reference it was +0.096 ns on 2026-09-05 with no DSP chain at all, so this
+build has more margin than the design had before any of this work.
+
+FIXES IN THIS IMAGE
+-------------------
+1. complex_div: extra PRODUCTS2 pipeline stage.
+
+   Quartus absorbs the p_* product registers into the DSP blocks' output
+   registers, leaving
+       DSP output terminal -> routing -> 57-bit adder -> den
+   in one clock. report_timing named it exactly:
+       From rx|complex_div|p_q1q1[24]_OTERM613  To rx|complex_div|den[54]
+       Slack -0.081 (VIOLATED)
+   On hardware this appeared as ~16% capture loss, which collapsed the sweep
+   rate from 37/s to 5/s because the host could no longer find the step grid
+   ("only 17 transients in the capture, need at least 25").
+
+   PRODUCTS2 is a plain register copy that cannot be absorbed into the DSP
+   blocks, so the path splits in two. Costs one clock in a divide that takes
+   ~52 and runs once per step.
+
+2. rx.vhd: the raw path is no longer destroyed by ENABLE_DSP_AVERAGE.
+
+   The generate branch used to end with fw_streams/fw_controls/fw_packet tied
+   to ZERO_SAMPLE/DISABLE/DEFAULT, starving fifo_writer. Since dsp_path_en
+   defaults to 0, the read mux then pointed at a FIFO that could never fill and
+   EVERY RX transfer timed out. Those assignments are now unconditional: the
+   generic may only ADD a path, never remove one.
+
+3. rx.vhd: one shared valid for both accumulators.
+
+       dsp_sample_v <= mux_streams(0).data_v and mux_streams(1).data_v;
+
+   Each accumulator previously ran off its own per-channel valid while
+   complex_div was started by RX1 alone, so if RX2 fell behind, the divide used
+   RX2's HELD sum from a PREVIOUS step and reported it with div_by_zero clear.
+   dsp_valid_skew_tb case 2: truth 98304, reported 49152 -- wrong by 2x, and
+   unflagged.
+
+4. rx.vhd: the accumulation window now fits inside a sweep step.
+
+       DSP_FLUSH_N   64   -> 1088
+       DSP_ACCUM_N   4096 -> 2944
+
+   The NIOS sweep retunes every nios_dwell samples (4096) and toggles the
+   restart bit as it does; seq_adder's restart discards whatever is
+   part-accumulated. At 64 + 4096 = 4160 against a 4096-sample dwell the
+   accumulator was wiped a few samples short EVERY step, so the chain would
+   have emitted nothing at all -- silent in a way that looks like a dead
+   datapath.
+
+   1088 + 2944 = 4032 fits with 64 samples of tail guard, and the window now
+   matches the host's own capture window,
+   dwell - settle - 2*NIOS_WINDOW_GUARD = 4096 - 1024 - 128 = 2944, so the FPGA
+   averages the samples the host would have. 2944 is 29.44 tone cycles at
+   100 samples/cycle -- deliberately NOT a multiple of 100, which would sum to
+   zero on both channels and make every division 0/0.
+
+SYNCHRONISATION
+---------------
+The FPGA does not count to 4096 independently. profile_activate() toggles RFFE
+GPO bit 24 at the retune; the FPGA synchronises that into rx_clock,
+edge-detects it and pulses dsp_restart, and seq_adder restarts from that
+instant. So retune jitter shifts where the window starts and never misaligns
+it. NIOS polls time_tamer_read() and can only ever be late, never early, so the
+dwell is always >= 4096 samples.
+
+The one hard requirement is FLUSH_N + ACCUM_N < nios_dwell. There is currently
+no assert on either side enforcing it.
+
+VERIFICATION
+------------
+ModelSim ASE 20.1, all passing:
+    seq_adder_tb          ALL PASS
+    iq_dword_packer_tb    ALL PASS
+    dsp_chain_tb          PASSED
+    dsp_valid_skew_tb     PASS
+    rx_dsp_fifo_tb        PASSED
+    rx_sweep_tb           PASSED  50 steps x 4096, worst error 1 count (tol 250)
+    fx3_gpif_dsp_tb       DSP_PATH_SEL=0: 24576 FX3 reads, 0 errors
+
+fx3_gpif_dsp_tb is new and covers the regression in fix 2 -- rx -> fx3_gpif ->
+fx3_model with the DSP chain compiled in -- so that failure is caught in
+simulation rather than on hardware next time.
+
+REMAINING
+---------
+1. dsp_path_en = 1 still cannot deliver. fx3_gpif.vhd:270-273:
+       packet_enable = '1'  ->  rx_fifo_enough <= rx_meta_fifo_empty = '0'
+       packet_enable = '0'  ->  (rx_fifo_full & rx_fifo_usedw) >= gpif_buf_size
+   The DSP route bypasses fifo_writer, so nothing writes the meta FIFO and
+   packet mode never bursts. In non-packet mode gpif_buf_size is 2048 while the
+   DSP FIFO holds 51 words (102 read-side); the concatenated full flag satisfies
+   the comparison anyway, and fx3_gpif has no underflow check during a burst
+   (rx_fifo_empty is an input port never referenced in the state machine), so it
+   would over-read by ~1946 words.
+
+   Needs meta-FIFO writes on the DSP path, or results routed back through
+   fifo_writer's packet port.
+
+2. div_by_zero is wired but never read, so a dead reference channel returns
+   zeros indistinguishable from a real null.
+
+3. No host API for the NIOS sweep commands (SWPR/SWEP/SWST/SWQG).
+
+RESOURCES
+---------
+    Logic utilization   7,428 / 113,560  ( 7 %)
+    Registers          16,233
+    Block memory bits   2,213,376 / 12,492,800 (18 %)
+    DSP Blocks             26 / 342  ( 8 %)
+
+USAGE
+-----
+    bladeRF-cli -l hostedxA9_niosIIf_sweep_dsp_v3.rbf
