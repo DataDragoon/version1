@@ -794,6 +794,18 @@ export default function App() {
       topPx: num('cscan_top_px', 80),
     };
   });
+  // Plan-view smoothing. Purely a DISPLAY choice -- it resamples the same cell
+  // values bilinearly between cell centres so the grid reads as a continuous
+  // field instead of a mosaic. Deliberately not part of `bscanParams`: it
+  // changes no cell value, nothing downstream reads it, and it should not ride
+  // along in an export as though it were a property of the capture.
+  const [cscanSmooth, setCscanSmoothState] = useState(
+    () => localStorage.getItem('cscan_smooth') === 'true');
+  const setCscanSmooth = useCallback((v) => {
+    localStorage.setItem('cscan_smooth', String(!!v));
+    setCscanSmoothState(!!v);
+  }, []);
+
   // The projector output window: `null` when closed, otherwise the display it
   // was opened on (or `{}` when the operator has to place it by hand because
   // the browser will not enumerate displays). Held in App rather than in the
@@ -2298,6 +2310,8 @@ export default function App() {
         onBscanShowGateChange={setBscanShowGate}
         cscanProjection={cscanProjection}
         onCscanProjectionChange={setCscanProjection}
+        cscanSmooth={cscanSmooth}
+        onCscanSmoothChange={setCscanSmooth}
         cscanProjector={cscanProjector}
         onCscanProjectorChange={setCscanProjector}
         bscanScaleLink={bscanScaleLink}
@@ -2313,6 +2327,8 @@ export default function App() {
         cscanSharedScale={cscanSharedScale}
         cscanBgDiag={cscanBgDiag}
         bscanProcParams={bscanProcParams}
+        onBscanProcParamsChange={setBscanProcParams}
+        bscanProcLocked={sfcwRunning || !!roverScan.active}
         bscanCaptureProgress={bscanCaptureProgress}
         sarBscanData={sarBscanInput}
         sarResult={sarResult}
@@ -2433,9 +2449,6 @@ export default function App() {
         bscanBgDisplay={bscanBgDisplay}
         bscanBgSubMode={bscanBgSubMode}
         cscanSharedScale={cscanSharedScale}
-        bscanProcParams={bscanProcParams}
-        onBscanProcParamsChange={setBscanProcParams}
-        bscanProcLocked={sfcwRunning || !!roverScan.active}
         bscanParams={bscanParams}
         bscanCapturing={bscanCapturing}
         roverScan={roverScan}
@@ -2446,9 +2459,9 @@ export default function App() {
         bscanShowGate={bscanShowGate}
         bscanScaleLink={bscanScaleLink}
         cscanProjection={cscanProjection}
+        cscanSmooth={cscanSmooth}
         cscanRowScales={cscanRowScales}
         cscanGridScales={cscanGridScales}
-        cscanLiveResult={cscanLiveProcessed.result}
         sarResult={sarResult}
         sarProgress={sarProgress}
         sarScaleMode={sarScaleMode}
@@ -2498,6 +2511,7 @@ export default function App() {
             nextIndex={roverScan.active ? roverScan.index : cscanProcessedData.length}
             scanMode={bscanParams.scanMode}
             projection={cscanProjection}
+            smooth={cscanSmooth}
             rootRef={cscanProjectorRootRef}
           />
         </ProjectorWindow>

@@ -69,7 +69,96 @@ function canvasOffsetIn(rootRef, rect) {
   return { x: rect.left - r.left, y: rect.top - r.top };
 }
 
-function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless) {
+// The plan view resampled BILINEARLY between cell centres instead of painted as
+// flat tiles, so the grid reads as a continuous field rather than a mosaic.
+//
+// The interpolation is deliberately the narrowest one that removes the blocking:
+// a cell's value reaches exactly as far as the next cell's centre and no
+// further, which is what an `imshow(interpolation='bilinear')` does. Nothing is
+// invented beyond the grid either -- the outer half-cell ring is the edge cell's
+// own value held flat (drawImage clamps at the source edge), not an
+// extrapolation. So a feature never moves and never grows by more than the
+// pitch the operator chose to sample at.
+//
+// Built at GRID resolution (one source pixel per cell) and upscaled by the
+// canvas, so the per-frame cost is hCount*vCount, not a pixel of the pane.
+//
+// Returns false if there is nothing to draw, in which case the caller falls
+// back to the flat tiles.
+function drawSmoothField(ctx, canvas, grid, L, valueAt) {
+  const { hCount, vCount } = grid;
+  const n = hCount * vCount;
+  if (n < 2) return false;
+
+  const t = new Float32Array(n);
+  const known = new Uint8Array(n);
+  let anyKnown = false;
+  for (let iy = 0; iy < vCount; iy++) {
+    for (let ix = 0; ix < hCount; ix++) {
+      const i = iy * hCount + ix;
+      const v = valueAt(ix, iy);
+      if (v == null) continue;
+      t[i] = Math.max(0, Math.min(1, v));
+      known[i] = 1;
+      anyKnown = true;
+    }
+  }
+  if (!anyKnown) return false;
+
+  // Holes -- uncaptured cells, gated-out cells, cells whose background failed.
+  // Each is overdrawn opaquely as itself afterwards, but it would still drag the
+  // ramp INTO it toward whatever colour a zero happens to be, which is a value
+  // nothing measured. Give it the mean of its KNOWN neighbours instead, so the
+  // field simply carries on across the hole and the hole's own square is the
+  // only thing that reads as missing.
+  //
+  // ONE pass, deliberately. Bilinear interpolation only ever mixes two adjacent
+  // source pixels, and the half of that span lying inside the hole's own cell is
+  // overdrawn -- so only a hole DIRECTLY beside a real cell can touch a visible
+  // pixel, and filling deeper would both fabricate more and cost passes over the
+  // whole grid on every frame of a mostly-empty raster.
+  const patched = new Float32Array(t);
+  for (let iy = 0; iy < vCount; iy++) {
+    for (let ix = 0; ix < hCount; ix++) {
+      const i = iy * hCount + ix;
+      if (known[i]) continue;
+      let sum = 0;
+      let cnt = 0;
+      if (ix > 0 && known[i - 1]) { sum += t[i - 1]; cnt++; }
+      if (ix < hCount - 1 && known[i + 1]) { sum += t[i + 1]; cnt++; }
+      if (iy > 0 && known[i - hCount]) { sum += t[i - hCount]; cnt++; }
+      if (iy < vCount - 1 && known[i + hCount]) { sum += t[i + hCount]; cnt++; }
+      if (cnt) patched[i] = sum / cnt;
+    }
+  }
+
+  // From the canvas's OWN document: the projector portal draws into a second
+  // window, and a node made by the wrong document is not usable there.
+  const doc = canvas.ownerDocument;
+  const off = doc.createElement('canvas');
+  off.width = hCount;
+  off.height = vCount;
+  const octx = off.getContext('2d');
+  const img = octx.createImageData(hCount, vCount);
+  const px = img.data;
+  for (let iy = 0; iy < vCount; iy++) {
+    // Source row 0 is the TOP of the image, grid row 0 is the BOTTOM.
+    const row = vCount - 1 - iy;
+    for (let ix = 0; ix < hCount; ix++) {
+      const [r, g, b] = jet(patched[iy * hCount + ix]);
+      const o = (row * hCount + ix) * 4;
+      px[o] = r; px[o + 1] = g; px[o + 2] = b; px[o + 3] = 255;
+    }
+  }
+  octx.putImageData(img, 0, 0);
+
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(off, 0, 0, hCount, vCount, L.originX, L.originY - L.gridH, L.gridW, L.gridH);
+  return true;
+}
+
+function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth) {
   // `isConnected` is false for a frame or two while the projector window is
   // being torn down, and drawing into a canvas whose document is going away
   // throws in some browsers.
@@ -165,7 +254,17 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   ctx.rect(L.clip.x, L.clip.y, L.clip.w, L.clip.h);
   ctx.clip();
 
-  // Cells
+  // Cells. With smoothing on, the VALID cells are painted once as one
+  // interpolated field and skipped in the loop below; everything that is not a
+  // value -- uncaptured, gated out, background-failed -- is still drawn as its
+  // own sharp square on top, because those are statements about a cell rather
+  // than measurements to be blended between.
+  const smoothed = smooth && drawSmoothField(ctx, canvas, grid, L, (ix, iy) => {
+    const cell = grid.cells[iy * grid.hCount + ix];
+    if (!cell || cell.invalid || !isFinite(cell.value)) return null;
+    return norm(cell.value, limitsFor(iy));
+  });
+
   for (let iy = 0; iy < grid.vCount; iy++) {
     for (let ix = 0; ix < grid.hCount; ix++) {
       const cell = grid.cells[iy * grid.hCount + ix];
@@ -185,9 +284,11 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
         ctx.lineTo(r.x + inset, r.y + r.h - inset);
         ctx.stroke();
       } else if (cell && isFinite(cell.value)) {
-        const [cr, cg, cb] = jet(norm(cell.value, limitsFor(iy)));
-        ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
-        ctx.fillRect(r.x, r.y, r.w, r.h);
+        if (!smoothed) {
+          const [cr, cg, cb] = jet(norm(cell.value, limitsFor(iy)));
+          ctx.fillStyle = `rgb(${cr},${cg},${cb})`;
+          ctx.fillRect(r.x, r.y, r.w, r.h);
+        }
         // The model was applied but clamped to the edge of its captured span.
         // Measured cost: 19 dB at 5 mm outside, NEGATIVE suppression past 10 mm.
         // The value is real enough to draw, but not to trust unmarked.
@@ -338,8 +439,12 @@ function drawCscan(canvas, scanData, params, crosshair, selected, nextIndex, isL
   // a back-projected aperture sum rather than this cell's own gated profile --
   // and the B-scan pane beside it is deliberately NOT focused.
   const focusTag = params.focusEnabled ? ` · FOCUS ×${params.focusAperture}` : '';
+  // Named because the pixels between cell centres are interpolated rather than
+  // measured -- the cell values themselves are untouched, but the image is no
+  // longer one flat tile per sample.
+  const smoothTag = smoothed ? ' · SMOOTH' : '';
   ctx.fillText(
-    `C-SCAN (${String(metric).toUpperCase()} @ ${gateStart}-${gateEnd} cm${isDiff ? ' · Δ MAG' : ''}${focusTag})`,
+    `C-SCAN (${String(metric).toUpperCase()} @ ${gateStart}-${gateEnd} cm${isDiff ? ' · Δ MAG' : ''}${focusTag}${smoothTag})`,
     L.pad.left, 14);
   ctx.fillStyle = '#444444';
   ctx.font = '9px monospace';
@@ -452,6 +557,7 @@ export default function CscanDisplay({
   scanData, params, capturing, sfcwProgress, scaleMode, scaleRange,
   nextIndex, selectedCell, onSelectCell, scanMode, sharedScale, subMode,
   rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless,
+  smooth,
 }) {
   const canvasRef = useRef(null);
   const animRef = useRef(null);
@@ -473,7 +579,7 @@ export default function CscanDisplay({
       if (start === null) start = t;
       // Breathing highlight on the next target cell, only while a capture is pending.
       const pulse = capturing ? 0.5 + 0.5 * Math.sin((t - start) / 180) : 0;
-      drawCscan(canvas, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless);
+      drawCscan(canvas, scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, pulse, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth);
       if (win.closed) return;
       animRef.current = win.requestAnimationFrame(render);
     };
@@ -484,7 +590,7 @@ export default function CscanDisplay({
       // cancelling an unknown id is a no-op either way.
       if (animRef.current && !win.closed) win.cancelAnimationFrame(animRef.current);
     };
-  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless]);
+  }, [scanData, params, crosshair, selectedCell, nextIndex, isLinear, scaleRange, capturing, scanMode, sharedScale, subMode, rowScales, scaleScope, scaleLink, projection, onLayout, rootRef, chromeless, smooth]);
 
   const pick = (e) => {
     const rect = e.currentTarget.getBoundingClientRect();

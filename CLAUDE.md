@@ -3725,6 +3725,61 @@ real data reaching the second window and not just an empty grid.
 There is still no test runner in this repo, so all of these were throwaway
 scripts. `vite build` passes.
 
+## C-scan panel: smoothed plan view, Live Sweep pane removed (2026-09-08)
+
+Three UI changes to the C-Scan panel.
+
+**1. A Smooth/Blocky toggle in the Display section** (`cscanSmooth` in `App.jsx`,
+persisted to `localStorage.cscan_smooth`, passed to both `CscanDisplay`
+instances including the projector portal). It is a DISPLAY transform only -- no
+cell value changes and nothing downstream reads it, which is why it is
+deliberately NOT in `bscanParams`: it must not ride along in an export as though
+it were a property of the capture.
+
+`drawSmoothField()` builds an ImageData at GRID resolution (one source pixel per
+cell), then lets `drawImage` upscale it with `imageSmoothingEnabled`. Two
+properties make it honest, and both were checked head-first against the shipped
+call: **cell centres survive the resample exactly** (source pixel `i+0.5` maps to
+`originX + (i+0.5)*cellW`, which is `cellRect`'s own centre), and **a value
+reaches exactly one pitch and no further** -- bilinear only ever mixes two
+adjacent source pixels, so a feature can neither move nor grow beyond the
+sampling the operator chose. The outer half-cell ring is the edge cell's own
+value held flat (drawImage clamps at the source edge), not an extrapolation.
+The title carries `· SMOOTH` because the pixels between centres are interpolated
+rather than measured.
+
+Cost is `hCount*vCount` per frame, not a pixel of the pane -- 1515 for a 101x15
+raster.
+
+**Cells that are not a value are still drawn as sharp squares on top**:
+uncaptured, gated-out, and the red-cross background-failed cells. Those are
+statements about a cell, not measurements to blend between. Holes are first
+given the mean of their KNOWN neighbours in the source image so the ramp INTO
+them is not dragged toward a colour nothing measured. **That fill is ONE pass,
+deliberately** -- only a hole directly beside a real cell can touch a visible
+pixel (the half of the span inside the hole's own cell is overdrawn), and an
+iterative flood would fabricate more AND cost passes over the whole grid on
+every frame of a mostly-empty raster.
+
+**2. The Live Sweep pane is gone from the C-Scan viewport.** The plan view now
+holds the whole area until a row is opened. That pane's controls bar was the
+ONLY place `procParams` could be set (see "The Live Sweep controls bar now
+drives the C-scan", 2026-08-31), so **Window / Kaiser beta / Avg / coh-inc moved
+into the panel's Display section as real controls** rather than the read-only
+tiles that used to mirror them; they still lock on `procLocked`
+(`sfcwRunning || roverScan.active`) for the same reason. `Viewport` no longer
+takes `bscanProcParams` / `onBscanProcParamsChange` / `bscanProcLocked` /
+`cscanLiveResult`; `App.jsx` passes them to the Sidebar instead.
+`cscanLiveProcessed` survives -- only its `.diag` is consumed now, by the panel's
+Background readout.
+
+**3. The explanatory prose blocks were removed** from Depth Slice (gate
+markers), Focus, Display, the Window/Avg block, Projection, Scaling, Background
+and Super Fit. Status and warning text is untouched -- only the paragraphs
+explaining what a control does. The Super Fit "needs a full grid, N of M cells"
+line went with them; the Scan Grid section's `Captured` tile already shows that
+count.
+
 ## C-scan plan-view focusing, per row (2026-09-06)
 
 A **Focus (SAFT)** section on the C-scan panel -- a toggle and an aperture

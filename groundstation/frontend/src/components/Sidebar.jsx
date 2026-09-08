@@ -87,6 +87,8 @@ export default function Sidebar({
   cscanSharedScale,
   cscanBgDiag,
   bscanProcParams,
+  onBscanProcParamsChange,
+  bscanProcLocked,
   bscanCaptureProgress,
   onBgAppliedChange,
   bscanParams,
@@ -103,6 +105,8 @@ export default function Sidebar({
   bscanShowGate,
   onBscanShowGateChange,
   cscanProjection,
+  cscanSmooth,
+  onCscanSmoothChange,
   onCscanProjectionChange,
   cscanProjector,
   onCscanProjectorChange,
@@ -427,6 +431,8 @@ export default function Sidebar({
                   sharedScale={cscanSharedScale}
                   bgDiag={cscanBgDiag}
                   procParams={bscanProcParams}
+                  onProcParamsChange={onBscanProcParamsChange}
+                  procLocked={bscanProcLocked}
                   captureProgress={bscanCaptureProgress}
                   onBgAppliedChange={onBgAppliedChange}
                   onScanAction={onBscanAction}
@@ -456,6 +462,8 @@ export default function Sidebar({
                   onShowGateChange={onBscanShowGateChange}
                   projection={cscanProjection}
                   onProjectionChange={onCscanProjectionChange}
+                  smooth={cscanSmooth}
+                  onSmoothChange={onCscanSmoothChange}
                   projector={cscanProjector}
                   onProjectorChange={onCscanProjectorChange}
                   lidarMm={lidarMm}

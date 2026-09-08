@@ -29,10 +29,11 @@ export default function CscanPanel({
   onCaptureBg, onLoadBgModel, onClearBg,
   bgSubMode, onBgSubModeChange,
   superFit, onCaptureSuperFit, onClearSuperFit,
-  sharedScale, bgDiag, procParams, captureProgress,
+  sharedScale, bgDiag, procParams, onProcParamsChange, procLocked, captureProgress,
   scaleScope, onScaleScopeChange, rowScales, showGate, onShowGateChange,
   scaleLink, onScaleLinkChange, gridScales, liveDiag,
   projection, onProjectionChange, projector, onProjectorChange,
+  smooth, onSmoothChange,
   roverConnected, roverStatus, sendRover, roverScan, roverRowStats, sweepPeriodMs,
   originAnchor,
 }) {
@@ -1006,11 +1007,6 @@ export default function CscanPanel({
         >
           {showGate ? '● Gate markers on B-scan' : 'Gate markers hidden'}
         </button>
-        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          {showGate
-            ? 'Two cyan lines on the B-scan mark the gate edges and everything outside them is dimmed — what stays bright is exactly the bins each plan-view cell is built from. Drag the sliders and watch it move.'
-            : 'Markers hidden. The gate still decides every plan-view cell value — this toggle only stops drawing it.'}
-        </div>
       </Section>
 
       {/* Plan-view focusing. Same synthetic-aperture kernel the 2D Map uses
@@ -1052,13 +1048,6 @@ export default function CscanPanel({
             </div>
           </>
         )}
-        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          {hCount < 3
-            ? 'Needs at least 3 columns — focusing sums a row’s neighbours.'
-            : focusEnabled
-              ? 'Each cell is back-projected from its own row: every neighbour within the aperture is read at the geometric range to each gated depth and summed, tapered by an obliquity weight. Rows never contribute to each other — the vertical axis decorrelates far faster than the horizontal one on this rig, so traces a row apart do not describe the same wall. Neighbours are addressed by grid column, so a gap left by an undo keeps its spacing. Colour limits switch to the focused values, because a summed aperture is no longer a bin of any profile — the B-scan pane below is NOT focused and both panes say so.'
-              : 'Off, each cell is just its own range profile reduced over the gate. On, each row is focused along itself, which sharpens a target that spans several columns and suppresses returns that do not line up on a hyperbola.'}
-        </div>
       </Section>
 
       <Section label="Display">
@@ -1076,39 +1065,98 @@ export default function CscanPanel({
             {displayMode === 'color' ? 'Color' : 'Profile'}
           </button>
         </div>
-        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          The B-scan pane draws the whole record — {depthLimitCm} cm at the current
-          step size, gate or no gate. The Depth Slice gate chooses what the plan
-          view colours by; on the right it only shades the excluded bins, and
-          the data under the shading is still drawn and still readable.
-        </div>
 
-        {/* Mirrors the Live Sweep pane's controls bar, which is where they are
-            set. Window and averaging MODE re-derive the whole grid on change;
-            Avg is how many sweeps each cell takes and only applies to captures
-            made after it is set. The bar locks while a session runs. */}
+        {/* Smoothing. A DISPLAY transform only: the plan view is resampled
+            bilinearly between cell CENTRES, so a cell's value reaches exactly as
+            far as its neighbour's centre and no further. Nothing is invented
+            past the grid either -- the outer half-cell ring holds the edge
+            cell's own value. Cells that are not a value (uncaptured, gated out,
+            background-failed) are still drawn as their own sharp squares. */}
+        <button
+          onClick={() => onSmoothChange && onSmoothChange(!smooth)}
+          className={cn(
+            'w-full px-3 py-2 rounded-lg text-xs font-medium transition-all border',
+            smooth
+              ? 'bg-[#6B9BD2]/10 border-[#6B9BD2]/40 text-[#6B9BD2]'
+              : 'bg-white/5 border-white/10 text-white/50 hover:text-white/80',
+          )}
+        >
+          {smooth ? '● Smooth cells' : 'Blocky cells'}
+        </button>
+
+        {/* Window and averaging. Window and the averaging MODE re-derive every
+            stored cell on change (each cell keeps all its sweeps, so coh/inc
+            stays a live choice); Avg is how many sweeps each cell TAKES and so
+            only applies to cells captured after it is set. Both lock while a
+            session runs -- different cells of one grid must be processed
+            identically. */}
         {procParams && (
           <>
             <div className="grid grid-cols-2 gap-2">
-              <InfoTile
-                label="Window"
-                value={procParams.windowType === 'kaiser'
-                  ? `Kaiser β${procParams.kaiserBeta}`
-                  : procParams.windowType === 'hanning' ? 'Hanning' : 'Rect'}
-              />
-              <InfoTile
-                label="Avg / cell"
-                value={procParams.avgCount > 1
-                  ? `${procParams.avgCount}× ${procParams.avgMode === 'coherent' ? 'coh' : 'inc'}`
-                  : 'Off'}
-              />
+              <div className="flex flex-col gap-1">
+                <span className="px-1 text-[9px] font-medium uppercase tracking-wider text-[#555555]">Window</span>
+                <select
+                  value={procParams.windowType}
+                  disabled={procLocked}
+                  onChange={(e) => onProcParamsChange({ ...procParams, windowType: e.target.value })}
+                  className={cn(
+                    'w-full px-2 py-1.5 rounded-lg text-[10px] bg-white/5 border border-white/10 outline-none',
+                    procLocked ? 'text-white/20 cursor-not-allowed' : 'text-white/70',
+                  )}
+                >
+                  <option value="rectangular">Rectangular</option>
+                  <option value="kaiser">Kaiser</option>
+                  <option value="hanning">Hanning</option>
+                </select>
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="px-1 text-[9px] font-medium uppercase tracking-wider text-[#555555]">Avg / cell</span>
+                <div className="flex gap-1">
+                  <select
+                    value={procParams.avgCount}
+                    disabled={procLocked}
+                    onChange={(e) => onProcParamsChange({ ...procParams, avgCount: Number(e.target.value) })}
+                    className={cn(
+                      'flex-1 min-w-0 px-2 py-1.5 rounded-lg text-[10px] bg-white/5 border border-white/10 outline-none',
+                      procLocked ? 'text-white/20 cursor-not-allowed' : 'text-white/70',
+                    )}
+                  >
+                    {[1, 2, 4, 8, 16, 32].map(v => (
+                      <option key={v} value={v}>{v === 1 ? 'Off' : `${v}×`}</option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={() => onProcParamsChange({
+                      ...procParams,
+                      avgMode: procParams.avgMode === 'coherent' ? 'incoherent' : 'coherent',
+                    })}
+                    disabled={procLocked || procParams.avgCount === 1}
+                    className={cn(
+                      'px-2 py-1.5 rounded-lg text-[9px] uppercase tracking-wider font-medium border transition-all',
+                      (procLocked || procParams.avgCount === 1)
+                        ? 'bg-white/5 border-white/10 text-white/20 cursor-not-allowed'
+                        : procParams.avgMode === 'coherent'
+                          ? 'bg-[#4ecdc4]/20 border-[#4ecdc4]/30 text-[#4ecdc4]'
+                          : 'bg-white/5 border-white/10 text-white/40',
+                    )}
+                  >
+                    {procParams.avgMode === 'coherent' ? 'Coh' : 'Inc'}
+                  </button>
+                </div>
+              </div>
             </div>
-            <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-              Set on the Live Sweep pane's controls bar, and locked while a session
-              runs. Window and coh/inc re-derive every stored cell immediately —
-              each cell keeps all its sweeps, so the averaging mode stays a live
-              choice. Avg only affects cells captured after it is changed.
-            </div>
+            {procParams.windowType === 'kaiser' && (
+              <SliderRow
+                label="Kaiser β"
+                value={procParams.kaiserBeta}
+                unit=""
+                min={2}
+                max={14}
+                step={0.5}
+                accent="cyan"
+                onChange={(v) => onProcParamsChange({ ...procParams, kaiserBeta: v })}
+              />
+            )}
           </>
         )}
       </Section>
@@ -1241,11 +1289,8 @@ export default function CscanPanel({
             >
               ● Close projector window
             </button>
-            <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-              Showing on <span className="text-white/70">{projector.target ? projector.target.label : 'a free window'}</span>.
-              Click inside that window for full screen. Scale and Left/Top above
-              drive it live — they are measured from ITS top-left corner, so tune
-              them here while watching the wall.
+            <div className="px-2 text-[9px] text-white/40">
+              Showing on <span className="text-white/70">{projector.target ? projector.target.label : 'a free window'}</span>
             </div>
           </>
         ) : displays ? (
@@ -1298,21 +1343,6 @@ export default function CscanPanel({
           </div>
         )}
 
-        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          To scale draws the plan view at exactly this many screen pixels per
-          centimetre and puts its top-left corner exactly there, so the image is
-          the swept rectangle times one constant at a fixed spot — trim both
-          against the projector's own zoom and aim until the grid lands on the
-          real wall, then leave them alone. Fitted scaling cannot be aligned: it
-          re-derives itself from the pane size, so opening a row's B-scan or
-          resizing the window silently moves everything. Left/Top are measured
-          from the viewport corner rather than from this pane, so the same pane
-          changes leave the projected grid where it is. The B-scan pane places
-          its columns from the same layout, so it stays registered under the
-          grid either way. A grid that falls outside the pane is CLIPPED, not
-          re-fitted — re-fitting would be exactly the silent re-scaling this
-          avoids, so move it back rather than expecting it to shrink.
-        </div>
       </Section>
 
       {/* Colour scaling — dynamic tracks the data, manual pins both ends live */}
@@ -1438,17 +1468,6 @@ export default function CscanPanel({
             />
           </div>
         )}
-        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          {!scaleRange.dynamic
-            ? 'Colour limits pinned — both the C-scan and B-scan panes update live.'
-            : unlinked
-              ? (scaleScope === 'row'
-                ? 'Each grid row is scaled to its own gated cell values, and the B-scan keeps the bin-domain scale. Contrast where you need it; no colour agrees with any other pane or row.'
-                : 'The grid is scaled to its own gated cell values, so it follows the Depth Slice gate. The B-scan keeps the bin-domain scale, so the two colour bars no longer agree.')
-              : scaleScope === 'row'
-                ? 'Each grid row gets its own limits, from every bin of that row (1st–99.9th percentile). Contrast within a row, but a colour no longer means the same dB in different rows — the colour bar shows the selected row and is marked PER ROW.'
-                : 'One scale for both panes, from every bin of every valid cell in the grid (1st–99.9th percentile, so a single interference null cannot flatten the image). A colour means the same dB in the plan view and in the B-scan.'}
-        </div>
         {gridGlobal && gridGlobal.degenerate && scaleRange.dynamic && (
           <div className="px-2 py-1.5 rounded-lg bg-[#f59e0b]/5 border border-[#f59e0b]/30 text-[9px] text-[#f59e0b] leading-relaxed">
             Every bin has the same value — there is nothing to scale. Expected right
@@ -1626,15 +1645,6 @@ export default function CscanPanel({
                     : liveDiag.source === 'model' ? 'model' : 'reference'}, ${liveDiag.mode}).`}
           </div>
         )}
-        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          {superFit
-            ? 'Super Fit: each cell is subtracted from the reference captured at that same cell. The Live Sweep trace uses the reference for the cell about to be captured.'
-            : bgModel
-              ? 'Model background, inferred per cell from that cell’s own lidar standoff.'
-              : bgRef
-                ? 'Reference sweep, subtracted exactly as captured. It only holds near the standoff and position it was taken at — recapture if either moves. On a grid whose standoff varies, use Super Fit instead.'
-                : 'Capture a reference sweep, load a model, or Super Fit a reference grid.'}
-        </div>
       </Section>
 
       {/* Super Fit — a whole reference GRID, matched cell for cell.
@@ -1660,11 +1670,6 @@ export default function CscanPanel({
             >
               Super Fit This Grid
             </button>
-            <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-              {gridFull
-                ? 'Stores every cell of the current grid as a per-cell background. Then clear the grid and rescan the same wall from the same origin — each new cell is subtracted from the reference at its own cell.'
-                : `Needs a full grid — ${captured} of ${stats.total} cells captured. Scan or import a complete sweep of the bare wall first.`}
-            </div>
           </>
         ) : (
           <>
