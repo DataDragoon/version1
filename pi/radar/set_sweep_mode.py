@@ -55,18 +55,37 @@ async def run(mode):
             print("could not read sweep_mode from the status reply")
             return 1
 
-        print("stopping sweep...")
-        await send({'cmd': 'sfcw_stop'})
-        await asyncio.sleep(1.0)
-
+        # SET THE MODE ONLY. This used to stop and restart the sweep too, but
+        # that fights whatever already drives it -- the GUI starts and stops
+        # sweeps on its own, and a stop/start from a second client that then
+        # disconnects can leave the engine stopped with nothing printed at all.
+        #
+        # The restart is still REQUIRED (the sample format is fixed when
+        # sync_config runs), it just has to come from the same place that
+        # normally starts sweeps.
         print("setting sweep_mode = {}".format(mode))
         await send({'cmd': 'sfcw_set_params', 'sweep_mode': mode})
         await asyncio.sleep(0.5)
 
-        print("starting sweep...")
-        await send({'cmd': 'sfcw_start'})
-        await asyncio.sleep(0.5)
-        print("done -- watch the server console for the result")
+        # Read it back so the change is confirmed rather than assumed.
+        await send({'cmd': 'sfcw_get_status'})
+        for _ in range(20):
+            try:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+            except asyncio.TimeoutError:
+                break
+            for blob in (msg, msg.get('data') or {}):
+                if isinstance(blob, dict) and 'sweep_mode' in blob:
+                    got = blob['sweep_mode']
+                    print("server now reports sweep_mode =", got)
+                    if got != mode:
+                        print("WARNING: not the mode requested")
+                        return 1
+                    print("\nNow STOP and START the sweep from the GUI for it "
+                          "to take effect.")
+                    return 0
+        print("mode was set, but the server did not report it back; "
+              "stop and start the sweep from the GUI anyway")
         return 0
 
 
