@@ -11,6 +11,68 @@ MGC = libbladeRF.BLADERF_GAIN_MGC
 TUNING_MODE_FPGA = libbladeRF.BLADERF_TUNING_MODE_FPGA
 
 
+# ---------------------------------------------------------------------------
+# bladerf_format values, resolved by NAME rather than through Format.<X>.
+#
+# The Python bindings installed on a Pi can be older than libbladeRF.so. The
+# one that matters here predates BLADERF_FORMAT_SC16_Q11_PACKED, and because
+# bladerf_format is a plain C enum, dropping a member shifts every later one
+# down by one:
+#
+#     canonical (.so)   SC16_Q11 0  PACKED 1  META 2  PACKET_META 3  SC8 4 ...
+#     stale binding     SC16_Q11 0            META 1  PACKET_META 2  SC8 3 ...
+#
+# sync_config passes fmt.value straight through, so Format.SC16_Q11_META sends
+# 1 and the library reads SC16_Q11_PACKED. The visible symptoms are a buffer
+# size computed at 3 bytes/sample ("4096 samples (12288 bytes)") and then
+# BLADERF_ERR_INVAL from perform_format_config, because the shifted RX and TX
+# formats disagree about timestamps.
+#
+# Detection rule: if the installed bindings expose SC16_Q11_PACKED they were
+# generated against a header that has it, so they agree with the library and
+# are used unchanged. If they do not, they are stale and the canonical values
+# are used instead.
+#
+# This is a shim, not a fix. The fix is to install the bindings from
+# bladerf-src/host/libraries/libbladeRF_bindings/python on the Pi, which also
+# brings dsp_path_enabled and unpack_dsp_results.
+# ---------------------------------------------------------------------------
+
+_CANONICAL_FORMAT = {
+    'SC16_Q11':        0,
+    'SC16_Q11_PACKED': 1,
+    'SC16_Q11_META':   2,
+    'PACKET_META':     3,
+    'SC8_Q7':          4,
+    'SC8_Q7_META':     5,
+}
+
+_BINDINGS_STALE = not hasattr(Format, 'SC16_Q11_PACKED')
+if _BINDINGS_STALE:
+    print("[bladerf] WARNING: installed Python bindings predate "
+          "SC16_Q11_PACKED; sample-format values are being corrected in "
+          "software. Install the bindings from bladerf-src to remove this.")
+
+
+class _Fmt:
+    """Duck-types Format for sync_config, which only ever reads .value."""
+    __slots__ = ('name', 'value')
+
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+
+    def __repr__(self):
+        return "<Format.{}: {}>".format(self.name, self.value)
+
+
+def fmt(name):
+    """Resolve a bladerf_format by name to the value libbladeRF.so expects."""
+    if not _BINDINGS_STALE:
+        return getattr(Format, name)
+    return _Fmt(name, _CANONICAL_FORMAT[name])
+
+
 # RX sync ring depth (buffers) for dual-channel streaming -- see start_rx_dual.
 RX_RING_DEPTH = 256
 
@@ -271,7 +333,7 @@ class BladeRFDriver:
         self.tx_running = True
         self.device.sync_config(
             layout=ChannelLayout.TX_X1,
-            fmt=Format.SC16_Q11,
+            fmt=fmt('SC16_Q11'),
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
@@ -312,7 +374,7 @@ class BladeRFDriver:
         self.rx_running = True
         self.device.sync_config(
             layout=ChannelLayout.RX_X1,
-            fmt=Format.SC16_Q11,
+            fmt=fmt('SC16_Q11'),
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
@@ -375,7 +437,7 @@ class BladeRFDriver:
         self._rebuild_tx_dual_buffer()
         self.device.sync_config(
             layout=ChannelLayout.TX_X2,
-            fmt=Format.SC16_Q11_META if timestamped else Format.SC16_Q11,
+            fmt=fmt('SC16_Q11_META') if timestamped else fmt('SC16_Q11'),
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
@@ -436,7 +498,7 @@ class BladeRFDriver:
         self._dual_channel = True
         self.device.sync_config(
             layout=ChannelLayout.RX_X2,
-            fmt=Format.SC16_Q11,
+            fmt=fmt('SC16_Q11'),
             # 256, not 16 (changed 2026-09-07): the ring is the only thing
             # between an RX-thread stall and DROPPED samples, and stalls up to
             # 50.9 ms have been measured under full-stack load. 16 buffers is
@@ -550,6 +612,41 @@ class BladeRFDriver:
     # Send as soon as there is room; the timestamp field is then ignored.
     _META_FLAG_TX_NOW = 1 << 2
 
+    def _gpio_read(self):
+        """config_gpio, whatever the installed bindings call it.
+
+        Current bindings expose get_config_gpio/set_config_gpio; some older
+        ones only have the config_gpio property, and the version this file
+        originally called (config_gpio_read/write) exists in neither. Try in
+        order rather than assume, so a stale binding fails with a clear message
+        instead of AttributeError from inside the sweep thread.
+        """
+        dev = self.device
+        for name in ('get_config_gpio', 'config_gpio_read'):
+            f = getattr(dev, name, None)
+            if callable(f):
+                return int(f())
+        if hasattr(dev, 'config_gpio'):
+            return int(dev.config_gpio)
+        raise RuntimeError(
+            "installed bladerf bindings expose no config_gpio accessor; "
+            "install the bindings from bladerf-src")
+
+    def _gpio_write(self, val):
+        dev = self.device
+        val = int(val) & 0xFFFFFFFF
+        for name in ('set_config_gpio', 'config_gpio_write'):
+            f = getattr(dev, name, None)
+            if callable(f):
+                f(val)
+                return
+        if hasattr(type(dev), 'config_gpio'):
+            dev.config_gpio = val
+            return
+        raise RuntimeError(
+            "installed bladerf bindings expose no config_gpio accessor; "
+            "install the bindings from bladerf-src")
+
     def dsp_path_enable(self, on=True):
         """Route the sample FIFO ports to the DSP result FIFO, or back.
 
@@ -561,12 +658,12 @@ class BladeRFDriver:
         packet/8-bit mode, the LEDs and the clock selects, so a bare mask would
         clear all of them.
         """
-        val = self.device.get_config_gpio()
+        val = self._gpio_read()
         if on:
             val |= (1 << self.DSP_PATH_BIT)
         else:
             val &= ~(1 << self.DSP_PATH_BIT)
-        self.device.set_config_gpio(val & 0xFFFFFFFF)
+        self._gpio_write(val)
 
     def start_rx_dsp(self):
         """Configure RX to receive DSP results instead of raw samples.
@@ -584,7 +681,7 @@ class BladeRFDriver:
             raise RuntimeError("stop RX before switching to the DSP path")
         self.device.sync_config(
             layout=ChannelLayout.RX_X2,
-            fmt=Format.PACKET_META,
+            fmt=fmt('PACKET_META'),
             num_buffers=RX_RING_DEPTH,
             buffer_size=4096,
             num_transfers=8,
@@ -606,7 +703,7 @@ class BladeRFDriver:
         # sweep needs the SC16_Q11 callback stream, which this mode does not
         # start, so a per-sweep fallback cannot rescue it either. Better to
         # fail at stream start with a message naming the cause.
-        gpio = self.device.get_config_gpio()
+        gpio = self._gpio_read()
         if not (gpio & (1 << self.DSP_PATH_BIT)):
             raise RuntimeError(
                 "DSP path bit {} did not stick (config_gpio=0x{:08x}). This "
