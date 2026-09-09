@@ -400,13 +400,30 @@ class SFCWEngine:
         # 'nios' hands the whole sweep to the FPGA firmware and slices one
         # continuous capture at the step boundaries; every failure path in
         # _sweep_core_nios falls back to 'standard' and says why.
-        # 'nios' by default as of 2026-09-07: bracketed 2x1200-sweep blocks
+        # 'nios' was the default from 2026-09-07: bracketed 2x1200-sweep blocks
         # through the full stack measured 28.6/28.8 ms (34.8 Hz) at S_repeat
         # 35.2/34.9 dB against the standard sweep's 55.4/55.2 ms -- a 1.93x
         # win at equal-or-better quality, with every failure falling back to
         # one standard sweep. 'standard' remains the fully-validated
-        # host-driven core; one sfcw_set_params reverts.
-        self.sweep_mode = 'nios'
+        # host-driven core; one sfcw_set_params reverts to either.
+        #
+        # 'dsp' by default as of 2026-09-09, with FPGA image v7 or later. It
+        # keeps the NIOS stepping the synthesizers and additionally takes the
+        # RESULT from the FPGA: rx.vhd mixes, accumulates and divides on chip
+        # and hands back one 64-bit ratio per step, so a sweep is 408 bytes
+        # instead of 835 KB and the Pi computes no demodulation and no
+        # division. It also removes the ring-overflow fallback by
+        # construction -- there is no continuous capture to overflow.
+        #
+        # Defaulting rather than leaving it opt-in because there was no way to
+        # select it except a WebSocket sweep_mode command, so an image built
+        # for it would silently keep running the raw path. Every failure inside
+        # _sweep_core_dsp still falls back to one standard sweep.
+        #
+        # REQUIRES an image whose Nios toggles RFFE GPO bit 24 on every retune
+        # (v7+). On v5/v6 the accumulators never restart, the DSP FIFO never
+        # fills, and every sweep falls back -- correct data, no speed gain.
+        self.sweep_mode = 'dsp'
         self.nios_dwell = 4096        # samples per step, rounded to 64 -- see NIOS_MIN_DWELL
         self.nios_settle = 1024       # samples dropped at the start of a step
         # Overlap the next sweep's EXEC+capture with this sweep's processing.

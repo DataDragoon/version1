@@ -564,6 +564,29 @@ class BladeRFDriver:
         self.device.enable_module(bladerf.CHANNEL_RX(0), True)
         self.device.enable_module(bladerf.CHANNEL_RX(1), True)
         self.dsp_path_enable(True)
+
+        # Read the bit back rather than trust the write.
+        #
+        # rx.vhd gates the FIFO mux on ENABLE_DSP_AVERAGE *and* dsp_path_en, so
+        # on an image built without the DSP chain the mux stays on the raw
+        # sample FIFO and the only symptom is a stream that quietly delivers
+        # raw samples through a PACKET_META reader -- garbage results, or a
+        # sweep rate that simply never improves. Neither announces itself.
+        #
+        # Raising here is deliberate. There is no clean degrade: the standard
+        # sweep needs the SC16_Q11 callback stream, which this mode does not
+        # start, so a per-sweep fallback cannot rescue it either. Better to
+        # fail at stream start with a message naming the cause.
+        gpio = self.device.get_config_gpio()
+        if not (gpio & (1 << self.DSP_PATH_BIT)):
+            raise RuntimeError(
+                "DSP path bit {} did not stick (config_gpio=0x{:08x}). This "
+                "FPGA image does not support the DSP result path -- flash v7 "
+                "or later, or set sweep_mode='nios'.".format(
+                    self.DSP_PATH_BIT, gpio))
+        print("[bladerf] DSP result path enabled "
+              "(config_gpio=0x{:08x})".format(gpio))
+
         self.rx_running = True
         self._dual_channel = True
 
