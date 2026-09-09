@@ -827,7 +827,15 @@ class SFCWEngine:
             self._start_tx_rx()
 
             while not self._stop_event.is_set():
-                if not self.driver.tx_running or not self.driver.rx_running:
+                # In 'dsp' the RX stream is opened per sweep, immediately
+                # before EXEC, and torn down again if a read fails -- see the
+                # note in _start_tx_rx. rx_running is therefore legitimately
+                # False here on the first pass and between sweeps, so requiring
+                # it would abort the loop before a single sweep had run. TX is
+                # continuous in every mode and is still checked.
+                rx_required = (self.sweep_mode != 'dsp')
+                if not self.driver.tx_running or (
+                        rx_required and not self.driver.rx_running):
                     print("[sfcw] ERROR: TX/RX stream died unexpectedly")
                     if self._callback:
                         self._callback({'error': 'USB stream died — restart sweep'})
