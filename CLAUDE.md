@@ -532,13 +532,173 @@ Setting the timeout back to 0 re-energises immediately rather than at the next m
   `linkReady()` (associated **and** holding an address) that all the retry logic tests,
   and a failed DHCP attempt explicitly disconnects so the next one starts clean.
   `USE_STATIC_IP` in `config.h` sidesteps DHCP altogether if it ever recurs.
+  **PARTLY SUPERSEDED 2026-09-09: this was the address-less variant, and the fix
+  for it was right. There is a second variant it cannot see, where BOTH halves of
+  `linkReady()` lie -- see "The board could never rejoin the network" below.**
 - **The board does not always reconnect by itself.** Restarting `rover_server.py` left it
   with healthy WiFi (still pingable, still associated) and a socket that never came back,
   needing a power cycle. `ensureSocket()` now tears down and restarts the client after
   `WS_RECONNECT_FORCE_MS` (10 s) of downtime while WiFi is up.
+  **SUPERSEDED 2026-09-09: `ensureSocket()` is gone. Restarting the client for ever
+  while the radio is wedged is exactly the deadlock described below; the 10 s
+  interval survives as the ladder's first rung.**
 - **Status arrives at ~11 Hz, not the 20 Hz the firmware aims for.** Harmless -- it is
   display smoothness, not control -- but unexplained. Suspect WiFi latency in the R4's
   socket stack rather than the loop, since the loop does almost nothing.
+
+### The board could never rejoin the network: fixed 2026-09-09
+
+Reported symptom, and it had survived two previous rounds of fixes (both recorded
+above and both correct as far as they went): the Arduino drops off the WiFi, is
+powered off, is powered back on -- and **never tries to reconnect**. Sometimes the
+same happens after the *Pi* is power-cycled. The only reliable cure was restarting
+the ROUTER, which is why it kept being read as an AP problem.
+
+**It was not an AP problem. `ensureNetwork()` was never called again, ever.**
+Reproduced against the pre-fix firmware (`git show HEAD:rover/rover.ino`) driven by
+the new harness: after the AP goes away while the modem stays latched at
+`WL_CONNECTED`, the board calls `WiFi.begin()` **once, at boot, and not once more in
+15 minutes** -- while calling `webSocket.begin()` 100 times against a dead stack --
+and it does **not** recover even after the AP comes back.
+
+**Root cause: the two link layers had a strictly one-way trust relationship.**
+`linkReady()` (`WiFi.status() == WL_CONNECTED && localIP() != 0.0.0.0`) was the sole
+authority on the WiFi layer, and the socket layer deferred to it unconditionally
+(`if (!linkReady()) return;  // ensureNetwork owns that case`). But
+**`WiFi.status()` and `WiFi.localIP()` are the modem's opinion of itself, not a
+measurement of a working network, and the modem latches**: after an AP disappears
+without a clean deauth -- exactly what a power cut at either end leaves behind, and
+what an AP holding a stale station entry for this MAC produces -- `status()` can sit
+at `WL_CONNECTED` with the last-known address in `localIP()` indefinitely. When it
+did, `ensureNetwork()` returned at its first line every single iteration and never
+re-associated, while `ensureSocket()` churned `disconnect()`/`begin()` forever.
+
+The deadlock was structural, so no amount of tuning either layer could break it: the
+one piece of hard evidence available -- **a socket that will not come back** -- was
+never allowed to act on the layer below it. The 2026-08-29 fix addressed the
+*address-less* variant of this (`localIP() == 0.0.0.0`) and was right about that one;
+it could not see the latched variant, where both halves of `linkReady()` lie.
+
+Note the deadlock also explains the second half of the report. Restarting the router
+is not a fix for a stale lease here -- it is simply the only event that changes
+enough state at once, and it *sometimes* worked because it is roughly a coin toss
+whether the modem notices.
+
+**There was also no recovery of last resort.** Nothing in the firmware could
+reinitialise the radio (`WiFi.end()` was never called) or reset the board, so *any*
+wedge -- latched status, a modem holding sockets from hundreds of failed reconnects,
+an AP refusing this MAC -- was permanent until a human power-cycled something.
+
+**Fix: one escalation ladder (`serviceNetwork()`), and the socket layer is now
+allowed to act on the radio.** `ensureNetwork()` and `ensureSocket()` are gone.
+
+|  down for | action |
+|---|---|
+| 0-10 s | nothing; the library's own reconnect gets its chance |
+| 10 s | restart the websocket client |
+| ~30 s | **ask the gateway**, not the status register (see below) |
+| 5 min | `NVIC_SystemReset()` -- refused unless the rig is parked |
+
+**The gateway ping is the load-bearing idea.** `networkResponds()` pings
+`WiFi.gatewayIP()`, and it is the only question in that file whose answer does not
+come from the modem's opinion of itself. It separates the two cases the old firmware
+could not tell apart, and getting that separation is what makes the ladder safe to
+have at all:
+
+- **gateway answers** -> radio and LAN are fine, the Pi is simply not running. Keep
+  retrying the socket; **never** recycle, **never** reset. A Pi that is off is an
+  everyday state (every `rover_server.py` restart), and escalating on it would reboot
+  the board every 5 minutes during ordinary development.
+- **gateway silent while `status()` claims connected** -> the radio is lying. Tear it
+  all the way down and start over.
+
+Deliberately not a ping of the *Pi*, for the same reason. `NET_USE_PING 0` compiles it
+out if `WiFi.ping()` is ever unavailable; that fallback returns **false**, not
+`linkReady()` -- answering "should I believe the modem?" with the modem's own opinion
+would reinstate the exact deadlock. It then cannot tell the two cases apart and
+recycles in both, which is wasteful and the right way round.
+
+Other things that changed with it, each a hole in the old version:
+
+- **`WiFi.end()`, not just `disconnect()`.** `disconnect()` drops the association;
+  `end()` stops the WiFi stack in the modem, which is what releases the sockets it is
+  holding and re-arms its connection state machine. The first re-association attempt
+  is still a plain re-associate (most dropouts are a one-second AP hiccup); every
+  attempt after it is a full teardown.
+- **`send()` uses `sendTXT()`'s return value**, which it used to discard. A half-open
+  TCP connection -- no FIN, no RST, which is what a Pi losing power leaves behind --
+  keeps the library reporting the client connected until its own heartbeat gives up
+  ~36 s later. A failed write is the earliest unambiguous evidence there is and the
+  board is already sending 20 status frames a second. `NET_TX_FAIL_LIMIT = 40` (2 s).
+- **The reset check sits BEFORE the escalation branches, not after.** Each branch
+  either returns on success or reschedules, so a modem that kept associating happily
+  onto a dead network would have escalated for ever and never reached a check placed
+  at the end. Caught by the harness, not by reading.
+- **The reset is refused unless the rig is parked** (`boardParked()`: not moving,
+  nothing queued, no latched E-stop) and `persistBeforeReset()` runs first. That
+  helper also **clears the EEPROM magic when `positionValid` is false**, because
+  `loadPosition()` marks the position valid whenever it finds a well-formed blob --
+  coming back from a reset would otherwise silently re-declare a position an E-stop
+  had invalidated. Both its branches skip the write when the bytes are already
+  correct, or a board that can never reach the network would erase flash every five
+  minutes for as long as the fault lasted.
+- **`printMacAddress()` on failure too.** The MAC is what a DHCP reservation is keyed
+  on, so it is wanted exactly when the board is *not* getting on the network; the old
+  code printed it only after a successful connect, i.e. never when it mattered.
+- **`reportScan()` every 4th failed association**, which is the measurement that
+  separates "the AP is refusing this board" from "the AP is not there at all". Without
+  it both looked identical in the log, which is how this ended up diagnosed as
+  "restart the router" rather than as anything specific. A scan takes seconds and
+  disturbs an attempt, hence not every time.
+- **Association timeout bounded to 10 s** (`NET_ASSOC_TIMEOUT_MS`, was 15-20). The
+  retry blocks in `delay()`, so motion is unaffected (it is generated in the ISR) but
+  the board is deaf to the groundstation for the duration.
+- `onEvent()` now precedes `begin()` in `setup()`, the socket-restart clock no longer
+  starts stale, and the retry gate is wrap-safe past 49.7 days.
+
+### `rover/test/test_net.cpp` -- the harness, and why it exists
+
+125-check `test_core.cpp` could never have caught this: the fault is a **liveness**
+property ("from every bad state, some action eventually restores the link"), and the
+only way to check one is to put the machine in each bad state and run it. Both the
+old code and the new one read perfectly reasonably; only the arrangement differed.
+
+`test_net.cpp` **`#include`s `rover.ino`** so it drives the shipped `serviceNetwork()`
+and its shipped statics -- a retyped copy would have been free to drift, which for
+this file is the whole ballgame. `test/netstubs/` holds scriptable replacements for
+`Arduino.h` / `WiFiS3.h` / `WebSocketsClient.h` (fake clock that `delay()` advances,
+captured serial log, `NVIC_SystemReset()` that throws); `test/stubs/` still supplies
+EEPROM and FspTimer, which is why **netstubs must come FIRST on the include path**
+and why the two `Arduino.h` files share the `ROVER_ARDUINO_STUB_H` guard.
+
+Two details in the model are load-bearing and must not be "simplified":
+
+- **The WiFi model's `latched` flag survives `disconnect()` and is cleared only by
+  `end()`.** That single behaviour is the whole bug; a model without it passes the old
+  firmware.
+- **The websocket model connects from `loop()`, not from `begin()`**, matching the
+  real client. An earlier version connected inside `begin()`, which made the *old*
+  firmware unable to connect at all (it registered `onEvent` after `begin`) and would
+  have made any before/after comparison meaningless.
+
+41 checks: a healthy link left alone for 15 minutes; the Pi off for 20 minutes with
+no recycle and no reset, recovering the moment it returns; the latched-modem fault
+recovering unaided; a permanently wedged modem reaching the reset; the reset refused
+while E-stopped and while work is queued; a half-open socket detected from failed
+writes; an honest disconnect escalating from plain retry to teardown; and a
+never-answering DHCP server retried rather than accepted. `build_check.sh` runs it,
+and also now stands in `secrets.example.h` when `rover/secrets.h` is absent (the type
+check could not run on a fresh checkout before) and type-checks `rover.ino` both with
+and without `NET_USE_PING`.
+
+**Not yet run on the rig.** The model is a model: it has no RF, no real modem
+firmware, and `WiFi.ping()` / `WiFi.end()` are assumed to behave as WiFiS3 documents
+them. What to check on the bench, in order: (1) that `WiFi.ping()` compiles and
+returns sanely on the installed core -- if not, set `NET_USE_PING 0` and accept the
+recycles; (2) pull the AP's power with the board running and confirm the log shows
+`not to be trusted` and then a successful re-associate; (3) confirm a
+`rover_server.py` restart still reconnects in ~10 s and prints `gateway answers`
+rather than recycling anything.
 
 ### Calibration
 
