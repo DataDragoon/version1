@@ -741,6 +741,11 @@ class BladeRFDriver:
               "bit {} is write-only and always reads 0)".format(
                   gpio, self.DSP_PATH_BIT))
 
+        # Let the sync worker leave SYNC_WORKER_STATE_STARTUP before anyone
+        # reads. dsp_read_sweep retries anyway, but losing that race on every
+        # single sweep would burn a retry each time. See the note there.
+        time.sleep(0.15)
+
         self.rx_running = True
         self._dual_channel = True
 
@@ -779,23 +784,43 @@ class BladeRFDriver:
         buf = bytearray(want_bytes)
         meta = ffi.new("struct bladerf_metadata *")
         meta.flags = self._META_FLAG_RX_NOW
-        try:
-            # sync_rx raises on error and returns None -- the count comes back
-            # in meta.actual_count, NOT as a return value. Treating the return
-            # as a count is what made the previous version of this function
-            # loop until its deadline and always return None.
-            self.device.sync_rx(buf, want_dwords,
-                                timeout_ms=int(timeout_s * 1000), meta=meta)
-        except Exception as e:
+
+        # RETRY IS NOT OPTIONAL HERE.
+        #
+        # sync_worker_init leaves the worker in SYNC_WORKER_STATE_STARTUP, and
+        # it only reaches IDLE once its thread is first scheduled.
+        # SYNC_STATE_CHECK_WORKER (sync.c:550) accepts IDLE and RUNNING and
+        # returns BLADERF_ERR_UNEXPECTED (-1) for anything else -- so a read
+        # issued straight after sync_config loses a race with the worker
+        # thread and fails, which is what "An unexpected error occurred (code
+        # -1)" was. libbladeRF's own comment on that branch says the caller
+        # "can call this function again to restart the stream and try again".
+        last = None
+        for attempt in range(3):
+            try:
+                # sync_rx raises on error and returns None -- the count comes
+                # back in meta.actual_count, NOT as a return value. Treating
+                # the return as a count is what made an earlier version of
+                # this function loop until its deadline and always return None.
+                self.device.sync_rx(buf, want_dwords,
+                                    timeout_ms=int(timeout_s * 1000),
+                                    meta=meta)
+                last = None
+                break
+            except Exception as exc:
+                last = exc
+                time.sleep(0.05)
+
+        if last is not None:
             # The bindings raise a class named after the libbladeRF return
             # code and pass the code as arg 0, so report both -- "An
-            # unexpected error occurred" alone does not distinguish a stalled
-            # RX worker (ERR_UNEXPECTED, -13) from an empty FIFO
-            # (ERR_TIMEOUT, -6), and those need opposite responses.
-            code = e.args[0] if getattr(e, 'args', None) else '?'
-            print("[bladerf] DSP sweep read failed: {} ({}, code {}) "
-                  "after requesting {} DWORDs".format(
-                      e, type(e).__name__, code, want_dwords))
+            # unexpected error occurred" alone does not distinguish a worker
+            # that has not left STARTUP (ERR_UNEXPECTED, -1) from an empty
+            # FIFO (ERR_TIMEOUT, -6), and those need opposite responses.
+            code = last.args[0] if getattr(last, 'args', None) else '?'
+            print("[bladerf] DSP sweep read failed after 3 attempts: {} "
+                  "({}, code {}) requesting {} DWORDs".format(
+                      last, type(last).__name__, code, want_dwords))
             return None
 
         got = int(meta.actual_count)
