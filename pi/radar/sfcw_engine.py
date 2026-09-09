@@ -415,15 +415,23 @@ class SFCWEngine:
         # division. It also removes the ring-overflow fallback by
         # construction -- there is no continuous capture to overflow.
         #
-        # Defaulting rather than leaving it opt-in because there was no way to
-        # select it except a WebSocket sweep_mode command, so an image built
-        # for it would silently keep running the raw path. Every failure inside
-        # _sweep_core_dsp still falls back to one standard sweep.
+        # NOT the default. 'dsp' has never completed a sweep on hardware, and
+        # defaulting to it made every startup depend on it -- the raw path is
+        # the one that is known to work and it stays in charge until 'dsp' has
+        # proven itself.
         #
-        # REQUIRES an image whose Nios toggles RFFE GPO bit 24 on every retune
-        # (v7+). On v5/v6 the accumulators never restart, the DSP FIFO never
-        # fills, and every sweep falls back -- correct data, no speed gain.
-        self.sweep_mode = 'dsp'
+        # Select it explicitly, and only when FPGA v7+ is flashed:
+        #
+        #     {"sweep_mode": "dsp"}      over the sdr_server WebSocket
+        #
+        # then stop and restart the sweep -- the sample format is fixed when
+        # the stream is configured, so the mode cannot cross on a live stream.
+        # Switch back with {"sweep_mode": "nios"}.
+        #
+        # v5/v6 cannot run it at all: without the Nios toggling RFFE GPO bit 24
+        # on every retune the accumulators never restart and the DSP FIFO never
+        # fills.
+        self.sweep_mode = 'nios'
         self.nios_dwell = 4096        # samples per step, rounded to 64 -- see NIOS_MIN_DWELL
         self.nios_settle = 1024       # samples dropped at the start of a step
         # Overlap the next sweep's EXEC+capture with this sweep's processing.
