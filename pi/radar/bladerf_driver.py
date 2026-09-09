@@ -47,11 +47,35 @@ _CANONICAL_FORMAT = {
     'SC8_Q7_META':     5,
 }
 
-_BINDINGS_STALE = not hasattr(Format, 'SC16_Q11_PACKED')
+def _detect_stale_bindings():
+    """True when the binding's Format enum disagrees with libbladeRF.h.
+
+    Checks EVERY member, not one of them. An earlier version tested only for
+    SC16_Q11_PACKED and concluded the bindings were fine -- but the binding
+    actually shipping on the Pi is missing SC16_Q11_META instead:
+
+        installed   SC16_Q11 0  PACKED 1  PACKET_META 2  SC8_Q7 3  SC8_Q7_META 4
+        canonical   SC16_Q11 0  PACKED 1  META 2  PACKET_META 3  SC8_Q7 4  ...
+
+    so PACKET_META asks for 2 and the library delivers SC16_Q11_META, and
+    SC16_Q11_META cannot be named at all. Any missing or shifted member means
+    the whole enum is untrustworthy.
+    """
+    for name, want in _CANONICAL_FORMAT.items():
+        member = getattr(Format, name, None)
+        if member is None or member.value != want:
+            return True
+    return False
+
+
+_BINDINGS_STALE = _detect_stale_bindings()
 if _BINDINGS_STALE:
-    print("[bladerf] WARNING: installed Python bindings predate "
-          "SC16_Q11_PACKED; sample-format values are being corrected in "
-          "software. Install the bindings from bladerf-src to remove this.")
+    _present = {m.name: m.value for m in Format}
+    print("[bladerf] WARNING: installed Python bindings disagree with "
+          "libbladeRF's sample-format enum; correcting in software.")
+    print("[bladerf]   binding:   {}".format(_present))
+    print("[bladerf]   canonical: {}".format(_CANONICAL_FORMAT))
+    print("[bladerf]   install the bindings from bladerf-src to remove this.")
 
 
 class _Fmt:
@@ -613,39 +637,28 @@ class BladeRFDriver:
     _META_FLAG_TX_NOW = 1 << 2
 
     def _gpio_read(self):
-        """config_gpio, whatever the installed bindings call it.
+        """Read config_gpio through libbladeRF directly.
 
-        Current bindings expose get_config_gpio/set_config_gpio; some older
-        ones only have the config_gpio property, and the version this file
-        originally called (config_gpio_read/write) exists in neither. Try in
-        order rather than assume, so a stale binding fails with a clear message
-        instead of AttributeError from inside the sweep thread.
+        The binding installed on the Pi has NO config_gpio accessor at all --
+        not get_config_gpio, not config_gpio_read, not the property. Only the
+        newer bindings in bladerf-src do. But bladerf_config_gpio_read/write
+        are plain exported C functions declared in the cdef, so calling them
+        through cffi works on every binding version, and is how the rest of
+        this file already reaches libbladeRF (see _configure_channels_dual).
         """
-        dev = self.device
-        for name in ('get_config_gpio', 'config_gpio_read'):
-            f = getattr(dev, name, None)
-            if callable(f):
-                return int(f())
-        if hasattr(dev, 'config_gpio'):
-            return int(dev.config_gpio)
-        raise RuntimeError(
-            "installed bladerf bindings expose no config_gpio accessor; "
-            "install the bindings from bladerf-src")
+        val = ffi.new('uint32_t *')
+        ret = libbladeRF.bladerf_config_gpio_read(self.device.dev[0], val)
+        if ret != 0:
+            raise RuntimeError(
+                "bladerf_config_gpio_read failed: {}".format(ret))
+        return int(val[0])
 
     def _gpio_write(self, val):
-        dev = self.device
-        val = int(val) & 0xFFFFFFFF
-        for name in ('set_config_gpio', 'config_gpio_write'):
-            f = getattr(dev, name, None)
-            if callable(f):
-                f(val)
-                return
-        if hasattr(type(dev), 'config_gpio'):
-            dev.config_gpio = val
-            return
-        raise RuntimeError(
-            "installed bladerf bindings expose no config_gpio accessor; "
-            "install the bindings from bladerf-src")
+        ret = libbladeRF.bladerf_config_gpio_write(self.device.dev[0],
+                                                   int(val) & 0xFFFFFFFF)
+        if ret != 0:
+            raise RuntimeError(
+                "bladerf_config_gpio_write failed: {}".format(ret))
 
     def dsp_path_enable(self, on=True):
         """Route the sample FIFO ports to the DSP result FIFO, or back.
