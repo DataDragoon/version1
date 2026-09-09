@@ -476,14 +476,21 @@ class BladeRFDriver:
         """TX loop for dual channel — replays the interleaved buffer, re-read each
         iteration (like _tx_loop) so live waveform/rate changes take effect."""
         meta = None
-        if getattr(self, '_tx_timestamped', False):
-            # SC16_Q11_META demands metadata on every sync_tx. This is a
-            # free-running CW carrier, not a scheduled burst, so TX_NOW says
-            # "send as soon as there is room" and the timestamp is ignored.
-            # Without TX_NOW libbladeRF waits for a timestamp that never comes
-            # and the carrier never goes out.
+        timestamped = getattr(self, '_tx_timestamped', False)
+        if timestamped:
+            # SC16_Q11_META demands metadata on every sync_tx, and TX_NOW is
+            # only legal ALONGSIDE BURST_START -- handle_tx_parameters() in
+            # sync.c returns BLADERF_ERR_INVAL for "TX_NOW was specified
+            # without BURST_START". Equally, BURST_START a second time while
+            # already in a burst is also ERR_INVAL.
+            #
+            # So: open the burst once with BURST_START|TX_NOW, then keep
+            # feeding it with no flags at all. BURST_END is never sent -- this
+            # is a continuous carrier, and ending the burst would gate the
+            # transmitter off between buffers.
             meta = ffi.new("struct bladerf_metadata *")
-            meta.flags = self._META_FLAG_TX_NOW
+            meta.flags = (self._META_FLAG_TX_BURST_START
+                          | self._META_FLAG_TX_NOW)
         try:
             while not self._tx_stop.is_set():
                 with self._lock:
@@ -491,6 +498,9 @@ class BladeRFDriver:
                     n_samples = self._tx_dual_n_samples
                 if meta is not None:
                     self.device.sync_tx(tx_bytes, n_samples, meta=meta)
+                    # Burst is open from here on; further BURST_START would be
+                    # rejected.
+                    meta.flags = 0
                 else:
                     self.device.sync_tx(tx_bytes, n_samples)
         except Exception as e:
@@ -634,7 +644,10 @@ class BladeRFDriver:
     # bladerf_metadata.flags: take whatever the FIFO has, do not schedule.
     _META_FLAG_RX_NOW = 1 << 31
     # Send as soon as there is room; the timestamp field is then ignored.
+    # Only legal together with BURST_START -- see _tx_loop_dual.
     _META_FLAG_TX_NOW = 1 << 2
+    _META_FLAG_TX_BURST_START = 1 << 0
+    _META_FLAG_TX_BURST_END = 1 << 1
 
     def _gpio_read(self):
         """Read config_gpio through libbladeRF directly.
@@ -704,27 +717,29 @@ class BladeRFDriver:
         self.device.enable_module(bladerf.CHANNEL_RX(1), True)
         self.dsp_path_enable(True)
 
-        # Read the bit back rather than trust the write.
+        # BIT 6 IS WRITE-ONLY. Do not try to read it back to confirm.
         #
-        # rx.vhd gates the FIFO mux on ENABLE_DSP_AVERAGE *and* dsp_path_en, so
-        # on an image built without the DSP chain the mux stays on the raw
-        # sample FIFO and the only symptom is a stream that quietly delivers
-        # raw samples through a PACKET_META reader -- garbage results, or a
-        # sweep rate that simply never improves. Neither announces itself.
+        # bladerf-hosted.vhd drives dsp_path_en from the RAW nios_gpo_slv(6),
+        # so the write does reach the FIFO mux. But the readback path is
         #
-        # Raising here is deliberate. There is no clean degrade: the standard
-        # sweep needs the SC16_Q11 callback stream, which this mode does not
-        # start, so a per-sweep fallback cannot rescue it either. Better to
-        # fail at stream start with a message naming the cause.
+        #     nios_gpio.o          <= unpack(nios_gpo_slv)
+        #     nios_gpio.i.gpo_readback <= nios_gpio.o
+        #     gpio_in_port         <= pack(nios_gpio.i, '0')
+        #
+        # and bladerf_p.vhd's unpack() decodes only bits 31:30 and 21:7 -- bit
+        # 6 has no field in nios_gpo_t, so it is dropped in the round trip and
+        # always reads back 0. That undecodedness is exactly why bit 6 was
+        # available to use, the same reason bit 24 was free for dsp_restart.
+        #
+        # An earlier version raised on the readback and so refused every
+        # correctly-configured stream. Whether the DSP path is really live can
+        # only be established functionally -- if the image lacks the DSP chain
+        # the FIFO stays empty and _sweep_core_dsp falls back, naming the
+        # reason.
         gpio = self._gpio_read()
-        if not (gpio & (1 << self.DSP_PATH_BIT)):
-            raise RuntimeError(
-                "DSP path bit {} did not stick (config_gpio=0x{:08x}). This "
-                "FPGA image does not support the DSP result path -- flash v7 "
-                "or later, or set sweep_mode='nios'.".format(
-                    self.DSP_PATH_BIT, gpio))
-        print("[bladerf] DSP result path enabled "
-              "(config_gpio=0x{:08x})".format(gpio))
+        print("[bladerf] DSP result path selected (config_gpio=0x{:08x}; "
+              "bit {} is write-only and always reads 0)".format(
+                  gpio, self.DSP_PATH_BIT))
 
         self.rx_running = True
         self._dual_channel = True
