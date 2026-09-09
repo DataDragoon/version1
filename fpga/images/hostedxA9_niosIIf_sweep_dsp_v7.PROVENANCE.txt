@@ -1,0 +1,176 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v7.rbf
+==================================================
+
+Status:  TIMING CLEAN -- zero negative slack at every corner -- and the first
+         image on which the DSP path can actually produce results. v5 and v6
+         could not: nothing drove dsp_restart, so every accumulator emitted
+         one result and then waited forever.
+
+         Reproducible: bladerf-src @ c6acd064, clean tree. (v5 and v6 were
+         built dirty and cannot be regenerated from a hash.)
+
+Build date:        2026-09-08 23:28 IST
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-08_23.28.22
+md5    (.rbf):     961f3141f5c2524b3570af7dd65c86fc (see .rbf.md5)
+Source tree:       bladerf-src @ c6acd064, branch sfcw-fpga-dsp, clean.
+Quartus:           18.1.0.625 Standard, device 5CEBA9F23C8, fitter seed 1.
+
+THE CHANGE THAT MAKES THE DSP PATH WORK AT ALL
+----------------------------------------------
+rx.vhd has said this since the chain was written:
+
+    RESTART IS MANDATORY. Each accumulator emits one result per restart
+    pulse and then waits. dsp_restart must pulse on every retune; without
+    it the block produces nothing at all.
+
+dsp_restart comes from RFFE GPO bit 24 (bladerf-hosted.vhd:657). Nothing drove
+it -- not pkt_retune2.c, not fpga_common, not the host. So on v5 and v6 the DSP
+FIFO never reached 51 words, its gate never opened, and the host saw an empty
+stream and fell back to a standard sweep every time. The measured 37 Hz on v5
+was the ordinary raw-capture path; the DSP chain had never run on hardware.
+
+This was invisible in simulation because fx3_gpif_dsp_tb DRIVES dsp_restart
+itself. The testbench supplied what the hardware had no source for, which is
+exactly why it reported a clean 102 reads on an image that could not work.
+
+v7 toggles bit 24 on both retune paths:
+
+  - profile_activate()  -- host-driven retunes (ported from the bladeRF tree)
+  - sweep_activate()    -- the autonomous sweep
+
+The second is the one that matters, and it must be in sweep_activate() rather
+than sweep_profile_activate(): the sweep calls sweep_profile_activate() ONCE
+PER MODULE, so toggling there gives two edges per step. The second edge would
+restart the accumulator mid-flush and that step would emit nothing. One toggle
+per STEP, after both synthesizers are on the new frequency.
+
+Bit 24 is safe to toggle: RFFE_CONTROL_CTRL_OUT is bits 31..24 INPUT-only, so
+the output register there is undecoded by the fabric.
+
+TIMING -- CLEAN
+---------------
+                                        v5       v6       v7
+    Slow 1100mV 85C setup, pll_sclk   +0.284   -0.086   +0.409
+    Slow 1100mV  0C setup, pll_sclk   -0.084   +0.082   +0.203
+    Negative-slack entries, all corners    1        1        0
+
+Holds positive (+0.237 at 85 C, +0.089 at 0 C). altera_reserved_tck clean:
++4.453/+4.968 setup, +0.186/+0.184 hold. Both Fast corners pass by >2 ns.
+
+Two paths were fixed, both by putting a register in a too-long combinational
+run:
+
+  cw_mixer.vhd (fixed in v6, retained here)
+      scale() did rounding, shift AND saturation in one function, evaluated
+      between the DSP block's output register and out_*. Quartus absorbs the
+      products AND the adder into the block, so a register between the sum and
+      scale() would have bought nothing -- the sum was already registered as
+      Add1~mac_pl. Split into round_shift() and clamp(), the intermediate
+      registered at SUM_W-TONE_FRAC = 19 bits rather than 33, which also
+      shrinks the stage-3 comparators. Rounding and saturation bit-identical.
+      Latency 2 -> 3 clocks; both channels identical so the accumulators stay
+      in step.
+
+  fifo_reader.vhd (new in v7)
+      META_LOAD's scheduling test was a 64-bit > against timestamp AND a
+      64-bit /= against META_NOW, both combinational from an input arriving
+      across the chip from the Nios time_tamer -- mostly routing, and the
+      design's worst path once the mixer was fixed. Precomputed into one
+      registered bit. The stale-by-one is safe HERE specifically: META_WAIT
+      re-tests against the LIVE timestamp before releasing anything, so a
+      stale '1' costs one extra clock that META_WAIT immediately satisfies.
+      Nothing is released early.
+
+The -0.053 AD9361 AXI up_xfer_cntrl -> fifo_writer path that sat hidden behind
+the comparator in v6 closed on its own, once the comparator stopped competing
+for placement. No vendor IP was touched and no false path was declared.
+
+WHAT DID NOT WORK
+-----------------
+OPTIMIZATION_MODE "High Performance Effort", the lever v4's provenance listed
+as untried, made things much worse rather than better:
+
+    one violation at -0.086   ->   five, worst -0.399
+    altera_reserved_tck hold  ->   newly broken at -0.023
+
+It re-plans placement globally to chase fmax and spent its budget somewhere
+other than the path that needed it. Reverted, and recorded in bladerf.tcl so
+it is not tried again. Same lesson as v4's seed-3 experiment: on marginal
+paths a fitter knob is a lottery ticket, not a fix. Both violations were
+closed at source instead.
+
+RESOURCES
+---------
+    Logic (ALMs)   8,476 / 113,560  (7 %)
+    Registers      18,079
+    DSP blocks     34 / 342         (10 %)
+Analysis & Synthesis: 0 errors, 145 warnings, same benign classes as v5/v6.
+
+VERIFICATION
+------------
+All eight testbenches green against this exact RTL:
+
+    seq_adder_tb           PASS
+    iq_dword_packer_tb     PASS
+    dsp_chain_tb           PASS  0 errors, 4 acc1 / 4 acc2 / 4 divisions
+    rx_dsp_fifo_tb         PASS
+    rx_sweep_tb            PASS  50/50 words, worst error 7 counts (tol 250)
+    dsp_valid_skew_tb      PASS
+    fx3_gpif_dsp_tb SEL=0  PASS  24576 reads, stock path unaffected
+    fx3_gpif_dsp_tb SEL=1  PASS  102 reads, one sweep as one burst
+
+The two fx3_gpif_dsp_tb runs compile tx.vhd and so exercise the fifo_reader
+change, which is shared Nuand TX code and the one edit here that reaches
+outside the DSP chain.
+
+Run with ModelSim ASE (intelFPGA_lite/20.1), not Questa -- Questa FSE wants a
+SALT_LICENSE_SERVER that is not configured here.
+
+NOT FLASHED, NOT RUN ON HARDWARE. Everything above is synthesis, fit, STA and
+simulation.
+
+HOST SIDE
+---------
+version1 @ 375c657 has the matching host changes: sweep_mode='dsp' and
+_sweep_core_dsp in sfcw_engine.py, and a driver DSP path that now works
+(dsp_path_enable used config_gpio_read/write which do not exist; dsp_read_sweep
+treated sync_rx's return as a count when the count is in meta.actual_count; and
+PACKET_META was never selected, without which fx3_gpif waits for 2048 words and
+a 102-DWORD sweep never triggers a transfer).
+
+Set sweep_mode='dsp' and restart the sweep -- the format is fixed when the
+stream is configured, so the mode cannot be crossed on a live stream.
+
+KNOWN RISK -- SWEEP ALIGNMENT
+-----------------------------
+dsp_result_count in rx.vhd free-runs modulo DSP_FIFO_WORDS and resets only on
+rx_reset. Priming (51 retunes) and each sweep (51) are exact multiples, so
+alignment holds in normal operation. But a SINGLE retune outside that rhythm --
+a UI frequency change, a coherence test -- rotates the 51-word grouping by one
+step permanently, and shows up as a range profile shifted by one frequency bin
+rather than as an error. Nothing currently detects it. Restarting the stream
+realigns.
+
+EXPECTED THROUGHPUT
+-------------------
+    51 steps x 4096 samples / 10 MS/s = 20.89 ms  ->  47.9 Hz
+
+That is the acquisition ceiling and the DSP path can reach it, not beat it.
+The 37 Hz measured on v5 is 27.0 ms, so ~6.1 ms/sweep (~120 us/step) is
+overhead the DSP path deletes: 835 KB per sweep over USB becomes 408 bytes,
+and the Pi stops computing 51 demodulations and 51 divisions. The ring-overflow
+fallback ("RX delivery lagged 86 ms at harvest") cannot occur in this mode --
+there is no continuous capture and no ring.
+
+Whether 37 -> 48 actually lands depends on how much of that 6.1 ms was USB and
+host compute rather than Nios retune time inside the dwell. Unmeasured.
+
+SEPARATE ISSUE, STILL OPEN
+--------------------------
+    RX ADC running hot -- RX1=2048/2047 (100% FS)
+
+The front end is compressing, and samples arrive clipped before the FPGA sees
+them, so the accumulated result carries a bias no averaging removes. Note that
+adc_peak is None in DSP mode -- it is measured from raw samples and there are
+none -- so _warn_if_adc_hot cannot fire. Set gain in 'nios' mode first, then
+switch.
