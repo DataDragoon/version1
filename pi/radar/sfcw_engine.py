@@ -1004,7 +1004,11 @@ class SFCWEngine:
         # float64 expression this replaced: worst relative error 1.4e-5 (-97.2 dB),
         # against a system limited at ~42 dB S_repeat. 55 dB of margin.
         self._ref_tone_c64 = self._ref_tone_scaled.astype(np.complex64)
-        self.driver.start_tx_dual()
+        # TX must be timestamped whenever RX is. PACKET_META requires
+        # timestamps and the enable is one global GPIO bit, so mixing
+        # SC16_Q11 on TX with PACKET_META on RX makes sync_config return
+        # BLADERF_ERR_INVAL before the stream ever starts.
+        self.driver.start_tx_dual(timestamped=(self.sweep_mode == 'dsp'))
         if self.sweep_mode == 'dsp':
             # PACKET_META and synchronous reads -- no callback thread, because
             # there is no continuous stream to consume. _rx_capture, the bulk

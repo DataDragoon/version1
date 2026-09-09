@@ -349,18 +349,33 @@ class BladeRFDriver:
 
     # -- Dual-channel TX/RX (used by SFCW engine for reference channel) --
 
-    def start_tx_dual(self):
-        """Start TX on both channels (TX1=antenna, TX2=reference cable)."""
+    def start_tx_dual(self, timestamped=False):
+        """Start TX on both channels (TX1=antenna, TX2=reference cable).
+
+        `timestamped` selects SC16_Q11_META instead of SC16_Q11. It is not a
+        preference -- it is forced by the RX side. libbladeRF refuses to run
+        one direction timestamped and the other not:
+
+            perform_format_config() (bladerf2/common.c)
+              requires_timestamps(module_format[other]) != requires_timestamps(this)
+                -> BLADERF_ERR_INVAL, "Invalid operation or parameter"
+
+        because the timestamp enable is a single global GPIO bit, not per
+        direction. PACKET_META requires timestamps, so the moment RX moves to
+        the DSP path TX has to move to SC16_Q11_META as well or sync_config
+        fails outright at stream start.
+        """
         if self.tx_running:
             return
         self._tx_buffer = self._generate(int(self.sample_rate * 0.01))
         self._tx_stop.clear()
         self.tx_running = True
         self._dual_channel = True
+        self._tx_timestamped = timestamped
         self._rebuild_tx_dual_buffer()
         self.device.sync_config(
             layout=ChannelLayout.TX_X2,
-            fmt=Format.SC16_Q11,
+            fmt=Format.SC16_Q11_META if timestamped else Format.SC16_Q11,
             num_buffers=16,
             buffer_size=4096,
             num_transfers=8,
@@ -374,12 +389,24 @@ class BladeRFDriver:
     def _tx_loop_dual(self):
         """TX loop for dual channel — replays the interleaved buffer, re-read each
         iteration (like _tx_loop) so live waveform/rate changes take effect."""
+        meta = None
+        if getattr(self, '_tx_timestamped', False):
+            # SC16_Q11_META demands metadata on every sync_tx. This is a
+            # free-running CW carrier, not a scheduled burst, so TX_NOW says
+            # "send as soon as there is room" and the timestamp is ignored.
+            # Without TX_NOW libbladeRF waits for a timestamp that never comes
+            # and the carrier never goes out.
+            meta = ffi.new("struct bladerf_metadata *")
+            meta.flags = self._META_FLAG_TX_NOW
         try:
             while not self._tx_stop.is_set():
                 with self._lock:
                     tx_bytes = self._tx_dual_bytes
                     n_samples = self._tx_dual_n_samples
-                self.device.sync_tx(tx_bytes, n_samples)
+                if meta is not None:
+                    self.device.sync_tx(tx_bytes, n_samples, meta=meta)
+                else:
+                    self.device.sync_tx(tx_bytes, n_samples)
         except Exception as e:
             print(f"[bladerf] TX dual error: {e}")
         finally:
@@ -520,6 +547,8 @@ class BladeRFDriver:
 
     # bladerf_metadata.flags: take whatever the FIFO has, do not schedule.
     _META_FLAG_RX_NOW = 1 << 31
+    # Send as soon as there is room; the timestamp field is then ignored.
+    _META_FLAG_TX_NOW = 1 << 2
 
     def dsp_path_enable(self, on=True):
         """Route the sample FIFO ports to the DSP result FIFO, or back.
