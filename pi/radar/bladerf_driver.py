@@ -787,7 +787,15 @@ class BladeRFDriver:
             self.device.sync_rx(buf, want_dwords,
                                 timeout_ms=int(timeout_s * 1000), meta=meta)
         except Exception as e:
-            print(f"[bladerf] DSP sweep read failed: {e}")
+            # The bindings raise a class named after the libbladeRF return
+            # code and pass the code as arg 0, so report both -- "An
+            # unexpected error occurred" alone does not distinguish a stalled
+            # RX worker (ERR_UNEXPECTED, -13) from an empty FIFO
+            # (ERR_TIMEOUT, -6), and those need opposite responses.
+            code = e.args[0] if getattr(e, 'args', None) else '?'
+            print("[bladerf] DSP sweep read failed: {} ({}, code {}) "
+                  "after requesting {} DWORDs".format(
+                      e, type(e).__name__, code, want_dwords))
             return None
 
         got = int(meta.actual_count)
