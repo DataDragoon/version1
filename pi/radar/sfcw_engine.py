@@ -1010,10 +1010,24 @@ class SFCWEngine:
         # BLADERF_ERR_INVAL before the stream ever starts.
         self.driver.start_tx_dual(timestamped=(self.sweep_mode == 'dsp'))
         if self.sweep_mode == 'dsp':
-            # PACKET_META and synchronous reads -- no callback thread, because
-            # there is no continuous stream to consume. _rx_capture, the bulk
-            # capture and everything downstream of them are unused in this mode.
-            self.driver.start_rx_dsp()
+            # DELIBERATELY NOT STARTED HERE.
+            #
+            # In DSP mode the FPGA emits nothing at all until a whole sweep has
+            # landed in the DSP FIFO -- the gate holds the read side empty by
+            # design. An RX stream opened now would then sit through the ~51
+            # USB retunes of NIOS priming with no data to deliver, every queued
+            # transfer would time out, the stream would error, and
+            # sync_worker.c would move the worker to STOPPED. The first real
+            # read then fails in sync_prime_stream, which returns
+            # BLADERF_ERR_UNEXPECTED (-1) for any state that is not RUNNING or
+            # IDLE. That is the "unexpected error" the DSP path was hitting,
+            # and the transfer timeouts logged alongside it were its cause, not
+            # its symptom.
+            #
+            # _sweep_core_dsp opens the stream immediately before EXEC instead,
+            # so it is never idle for long. Between sweeps the gap is one sweep
+            # period (~21 ms), which is well inside the transfer timeout.
+            pass
         else:
             self.driver.start_rx_dual(self._rx_capture, num_samples=n)
         time.sleep(0.05)
@@ -2037,6 +2051,14 @@ class SFCWEngine:
                             f"FPGA DSP chain needs (FLUSH_N + ACCUM_N)")
 
         try:
+            # Open the RX stream as late as possible -- see the note in
+            # _start_tx_rx. Priming is done by now, so the stream goes from
+            # start to first packet in one sweep period rather than sitting
+            # idle through 51 USB retunes and being torn down by transfer
+            # timeouts.
+            if not self.driver.rx_running:
+                self.driver.start_rx_dsp()
+
             ts0 = self._nios_timestamp()
             rc = self._nios_command(NIOS_CMD_EXEC,
                                     (units << 16) | (num_steps & 0xFFFF))
@@ -2052,6 +2074,14 @@ class SFCWEngine:
             budget = (num_steps * dwell) / float(self.driver.sample_rate) + 1.0
             h_cal = self.driver.dsp_read_sweep(num_steps, timeout_s=budget)
             if h_cal is None:
+                # A failed read usually means the sync worker stopped, and it
+                # will not recover on its own -- every later read would return
+                # the same error forever. Tear the stream down so the next
+                # sweep builds a fresh one.
+                try:
+                    self.driver.stop_rx_dsp()
+                except Exception:
+                    pass
                 return fallback("DSP FIFO read returned no complete sweep")
         except Exception as e:
             return fallback(f"DSP sweep raised {e!r}")
