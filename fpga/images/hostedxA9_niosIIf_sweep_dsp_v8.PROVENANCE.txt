@@ -1,0 +1,146 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v8.rbf
+==================================================
+
+Status:  DEBUG IMAGE -- SignalTap instrumented, TIMING NOT CLEAN.
+         Built to make the DSP chain observable on hardware, not to run
+         production sweeps. v7 remains the timing-clean image.
+
+         Six negative-slack entries at four corners, worst -3.057 ns on the
+         AD9361 LVDS receive clock. v7 had zero. Read "TIMING -- REGRESSED"
+         below before drawing conclusions from anything this image measures.
+
+Build date:        2026-09-09 16:03 IST (fit), 16:05 (assemble)
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-09_16.05.03
+md5    (.rbf):     a21b61c09c3372822e271f69c1b938b2 (see .rbf.md5)
+sha256 (.rbf):     see .rbf.sha256
+md5    (.sof):     e2b49072ed4503e17d73d91bb4fb5b5e
+Source tree:       bladerf-src @ d41819f5, branch sfcw-fpga-dsp.
+                   Tracked tree clean. 21 untracked paths, one of which is a
+                   build input: signaltap/dsp_chain.stp. Archived beside this
+                   file as hostedxA9_niosIIf_sweep_dsp_v8.stp -- without it the
+                   hash alone does not reproduce this image.
+Quartus:           18.1.0.625 Standard, device 5CEBA9F23C8.
+
+FILES IN THIS RELEASE
+---------------------
+    .rbf    the bitstream, for bladeRF-cli
+    .sof    REQUIRED for SignalTap. v4 shipped without one and that image can
+            no longer be tapped -- work/output_files/hosted.sof is overwritten
+            by every build, so an unarchived .sof is gone the moment you
+            rebuild. Keep them paired.
+    .stp    the SignalTap configuration the .sof was compiled against.
+
+WHY THIS IMAGE EXISTS
+---------------------
+v7's provenance closes with the DSP path fixed in principle but never observed
+on hardware: "NOT FLASHED, NOT RUN ON HARDWARE." The open questions -- does
+dsp_restart actually pulse per step, do the accumulators reach FLUSH, does the
+divider produce -- are all internal signals with no host-visible symptom short
+of "the sweep is empty."
+
+v8 adds a SignalTap instance so they can be watched directly.
+
+    Instance     dsp_chain
+    Width        14 bits
+    Depth        2048 samples
+    Clock        rx_clock (fifo_writer's clock domain)
+
+    rx:U_rx|complex_div:\dsp_average:U_complex_div|state.{IDLE,PRODUCTS,OUTPUT}
+    rx:U_rx|seq_adder:\dsp_average:U_acc_rx1|state.{ACCUM,FLUSH,WAIT_RESTART}
+    rx:U_rx|seq_adder:\dsp_average:U_acc_rx2|state.{ACCUM,FLUSH,WAIT_RESTART}
+    rx:U_rx|cw_nco:\dsp_average:U_cw_nco|phase
+    rx:U_rx|fifo_writer:U_fifo_writer|clock
+    synchronizer:U_sync_dsp_path_en|sync
+
+It also carries d41819f5 on top of v7's c6acd064:
+
+    nios: dsp_restart must not read-modify-write from an input pin
+
+WHAT THIS TAP SET CANNOT TELL YOU
+---------------------------------
+All 14 bits are state-machine flags plus NCO phase. No sample data is tapped --
+dsp_fifo_wdata is not in the instance. This image proves the chain SEQUENCES;
+it cannot show what values it produces. If the states look correct but host
+data is still wrong, that needs a different tap set and another build.
+
+The signals are all in rx:U_rx and only move when the RX path is enabled and
+dsp_path_en is high. A transmit-only host script leaves every one of them idle
+and the trigger never fires.
+
+TIMING -- REGRESSED
+-------------------
+                                            v7        15:43      v8
+    Slow 1100mV 85C Setup, pll_sclk       +0.409     -2.814    -3.057
+    Slow 1100mV  0C Setup, pll_sclk        +0.203    -2.757    -2.952
+    Fast 1100mV 85C Setup, pll_sclk           --     -1.313    -1.484
+    Fast 1100mV  0C Setup, pll_sclk           --     -1.202    -1.350
+    Fast 1100mV 85C Hold, altera_reserved_tck  --      clean    -0.031
+    Fast 1100mV  0C Hold, altera_reserved_tck  --      clean    -0.014
+    Negative-slack entries, all corners        0          4         6
+
+TNS is 0.000 on every one of these, so it is a single path failing at each
+corner, not a spread. Two distinct problems:
+
+  pll_sclk (-3.057)
+      U_nios_system|axi_ad9361_0|i_dev_if|i_rx|i_altlvds_rx -- the AD9361 LVDS
+      receive clock. This is the path samples travel to enter the FPGA. A
+      3 ns setup failure here means ADC data capture is not guaranteed, and
+      corrupted samples entering the DSP chain look exactly like a broken DSP
+      chain. This is the reason to distrust any measurement from this image.
+
+      Note it appeared at 15:43, BEFORE the SignalTap instance was added at
+      16:05 -- so SignalTap is not its cause, it only deepened it by 0.243 ns.
+      Something between c6acd064 and d41819f5, or a fitter placement change,
+      broke it first. Not yet diagnosed.
+
+  altera_reserved_tck hold (-0.031, -0.014)
+      New in v8, Fast corners only. This is the JTAG clock -- the clock
+      SignalTap itself uses to shift capture data out. A hold violation here
+      can corrupt the readback rather than the design. If a capture shows
+      impossible state transitions, suspect this before believing the RTL is
+      wrong.
+
+Both are unfixed. This image was built to observe, and it is being used
+knowingly with these violations.
+
+RESOURCES
+---------
+                        v7        v8       delta
+    Logic (ALMs)      8,476     8,715      +239
+    Registers        18,079    18,663      +584
+    DSP blocks           34        34         0
+    RAM blocks           --   319/1220 (26 %)
+    Block memory bits    --  2,539,968 (20 %)
+
+The ALM/register growth is the SignalTap instance and its trigger logic. At 14
+bits x 2048 deep the buffer is small; there is a great deal of headroom to add
+sample-data taps in a future build.
+
+VERIFICATION -- NONE PERFORMED FOR THIS IMAGE
+---------------------------------------------
+No testbenches were run against v8. v7's eight-testbench suite covers
+c6acd064; d41819f5 landed after it and has not been re-verified in simulation.
+The claims above are read from this build's own fit.summary and sta.summary
+and from the .stp -- synthesis and fit results only.
+
+Not run on hardware at time of writing.
+
+LOADING
+-------
+    bladeRF-cli -l hostedxA9_niosIIf_sweep_dsp_v8.rbf
+
+-l, into RAM. Do not flash this one. It is a debug image with a broken ADC
+capture path; it should not survive a power cycle. v7 stays in flash as the
+image the board falls back to.
+
+For SignalTap, point the SOF Manager at the .sof BESIDE THIS FILE, not at
+work/output_files/hosted.sof -- that one is overwritten by the next build.
+
+    quartus_stpw hostedxA9_niosIIf_sweep_dsp_v8.stp
+
+Both must come from this release. A .sof from a different build attaches
+without complaint and decodes to plausible garbage.
+
+Note: opening the .stp in quartus_stpw and setting the SOF Manager re-stamps
+the .sof in place -- its md5 changes while the .rbf does not. The hash recorded
+above is post-stamp. The .rbf is the invariant; check that one.
