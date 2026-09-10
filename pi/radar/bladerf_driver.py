@@ -694,10 +694,34 @@ class BladeRFDriver:
     def start_rx_dsp(self):
         """Configure RX to receive DSP results instead of raw samples.
 
-        PACKET_META, not SC16_Q11. This is not cosmetic: fx3_gpif only takes a
-        transfer length from the metadata header in packet mode. In sample mode
-        it waits for 2048 words to accumulate, and one sweep is 102 DWORDs, so
-        a transfer would never trigger and the sweep would sit in the FIFO.
+        SC16_Q11 -- plain sample mode, no metadata, no packet mode -- and NOT
+        PACKET_META. The previous version used PACKET_META so that fx3_gpif
+        would take the transfer length from a metadata header. That path was
+        never seen to deliver on hardware, and it carries two dependencies
+        this one does not:
+
+          * the sample-format enum. PACKET_META is 3 in the canonical
+            libbladeRF header and 2 in the bindings shipped on the Pi (see the
+            note at the top of this file). SC16_Q11 is 0 in every version.
+          * the dsp_meta FIFO and its header. Sample mode never consults
+            metadata at all.
+
+        How sample mode reaches the FX3 with only 102 DWORDs in the FIFO:
+        fx3_gpif's burst condition (fx3_gpif.vhd:273) is
+
+            unsigned(rx_fifo_full & rx_fifo_usedw) >= gpif_buf_size
+
+        with the FULL flag concatenated as the MSB. When the DSP FIFO fills --
+        one whole sweep -- that flag lifts the value to 2**14 + 102 = 16486,
+        past the 2048 threshold, and fx3_gpif moves one full-size DMA buffer:
+        the first 2*DSP_SWEEP_WORDS DWORDs are the sweep and the rest is the
+        FIFO's last word repeated, because reads past empty are ignored. The
+        FX3 firmware sees exactly the fixed-size buffer it always sees.
+        Verified with the real fx3_gpif in simulation (rx_fx3_tb, SAMPLE).
+
+        That repeated tail is also a fingerprint: dsp_read_sweep uses it to
+        tell a DSP burst from a buffer of raw samples, which is what arrives
+        if bit 6 is not in effect.
 
         Layout stays RX_X2 -- the FPGA still needs both AD9361 channels running
         to have a signal and a reference to divide. Only the FIFO read port is
@@ -705,49 +729,70 @@ class BladeRFDriver:
         """
         if self.rx_running:
             raise RuntimeError("stop RX before switching to the DSP path")
+
+        # One ring buffer == one GPIF DMA transfer, so every sync_rx returns
+        # exactly one burst: 2048 samples at SuperSpeed, 1024 at High Speed.
+        # Bit 7 of config_gpio is usb_speed (1 = HS) and, unlike bit 6, it
+        # reads back. buffer_size is the TOTAL interleaved sample count
+        # (sync.c: bytes = buffer_size * bytes_per_sample), not per channel.
+        gpio = self._gpio_read()
+        self._dsp_buf_samples = 1024 if (gpio >> 7) & 1 else 2048
+
         self.device.sync_config(
             layout=ChannelLayout.RX_X2,
-            fmt=fmt('PACKET_META'),
+            fmt=fmt('SC16_Q11'),
             num_buffers=RX_RING_DEPTH,
-            buffer_size=4096,
+            buffer_size=self._dsp_buf_samples,
             num_transfers=8,
             stream_timeout=3500
         )
         self.device.enable_module(bladerf.CHANNEL_RX(0), True)
         self.device.enable_module(bladerf.CHANNEL_RX(1), True)
+
+        # Bit 6 goes LAST. libbladeRF's format config does its own
+        # read-modify-write of config_gpio, and bit 6 reads back as 0 (it has
+        # no field in bladerf_p.vhd's unpack(), which is exactly why it was
+        # free to use) -- so any libbladeRF write after this would clear it.
+        # Do not try to read it back to confirm; dsp_read_sweep confirms the
+        # DSP path functionally instead.
         self.dsp_path_enable(True)
-
-        # BIT 6 IS WRITE-ONLY. Do not try to read it back to confirm.
-        #
-        # bladerf-hosted.vhd drives dsp_path_en from the RAW nios_gpo_slv(6),
-        # so the write does reach the FIFO mux. But the readback path is
-        #
-        #     nios_gpio.o          <= unpack(nios_gpo_slv)
-        #     nios_gpio.i.gpo_readback <= nios_gpio.o
-        #     gpio_in_port         <= pack(nios_gpio.i, '0')
-        #
-        # and bladerf_p.vhd's unpack() decodes only bits 31:30 and 21:7 -- bit
-        # 6 has no field in nios_gpo_t, so it is dropped in the round trip and
-        # always reads back 0. That undecodedness is exactly why bit 6 was
-        # available to use, the same reason bit 24 was free for dsp_restart.
-        #
-        # An earlier version raised on the readback and so refused every
-        # correctly-configured stream. Whether the DSP path is really live can
-        # only be established functionally -- if the image lacks the DSP chain
-        # the FIFO stays empty and _sweep_core_dsp falls back, naming the
-        # reason.
         gpio = self._gpio_read()
-        print("[bladerf] DSP result path selected (config_gpio=0x{:08x}; "
-              "bit {} is write-only and always reads 0)".format(
-                  gpio, self.DSP_PATH_BIT))
-
-        # Let the sync worker leave SYNC_WORKER_STATE_STARTUP before anyone
-        # reads. dsp_read_sweep retries anyway, but losing that race on every
-        # single sweep would burn a retry each time. See the note there.
-        time.sleep(0.15)
+        print("[bladerf] DSP result path selected, sample mode "
+              "(config_gpio=0x{:08x}; bit {} is write-only and reads 0; "
+              "{} samples per transfer)".format(
+                  gpio, self.DSP_PATH_BIT, self._dsp_buf_samples))
 
         self.rx_running = True
         self._dual_channel = True
+
+        # Between enable_module and dsp_path_enable the mux still pointed at
+        # the stock FIFO, and in sample mode fx3_gpif streams raw samples from
+        # it continuously -- so the ring now holds some buffers of raw IQ.
+        # Drain them: with bit 6 set and no sweep running nothing else
+        # arrives, so the drain ends on the first timeout.
+        self._dsp_drain_ring()
+
+    def _dsp_drain_ring(self, timeout_ms=150, limit=RX_RING_DEPTH + 8):
+        """Discard whatever is queued in the RX ring, until a read times out."""
+        nsamp = self._dsp_buf_samples
+        buf = bytearray(nsamp * 4)
+        drained = 0
+        for i in range(limit):
+            try:
+                self.device.sync_rx(buf, nsamp, timeout_ms=timeout_ms)
+                drained += 1
+            except Exception as exc:
+                # ERR_TIMEOUT (-6): ring empty, which is the goal. The
+                # sync-worker STARTUP race (ERR_UNEXPECTED, -1) can hit the
+                # very first call after sync_config; retry that a few times.
+                code = exc.args[0] if getattr(exc, 'args', None) else None
+                if code == -1 and drained == 0 and i < 3:
+                    time.sleep(0.05)
+                    continue
+                break
+        if drained:
+            print("[bladerf] DSP: drained {} stale raw buffer(s) from the RX "
+                  "ring".format(drained))
 
     def stop_rx_dsp(self):
         if not self.rx_running:
@@ -765,69 +810,82 @@ class BladeRFDriver:
         self._dual_channel = False
 
     def dsp_read_sweep(self, num_steps=None, timeout_s=2.0):
-        """Read one sweep of per-step ratios as complex64.
+        """Read one sweep of per-step ratios as complex64, or None.
 
-        Returns None on a short or failed read rather than a partial array: the
-        FPGA gate holds the FIFO 'empty' until a WHOLE sweep has landed, so
-        anything short means something upstream stalled and the caller should
-        fall back rather than process a torn sweep.
+        One sync_rx of exactly one GPIF transfer (see start_rx_dsp). The sweep
+        is the first 2*num_steps DWORDs; everything after is the FIFO's last
+        word repeated, because fx3_gpif keeps clocking reads past empty and
+        the FIFO ignores them.
 
-        One sweep is num_steps 64-bit words, which the 32-bit read side and
-        therefore libbladeRF's packet mode count as 2*num_steps DWORDs -- the
-        same number the FPGA writes into the header's length field.
+        THE TAIL IS THE CHECK. A buffer of raw IQ -- which is exactly what
+        arrives when bit 6 is not in effect, since sample mode then streams the
+        stock FIFO -- never has a constant tail. So a non-constant tail means
+        the DSP path is not selected, and that is reported by name rather than
+        returned as a plausible-looking sweep of garbage. On such a buffer
+        bit 6 is re-asserted once and the read retried, in case a libbladeRF
+        read-modify-write cleared it.
         """
         if num_steps is None:
             num_steps = self.DSP_SWEEP_WORDS
-        want_bytes  = num_steps * self.DSP_WORD_BYTES
-        want_dwords = want_bytes // 4
+        want_dwords = 2 * num_steps
+        nsamp = getattr(self, '_dsp_buf_samples', 2048)
+        buf = bytearray(nsamp * 4)
 
-        buf = bytearray(want_bytes)
-        meta = ffi.new("struct bladerf_metadata *")
-        meta.flags = self._META_FLAG_RX_NOW
-
-        # RETRY IS NOT OPTIONAL HERE.
-        #
-        # sync_worker_init leaves the worker in SYNC_WORKER_STATE_STARTUP, and
-        # it only reaches IDLE once its thread is first scheduled.
-        # SYNC_STATE_CHECK_WORKER (sync.c:550) accepts IDLE and RUNNING and
-        # returns BLADERF_ERR_UNEXPECTED (-1) for anything else -- so a read
-        # issued straight after sync_config loses a race with the worker
-        # thread and fails, which is what "An unexpected error occurred (code
-        # -1)" was. libbladeRF's own comment on that branch says the caller
-        # "can call this function again to restart the stream and try again".
-        last = None
-        for attempt in range(3):
+        reasserted = False
+        raw_seen = 0
+        # Bounded by the ring depth: raw buffers are consumed one per
+        # iteration, so this can never spin on a stale backlog, and a genuine
+        # timeout ends it immediately.
+        for attempt in range(RX_RING_DEPTH + 8):
+            # sync_rx raises on error and returns None -- there is no count to
+            # check in sample mode; a return means the whole buffer was filled.
+            # The retry covers the sync-worker STARTUP race (ERR_UNEXPECTED,
+            # -1) straight after sync_config; see SYNC_STATE_CHECK_WORKER.
             try:
-                # sync_rx raises on error and returns None -- the count comes
-                # back in meta.actual_count, NOT as a return value. Treating
-                # the return as a count is what made an earlier version of
-                # this function loop until its deadline and always return None.
-                self.device.sync_rx(buf, want_dwords,
-                                    timeout_ms=int(timeout_s * 1000),
-                                    meta=meta)
-                last = None
-                break
+                self.device.sync_rx(buf, nsamp,
+                                    timeout_ms=int(timeout_s * 1000))
             except Exception as exc:
-                last = exc
-                time.sleep(0.05)
+                code = exc.args[0] if getattr(exc, 'args', None) else '?'
+                if code == -1 and attempt < 2:
+                    time.sleep(0.05)
+                    continue
+                print("[bladerf] DSP sweep read failed: {} ({}, code {}) "
+                      "requesting {} samples{}".format(
+                          exc, type(exc).__name__, code, nsamp,
+                          " after {} raw buffer(s)".format(raw_seen)
+                          if raw_seen else ""))
+                return None
 
-        if last is not None:
-            # The bindings raise a class named after the libbladeRF return
-            # code and pass the code as arg 0, so report both -- "An
-            # unexpected error occurred" alone does not distinguish a worker
-            # that has not left STARTUP (ERR_UNEXPECTED, -1) from an empty
-            # FIFO (ERR_TIMEOUT, -6), and those need opposite responses.
-            code = last.args[0] if getattr(last, 'args', None) else '?'
-            print("[bladerf] DSP sweep read failed after 3 attempts: {} "
-                  "({}, code {}) requesting {} DWORDs".format(
-                      last, type(last).__name__, code, want_dwords))
-            return None
+            raw = np.frombuffer(bytes(buf), dtype='<i4')
+            tail = raw[want_dwords:]
+            if tail.size and np.all(tail == tail[0]):
+                payload = raw[:want_dwords]
+                scale = float(1 << self.DSP_FRAC_BITS)
+                return ((payload[0::2].astype(np.float32) / scale)
+                        + 1j * (payload[1::2].astype(np.float32) / scale)
+                        ).astype(np.complex64)
 
-        got = int(meta.actual_count)
-        if got < want_dwords:
-            return None
+            # Not a DSP burst. Raw samples mean the FIFO mux was on the stock
+            # path when this buffer was captured: bit 6 not in effect.
+            #
+            # Re-assert it ONCE, then keep READING -- do not drain. A genuine
+            # burst may already be queued behind the raw ones (the mux moved
+            # while they were in flight), and a drain would throw it away and
+            # then wait a whole sweep for the next. Reading through the check
+            # consumes the raw backlog one buffer at a time and returns the
+            # first real burst it meets.
+            raw_seen += 1
+            if not reasserted:
+                print("[bladerf] DSP read: buffer is raw samples, not a DSP "
+                      "burst ({} distinct values in the {}-DWORD tail) -- "
+                      "dsp_path_en (config_gpio bit {}) is not in effect; "
+                      "re-asserting it and reading on".format(
+                          len(np.unique(tail[:256])), tail.size,
+                          self.DSP_PATH_BIT))
+                self.dsp_path_enable(True)
+                reasserted = True
 
-        raw = np.frombuffer(bytes(buf), dtype='<i4')
-        scale = float(1 << self.DSP_FRAC_BITS)
-        return ((raw[0::2].astype(np.float32) / scale)
-                + 1j * (raw[1::2].astype(np.float32) / scale)).astype(np.complex64)
+        print("[bladerf] DSP read: {} consecutive raw buffers and no DSP burst "
+              "-- dsp_path_en (bit {}) is not taking effect on the FPGA; this "
+              "is not a host problem".format(raw_seen, self.DSP_PATH_BIT))
+        return None
