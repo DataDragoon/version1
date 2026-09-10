@@ -394,16 +394,58 @@ class Rover:
             'config': dict(self.config),
         }
 
-    async def _fanout(self, msg):
-        if not self.clients:
+    async def _fanout(self, msg, timeout=0.5):
+        """Send to every groundstation client CONCURRENTLY, dropping dead/slow ones.
+
+        Two separate bugs live in the obvious `for c in self.clients: await
+        c.send(msg)`, and this rig hits both.
+
+        1. `client_handler` does `clients.add()` on connect and `.discard()` in
+           its `finally`, on this same event loop -- so every `await` inside the
+           loop is a yield point at which the set can be mutated underneath the
+           iterator. That is `RuntimeError: Set changed size during iteration`,
+           and because `broadcast()` is called from `board_handler` at 20 Hz it
+           kills the BOARD link, not just one client. It became constant once
+           the groundstation's reconnect dropped to 500 ms (useWebSocket.js).
+           Iterating a snapshot is what fixes it; the set itself is only
+           rebound, never mutated in place, after every send has finished.
+
+        2. `send()` has no timeout and the sends were sequential, so one client
+           that is not draining -- a wedged browser, or a half-open TCP with no
+           FIN/RST -- blocks the whole loop and every other client with it. Same
+           failure as `_send_to_all` in sdr_server.py; see CLAUDE.md.
+
+        A client that cannot take a frame within `timeout` is dropped and left to
+        reconnect. Note the rover raster's silent-link watchdog aborts a scan
+        after STATUS_STALE_MS (4 s) without a status frame, so stalling here is
+        not survivable -- dropping the slow client is the cheaper failure.
+        """
+        clients = set(self.clients)
+        if not clients:
             return
-        dead = set()
-        for c in self.clients:
+
+        async def _try(c):
             try:
-                await c.send(msg)
-            except websockets.ConnectionClosed:
-                dead.add(c)
-        self.clients -= dead
+                await asyncio.wait_for(c.send(msg), timeout=timeout)
+            except (websockets.ConnectionClosed, asyncio.TimeoutError, OSError):
+                return c
+            except Exception as exc:
+                # Deliberately a catch-all. `broadcast()` runs from
+                # `board_handler` at 20 Hz, and anything raised here propagates
+                # out of that handler and takes the BOARD link down -- one
+                # groundstation client killing the rover connection is exactly
+                # the failure this function exists to prevent. A client whose
+                # send raises anything at all is not usable, so drop it; printed
+                # rather than logged via _note() because that would re-enter
+                # broadcast_log -> _fanout.
+                print(f"[rover] dropping client on unexpected send error: {exc!r}")
+                return c
+            return None
+
+        results = await asyncio.gather(*[_try(c) for c in clients])
+        dead = {c for c in results if c is not None}
+        if dead:
+            self.clients -= dead
 
     async def broadcast(self):
         await self._fanout(json.dumps({'type': 'rover_status', **self.status()}))

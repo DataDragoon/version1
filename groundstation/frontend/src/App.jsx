@@ -58,6 +58,7 @@ function buildCellRecord({ sweeps, meta, cell, grid, rover, target, roverXStd })
     h_cal_imag: meanSweep.im,
     num_steps: meta.num_steps,
     step_size: meta.step_size,
+    start_freq: meta.start_freq,
     range_offset: meta.range_offset,
     lidar_standoff_mm: standMean,
     lidar_n: sweeps.reduce((a, w) => a + (w.lidar_n || 0), 0),
@@ -592,6 +593,7 @@ export default function App() {
   // possible to test later whether the background depends on pose as well as
   // standoff -- cheap to capture now, impossible to backfill.
   const poseAccumRef = useRef([]);
+  const sfcwDisplayThrottleRef = useRef(0);
   // C-scan raster: a hCount x vCount grid captured along a snake path (see
   // lib/cscanGrid.js). vCount = 1 degenerates to the old single-line B-scan.
   const [bscanParams, setBscanParams] = useState({
@@ -1475,7 +1477,6 @@ export default function App() {
         roll_deg: rollDeg,
         pitch_deg: pitchDeg,
       };
-      setSfcwLidarProvenance(provenance);
 
       // Sweep period from the PI's own timestamps -- median of the adjacent
       // differences over a 12-sweep window, the same statistic (and for the
@@ -1498,9 +1499,21 @@ export default function App() {
         }
       }
 
-      // Always update live display
-      setSfcwResult(msg);
-      setSfcwStandoffMm(standoffMm);
+      // Throttle the live display to ~20 Hz. At the 36 Hz NIOS sweep rate every
+      // sweep triggered the whole re-render cascade (IFFTs, model inference,
+      // waterfall canvas), which is what made the browser the slow client that
+      // stalls the Pi's broadcast loop -- see _send_to_all in sdr_server.py.
+      // Only the React state driving the live display is gated: every capture
+      // path below reads the local `msg`/`provenance` and still sees every sweep.
+      const displayNow = performance.now();
+      const capturing = bscanCaptureRef.current || sfcwBgCaptureRef.current
+        || bscanBgCaptureRef.current || bgModelAccumRef.current || bgModelTestRef.current;
+      if (capturing || displayNow - sfcwDisplayThrottleRef.current >= 50) {
+        sfcwDisplayThrottleRef.current = displayNow;
+        setSfcwResult(msg);
+        setSfcwStandoffMm(standoffMm);
+        setSfcwLidarProvenance(provenance);
+      }
 
       // SFCW BG reference: first sweep after the button press becomes the reference
       if (sfcwBgCaptureRef.current && msg.h_cal_real && msg.h_cal_imag) {
@@ -1549,6 +1562,7 @@ export default function App() {
             distances: [...msg.distances],
             num_steps: msg.num_steps,
             step_size: msg.step_size,
+            start_freq: msg.start_freq,
             range_offset: msg.range_offset,
           };
           setBscanData(prev => [...prev, buildCellRecord({
@@ -1586,6 +1600,7 @@ export default function App() {
             distances: [...msg.distances],
             num_steps: msg.num_steps,
             step_size: msg.step_size,
+            start_freq: msg.start_freq,
             range_offset: msg.range_offset,
           },
         });

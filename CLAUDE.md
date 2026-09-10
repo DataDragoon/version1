@@ -5306,3 +5306,127 @@ never guess).
   corrupted several blocks during this session and cost real debugging time; repeated
   start/stop cycling also still degrades the device (recover by restarting `start.py`
   after a 15-20 s gap, or `usbreset` if it wedges).
+
+## The sweep "stuck in websocket": one slow client froze every client (2026-09-10)
+
+Integrated from the `balls` branch (`cb077ea`). Symptom: the GUI stops receiving
+sweeps entirely and stays stopped, while the Pi is plainly still sweeping -- the engine
+thread, the NIOS capture and the stdout are all healthy. Restarting the browser tab
+recovers it.
+
+**Root cause: `client.send()` has no timeout, and the broadcast was SEQUENTIAL.** All
+five broadcast sites in `sdr_server.py` did
+
+    for client in self.clients:
+        await client.send(msg)
+
+`websockets.send()` awaits until the frame reaches the transport. A client that is not
+draining -- a browser whose main thread is wedged, or a half-open TCP connection with no
+FIN/RST -- fills the writer buffer and **that await never returns.** It blocks
+`_sfcw_broadcast_loop` itself, so `sfcw_queue` (8-deep, drop-oldest) just churns and
+**every other client goes dark with it.** One bad client freezes the whole server's
+output. Note this is the same class of bug as the `put_nowait` one above and lives in the
+same loop, but it is a different mechanism: that one throttled the broadcast to ~10 Hz,
+this one stops it dead.
+
+**Fix: `_send_to_all(msg, timeout=0.5)`**, now the only way anything is broadcast.
+`asyncio.gather` over all clients concurrently, each wrapped in
+`wait_for(..., timeout=0.5)`, and a client that times out is dropped as dead alongside
+`ConnectionClosed`/`OSError`. **`RECONNECT_INTERVAL` in `useWebSocket.js` dropped
+3000 -> 500 ms as a direct consequence** -- the Pi now evicts a slow client, so it has to
+come back quickly. Those two changes are coupled; do not raise one without the other.
+
+**The loop can also DIE, and used to do it silently.** `_sfcw_broadcast_loop` is a bare
+`while True` and nothing awaited its task, so any exception inside it (a malformed dict,
+a JSON failure) killed the task permanently with no output at all -- identical symptom,
+different cause. The message-build and send are now wrapped in `try/except` that logs and
+continues, and both broadcast tasks carry an `add_done_callback` that prints a traceback
+if they die or are cancelled. A `_heartbeat()` prints
+`broadcast/callbacks/drops/clients/qsize` every 30 s, which is what tells the two cases
+apart: **callbacks climbing while broadcast is flat = a stuck send; both flat = the loop
+is dead.**
+
+**The client half: the browser WAS the slow client.** At the 36 Hz NIOS sweep rate every
+sweep triggered the full re-render cascade (IFFTs, model inference, waterfall canvas), so
+the main thread could not keep up with its own socket. `App.jsx` now throttles the live
+display to ~20 Hz. **Only the React state driving the display is gated** -- every capture
+path reads the local `msg`/`provenance` and still sees every sweep -- and the throttle is
+bypassed outright while any capture is armed (`bscanCaptureRef`, `sfcwBgCaptureRef`,
+`bscanBgCaptureRef`, `bgModelAccumRef`, `bgModelTestRef`). `setSfcwLidarProvenance` is
+inside the gate deliberately: it feeds only the Sidebar readout, so at 36 Hz it was
+re-rendering the sidebar for nothing.
+
+**Not integrated from that branch, deliberately: the Capon / semblance wiring.** The same
+commit bundles half of an unrelated beamforming feature -- an
+`import { useCaponWorker } from './hooks/useCaponWorker'`, six new `bscanParams` fields, a
+third argument to `computeGridScales`, and `caponValues`/`precomputedValues`/
+`sarSemblanceEnabled` props. **`useCaponWorker.js` does not exist on any branch or in any
+commit in this repo's history**, so `origin/balls` cannot build. The other half-wired
+pieces are no-ops here anyway (`computeGridScales` takes two arguments; the new props have
+no consumer). If that feature is wanted, it needs the worker file from wherever it was
+written, not this commit.
+
+**Residual gap, known and left alone:** only `_sfcw_broadcast_loop` has the `try/except`.
+`_broadcast_loop` (rx/fft) and `_broadcast_status` can still die on an unexpected
+exception -- strictly better than before, since `add_done_callback` now makes it loud
+rather than silent, but they are not yet self-healing.
+
+### The same bug was in `rover_server.py`, and the 500 ms reconnect set it off (2026-09-10)
+
+Immediately after the above shipped: `RuntimeError: Set changed size during iteration`
+in `_fanout`, repeatedly, killing the `board_handler` and so taking the BOARD link down
+with it.
+
+**The repeated `[rover] rover controller connected` lines in that log are NOT the fault --
+they are the Arduino's own reconnect working.** The board noticed its socket was gone and
+rejoined by itself, every time, with no intervention. That firmware behaviour is tracked
+SEPARATELY from this Pi-side fix; do not assume the two ship together. Behaviourally, per
+the operator: a board that dropped off used to require restarting the ROUTER to come back,
+and now it simply reconnects on its own.
+
+Worth keeping as a diagnostic lesson: **the firmware's reconnect MASKS how bad a Pi-side
+bug like this is.** A crash that kills the board link presents as harmless-looking link
+flapping, because the board keeps coming straight back. So a board reconnecting over and
+over is evidence that something keeps DROPPING it -- look at the Pi, not the network, and
+do not read self-recovery as "the link is fine".
+
+`rover_server.py` `_fanout` had the identical `for c in self.clients: await c.send(msg)`,
+and it carried **both** failure modes:
+
+- **Mutate-during-iterate.** `client_handler` does `clients.add()` on connect and
+  `.discard()` in its `finally`, on this same event loop, so every `await` inside the
+  loop is a yield point at which the set changes underneath the iterator. This one is
+  worse than the sdr_server case: `broadcast()` is called from `board_handler` at 20 Hz,
+  so the exception propagates out of the **board** handler, not a client handler. The
+  `except websockets.ConnectionClosed` there does not catch `RuntimeError`, so it fell
+  into the `finally`, which calls `broadcast()` again and raised again -- that is the
+  "During handling of the above exception, another exception occurred" chain in the log.
+- **No timeout, sequential sends.** Same as sdr_server: one client that is not draining
+  blocks the loop and `broadcast()` never returns at all.
+
+**The reconnect change is what made it constant, not what caused it.** The race was
+always there; dropping `RECONNECT_INTERVAL` 3000 -> 500 ms made clients churn 6x more
+often, so a 20 Hz broadcast started landing inside the add/discard window routinely.
+Expect this whenever reconnect timing is tightened.
+
+Fixed the same way as `_send_to_all`: iterate a **snapshot**, `gather` concurrently, each
+send under `wait_for(timeout=0.5)`, drop dead/slow clients. Plus a deliberate **catch-all**
+in the per-client coroutine that `sdr_server._send_to_all` does not have -- here anything
+escaping takes the board link down, so a client whose send raises *anything* is dropped
+(printed, not `_note()`d, because that would re-enter `broadcast_log` -> `_fanout`).
+
+Verified by extracting the SHIPPED `_fanout` from the file with `ast` (not a retyped copy)
+and driving it: 400 broadcasts against a client churning connect/disconnect gives
+**0 RuntimeErrors** post-fix and one per broadcast pre-fix; a stalled client is evicted
+after 0.5 s with the healthy clients still delivered and retained, where **pre-fix
+`_fanout` never returns at all** (confirmed hung past a 3 s watchdog -- so every
+*subsequent* broadcast never happens either, and the raster's `STATUS_STALE_MS` = 4 s
+watchdog would abort the scan); and an unexpected send exception is contained rather than
+escaping. Throwaway scripts, as usual.
+
+**`pi/sensors/stream.py` was checked and is SAFE** -- its
+`gather(*(c.send(msg) for c in clients))` unpacks the generator to completion *before* the
+first await, so the set is never iterated across a yield point. It has no send timeout, so
+the slow-client stall is latent there, but it cannot raise this RuntimeError. It is the
+only other websocket fan-out on the Pi; `sdr_server.py` and `rover_server.py` are now both
+fixed.
