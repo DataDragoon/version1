@@ -38,6 +38,10 @@ class SDRServer:
         self._sfcw_broadcast_count = 0
         self._sfcw_callback_count = 0
         self._sweep_heartbeat_t = 0.0
+        # Previous heartbeat's counters, so a heartbeat can report what MOVED
+        # rather than a cumulative total nobody can difference by eye.
+        self._hb_prev = (0, 0, 0)
+        self._hb_quiet = False
 
     async def start(self):
         try:
@@ -339,16 +343,57 @@ class SDRServer:
         self._post(self.sfcw_queue, data)
 
     def _heartbeat(self):
-        """Print a one-liner every 30s with broadcast health."""
+        """One line every 30 s, but ONLY when something is happening.
+
+        Silence means idle. Any output means a counter moved or a sweep is
+        running. A line that prints unconditionally is worse than no line: it
+        trains the operator to ignore it, which is exactly how the
+        `_sweep_core` 2-tuple error sat unnoticed for days (see CLAUDE.md).
+        Client churn alone is deliberately NOT worth a line -- a tab closed
+        abruptly lingers up to ~40 s on websockets' 20/20 keepalive, so an idle
+        server's client count flaps on its own and says nothing about health.
+
+        A RUNNING sweep always prints, even with flat counters, because a sweep
+        that is running while nothing moves is precisely the freeze this
+        instrumentation exists to catch and it must never be silent. The two
+        warnings below encode the diagnostic split: `callbacks` increments
+        before any queue, client or send is involved, so it separates "the
+        engine is not producing" from "the engine is fine and the send is
+        stuck".
+        """
         now = _time.monotonic()
-        if now - self._sweep_heartbeat_t < 30:
+        dt = now - self._sweep_heartbeat_t
+        if dt < 30:
             return
         self._sweep_heartbeat_t = now
-        print(f"[sdr] heartbeat: broadcast={self._sfcw_broadcast_count}"
-              f" callbacks={self._sfcw_callback_count}"
-              f" drops={self._sfcw_drops}"
+
+        cur = (self._sfcw_broadcast_count, self._sfcw_callback_count, self._sfcw_drops)
+        d = [c - p for c, p in zip(cur, self._hb_prev)]
+        self._hb_prev = cur
+        running = bool(getattr(self.sfcw, 'running', False))
+
+        if not any(d) and not running:
+            # Said once, so a server that goes quiet stays distinguishable from
+            # one that died.
+            if not self._hb_quiet:
+                self._hb_quiet = True
+                print(f"[sdr] heartbeat: idle, no sweep running "
+                      f"(clients={len(self.clients)}) -- silent until something moves")
+            return
+
+        self._hb_quiet = False
+        warn = ''
+        if running and d[1] == 0:
+            warn = '  *** running but NO callbacks -- engine is not producing ***'
+        elif d[1] and not d[0]:
+            warn = '  *** callbacks arriving but NO broadcasts -- send is stuck ***'
+
+        print(f"[sdr] heartbeat: broadcast={cur[0]} (+{d[0]}, {d[0] / dt:.1f}/s)"
+              f" callbacks={cur[1]} (+{d[1]})"
+              f" drops={cur[2]} (+{d[2]})"
               f" clients={len(self.clients)}"
-              f" qsize={self.sfcw_queue.qsize()}")
+              f" qsize={self.sfcw_queue.qsize()}"
+              f" running={running}{warn}")
 
     async def _sfcw_broadcast_loop(self):
         self._sweep_heartbeat_t = _time.monotonic()

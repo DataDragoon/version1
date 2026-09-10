@@ -5341,10 +5341,25 @@ come back quickly. Those two changes are coupled; do not raise one without the o
 a JSON failure) killed the task permanently with no output at all -- identical symptom,
 different cause. The message-build and send are now wrapped in `try/except` that logs and
 continues, and both broadcast tasks carry an `add_done_callback` that prints a traceback
-if they die or are cancelled. A `_heartbeat()` prints
-`broadcast/callbacks/drops/clients/qsize` every 30 s, which is what tells the two cases
+if they die or are cancelled. A `_heartbeat()` reports
+`broadcast/callbacks/drops/clients/qsize` on a 30 s tick, which is what tells the two cases
 apart: **callbacks climbing while broadcast is flat = a stuck send; both flat = the loop
-is dead.**
+is dead.** `callbacks` is the load-bearing one -- it increments in `_sfcw_callback` before
+any queue, client or send exists, so it separates "the engine is not producing" from "the
+engine is fine and the send is stuck". Both of those now print their own `***` warning.
+
+**The heartbeat is SILENT when idle, deliberately (2026-09-10).** It first shipped printing
+unconditionally, and on an idle server that is a line every 30 s reading `broadcast=0
+callbacks=0` with a client count that flaps on its own -- a tab closed abruptly lingers up
+to ~40 s on `websockets.serve`'s 20/20 keepalive default, so `clients=5/4/5/4` is normal
+and means nothing. That is the exact trap this file already records for the `_sweep_core`
+2-tuple error: a recurring benign line trains the operator to ignore the one line a real
+failure would print. So: **silence means idle; any output means a counter moved or a sweep
+is running.** A running sweep always prints even with flat counters, because "running but
+nothing moving" is the freeze the instrumentation exists to catch. Going idle prints one
+line and then stops, so a quiet server stays distinguishable from a dead one. Client churn
+alone is never worth a line. Counters are reported as deltas plus a rate, not bare
+cumulative totals nobody can difference by eye.
 
 **The client half: the browser WAS the slow client.** At the 36 Hz NIOS sweep rate every
 sweep triggered the full re-render cascade (IFFTs, model inference, waterfall canvas), so
