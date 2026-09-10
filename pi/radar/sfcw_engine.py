@@ -2032,8 +2032,26 @@ class SFCWEngine:
             if reprime:
                 self._nios_primed = False
                 self._nios_clear_queue()
-            return self._sweep_core(freqs, qt_rx, qt_tx, num_buffers,
-                                    settle_count, progress_cb)
+            # NO raw-capture fallback in DSP mode -- there is nothing to fall
+            # back TO. _start_tx_rx deliberately opens no RX stream in this
+            # mode (the DSP stream is opened here, lazily, by start_rx_dsp),
+            # and TX is already timestamped, so a plain SC16_Q11 RX stream
+            # cannot even be configured alongside it (the ERR_INVAL noted in
+            # _start_tx_rx). Calling _sweep_core here, as 'nios' mode's
+            # fallback legitimately does, therefore waits on rx_cond for
+            # buffers that never come: settle deadline + STALL_GIVEUP_S +
+            # a 1 s capture wait, about 1.3 s per step, all 51 steps dropped,
+            # over a minute per sweep with nothing published -- and it
+            # repeats every sweep. That is what "stuck after switching to
+            # dsp" was.
+            #
+            # Return an empty sweep at normal cadence instead. The reason is
+            # already on the console via _log_nios_fallback, and
+            # _perform_sweep reports it as N/N steps incomplete. The next
+            # sweep retries the DSP path from scratch (stop_rx_dsp has run),
+            # so a transient failure recovers on its own and a persistent one
+            # is visible every sweep rather than as a frozen GUI.
+            return (np.zeros(num_steps, dtype=np.complex128), num_steps, None)
 
         # DSP_FIFO_WORDS is a COMPILE-TIME generic in rx.vhd, and the metadata
         # header hard-codes 2*DSP_FIFO_WORDS as the transfer length. A sweep of
