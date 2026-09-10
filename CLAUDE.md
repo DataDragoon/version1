@@ -393,6 +393,45 @@ re-arms the stream after `STREAM_RESTART_AFTER_S = 1.5` of silence; re-sending i
 idempotent and cheap, so it is done on a timer rather than trying to detect the
 race. Verified by reproducing that exact sequence: 60/60 readings after the fix.
 
+### The standoff lagged by seconds: two bugs in the streamed read (2026-09-11)
+
+Reported from the UI: the standoff "takes a lot of seconds to show new values,
+especially if the difference in the previous and the new distance is large".
+Both causes were in this driver, and measured end to end the fix takes the
+published rate from **2.90 Hz to 6.07 Hz** and the age of a broadcast
+measurement from **p50 175 ms to 81 ms**. A large step (122 <-> 532 mm) now
+settles in **0.74 s**, which is the sensor reacquiring rather than transport lag,
+with **zero** frames discarded over a 40 s run.
+
+**The module emits frames in BURSTS, not on a uniform clock.** Measured at the
+serial layer: inter-frame gaps are bimodal, p50 **100 ms** and p90 **401 ms** --
+roughly four frames 100 ms apart and then a ~400 ms pause, averaging **5.73 Hz**.
+The datasheet's "5 Hz frame rate" is the average, not the cadence, and anything
+reasoning about lidar timing (the BG-model track especially) should assume
+~400 ms worst-case between measurements, not 182 ms.
+
+**`self.ser.read(64)` was blocking the FULL timeout every call.** pyserial's
+`read(n)` waits for n bytes *or* the timeout, and 64 bytes is ~7 frames -- more
+than a burst -- so every read sat out the whole 300 ms and then handed back a
+pile of frames at once. Measured 2.8 reads/s against a sensor emitting 5.73, the
+surplus thrown away as stale. It is now `read(1)` followed by `in_waiting`, which
+returns as soon as one frame completes: **5.88 Hz with 0 discarded.** The lesson
+generalises -- **never size a blocking serial read by how much you would like to
+have; size it by the smallest amount that lets you make progress.**
+
+**A streamed read returns the NEWEST buffered frame, not the oldest, and that is
+load-bearing.** Reported from the UI 2026-09-11: the standoff "takes a lot of
+seconds to show new values, especially if the difference is large". Serving the
+queue FIFO lags reality by the whole backlog and **never catches up** -- each
+read consumes one frame while the module produces another, so the queue length,
+and therefore the lag, persists indefinitely. Measured against the shipped
+function with a 20-frame backlog: oldest-first returns a value **1140 mm** and
+**3.5 s** out of date, newest-first returns the current one and empties the
+queue. Taking the newest also makes a backlog self-limiting rather than
+unbounded. `TF40S.skipped` counts what was discarded -- non-zero means the
+consumer is behind the sensor, and `stream.py` reports it (rate-limited, and
+only when non-zero).
+
 **Expect the first read or two after opening to return None** regardless -- the
 module takes a moment to begin streaming. `stream.py` handles it (the standoff is
 simply null until frames arrive); anything new that opens the driver should too,

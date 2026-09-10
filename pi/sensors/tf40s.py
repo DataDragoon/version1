@@ -126,6 +126,9 @@ class TF40S:
         self._buf = b''
         self._continuous = False
         self._last_start = 0.0
+        # Frames discarded as stale by _scan_newest. Non-zero means this consumer
+        # is not keeping up with the sensor; a healthy loop leaves it near 0.
+        self.skipped = 0
         self.ser = serial.Serial(port, baudrate=baudrate, timeout=timeout)
         self.ser.reset_input_buffer()
         # The module emits `01 03 02 00 00 B8 44` when EN goes high and it
@@ -163,21 +166,52 @@ class TF40S:
                                reg >> 8, reg & 0xFF, count >> 8, count & 0xFF]))
         self.ser.flush()
 
-    def _next_stream_frame(self, deadline):
-        """Pull the next CRC-valid 9-byte reply out of the continuous stream.
+    def _scan_newest(self):
+        """Return the NEWEST CRC-valid frame in the buffer, discarding older ones.
+
+        NEWEST, not oldest, and that is the whole point. This is a distance
+        sensor: if frames have queued up, the stale ones are worthless, and
+        serving them FIFO means the reading lags reality by the whole backlog
+        and NEVER catches up -- each read consumes one frame while the module
+        produces another, so the queue length, and therefore the lag, persists.
+        Reported from the UI as a standoff taking seconds to reflect a move and
+        worst after a large change, which is what a queue drained one entry per
+        read looks like.
+
+        Taking the newest also makes a backlog self-limiting instead of
+        unbounded: however far behind the consumer falls, the next read is
+        current again.
 
         Resynchronises by scanning, because the buffer can start mid-frame after
         a dropped byte -- the CRC is what decides, never the position.
         """
-        while True:
-            i = 0
-            while i + 9 <= len(self._buf):
-                f = self._buf[i:i + 9]
-                if (f[0] == self.address and f[1] == _READ_HOLDING and f[2] == 4
-                        and crc16(f[:7]) == (f[7] | (f[8] << 8))):
-                    self._buf = self._buf[i + 9:]
-                    return f[3:7]
+        found = None
+        i = 0
+        while i + 9 <= len(self._buf):
+            f = self._buf[i:i + 9]
+            if (f[0] == self.address and f[1] == _READ_HOLDING and f[2] == 4
+                    and crc16(f[:7]) == (f[7] | (f[8] << 8))):
+                if found is not None:
+                    self.skipped += 1        # the previous one was stale
+                found = f[3:7]
+                i += 9
+            else:
                 i += 1
+        if found is not None:
+            self._buf = b''   # everything before the newest frame is older still
+        return found
+
+    def _next_stream_frame(self, deadline):
+        """Return the newest streamed reply, waiting for one if none is buffered."""
+        while True:
+            # Take everything already delivered before deciding, so a backlog is
+            # collapsed in ONE call rather than one frame per call.
+            waiting = self.ser.in_waiting
+            if waiting:
+                self._buf += self.ser.read(waiting)
+            frame = self._scan_newest()
+            if frame is not None:
+                return frame
             # Keep only a partial frame's worth; anything older cannot start one.
             if len(self._buf) > 8:
                 self._buf = self._buf[-8:]
@@ -191,9 +225,19 @@ class TF40S:
                 else:
                     self.last_error = 'no stream frame'
                 return None
-            chunk = self.ser.read(64)
+            # read(1), NOT read(64). pyserial's read(n) blocks until n bytes
+            # OR the timeout, so asking for 64 (~7 frames) made every call wait
+            # the full 300 ms timeout and swallow a whole burst of frames --
+            # measured 2.8 reads/s against a sensor emitting 5.73, with the
+            # surplus discarded as stale. Waiting for ONE byte and then taking
+            # whatever else has landed returns as soon as a frame completes, so
+            # the loop runs at the sensor's real rate and nothing is dropped.
+            chunk = self.ser.read(1)
             if chunk:
                 self._buf += chunk
+                extra = self.ser.in_waiting
+                if extra:
+                    self._buf += self.ser.read(extra)
 
     def _transact(self, body, expected_data_bytes):
         """Send one Modbus request, return its data payload, or None.

@@ -117,8 +117,23 @@ async def lidar_poll_loop(lidar, state, rate=LIDAR_POLL_HZ):
     interval = 1.0 / rate if rate and rate > 0 else 0.0
     last_dist = None
     last_pub = 0.0
+    # A streaming driver discards frames it could not keep up with. That is the
+    # right behaviour (freshness beats completeness for a standoff) but it is
+    # also the only evidence that this loop is falling behind, and the symptom
+    # of NOT noticing is a standoff that lags reality by the whole backlog. So
+    # it is reported -- but only when non-zero and at most every 10 s, because a
+    # line that prints unconditionally is one the operator learns to ignore.
+    skip_report_t = time.monotonic()
+    skip_seen = 0
     while True:
         t0 = time.monotonic()
+        if t0 - skip_report_t >= 10.0:
+            grew = getattr(lidar, 'skipped', 0) - skip_seen
+            if grew:
+                skip_seen = lidar.skipped
+                print(f"NOTE: LiDAR dropped {grew} stale frame(s) in the last "
+                      f"{t0 - skip_report_t:.0f}s -- this loop is behind the sensor")
+            skip_report_t = t0
         try:
             dist = await loop.run_in_executor(None, lidar.read_distance)
             state['dist'] = dist
