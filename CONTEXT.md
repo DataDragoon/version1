@@ -13,7 +13,7 @@ not what is beyond it.
 | Component | Model | Interface | Role |
 |-----------|-------|-----------|------|
 | Compute | Raspberry Pi (with AI HAT+) | — | On-board control, sensor fusion, data capture |
-| LiDAR | TF-LC02 | UART (serial) | Range/distance reference |
+| LiDAR | TF40-S | UART (Modbus RTU, 9600) | Range/distance reference |
 | IMU | BNO085 (was MPU-6500 until 2026-08-24) | I2C | Orientation, acceleration, gyro |
 | SDR | bladeRF | USB | SFCW radar TX/RX |
 | Antennas | 2x Vivaldi | SMA to bladeRF | Wideband TX and RX |
@@ -124,7 +124,7 @@ does need real power, not just I2C soft reset, to leave that state. Fill in the 
 pin and RST/PS status here next time the wiring is physically checked instead of leaving
 this as a known gap.
 
-## Wiring — TF-LC02 LiDAR (UART)
+## Wiring — TF40-S LiDAR (UART)
 
 **Moved to UART3 (2026-08-24) after UART0's receiver was found dead** — see CLAUDE.md's
 LiDAR silent-serial investigation for the full diagnostic trail (loopback + `TIOCGICOUNT`
@@ -132,12 +132,18 @@ testing isolated it to UART0's RX peripheral specifically, not the module, not t
 not the Pi's GPIO pins themselves). VCC is 3.3V and not shared with the IMU, confirmed
 correct and unchanged throughout.
 
-| TF-LC02 Pin | Raspberry Pi | Notes |
+**LiDAR replaced 2026-09-11: TF-LC02 → TF40-S.** Same four signal connections, but the
+TF40-S is a **5-pin** part and speaks a different protocol at a different rate — 9600 baud
+Modbus RTU, not 115200 with `55 AA` framing. Driver is `pi/sensors/tf40s.py`; `tflc02.py`
+is deleted.
+
+| TF40-S Pin | Raspberry Pi | Notes |
 |---|---|---|
-| VCC | 3.3V rail | Not shared with IMU |
-| GND | Pin 6 (GND) | Common ground |
-| TX | Pin 21 (GPIO 9 / RXD3) | LiDAR TX → Pi RX |
-| RX | Pin 24 (GPIO 8 / TXD3) | Pi TX → LiDAR RX |
+| 1 VCC | 3.3V rail | **Not 5V tolerant** — signals must be 3.3V too. Draws ~180 mA |
+| 2 GND | Pin 6 (GND) | Common ground |
+| 3 TTL_TXD | Pin 21 (GPIO 9 / RXD3) | LiDAR TX → Pi RX |
+| 4 TTL_RXD | Pin 24 (GPIO 8 / TXD3) | Pi TX → LiDAR RX |
+| 5 EN_PWR | shorted to 3.3V (pulled high) | **Required** — EN low = low-power, module answers nothing |
 
 `uart3-pi5` overlay enabled in `config.txt` (`uart0-pi5` disabled, left commented rather than
 removed). Device: `/dev/ttyAMA3` (was `/dev/serial0`/`ttyAMA10` — do not revert to that, its
@@ -146,8 +152,12 @@ receiver is dead). Serial console disabled.
 ## LiDAR → Antenna Offset (measured 2026-08-28)
 
 **165 mm measured; 160 mm used** (5 mm buffer so a true zero-standoff pose reports
-slightly positive). With the antenna aperture placed against the wall, the TF-LC02 reads
-**164.83 mm ± 0.68**. Standoff = `lidar_reading − offset`, so real operation spans a lidar
+slightly positive). With the antenna aperture placed against the wall, the TF-LC02 read
+**164.83 mm ± 0.68**. **That figure is for the TF-LC02. The TF40-S replaced it 2026-09-11
+and the offset is now 75 mm** (`localStorage.lidar_antenna_offset_mm_v2`, key versioned so
+browsers do not keep the TF-LC02 value). Still per-mounting -- re-measure after any re-mount.
+Note this is separate from the TF40-S's own `RANGE_OFFSET_MM` decode constant, which
+corrects the raw sensor word; see CLAUDE.md. Standoff = `lidar_reading − offset`, so real operation spans a lidar
 reading of roughly **165–315 mm** for 0–150 mm of standoff.
 
 The value was hardcoded at 315 mm in `App.jsx` until 2026-08-28 and did not match this
@@ -247,7 +257,7 @@ Pi and groundstation are testable without the rig.
 - [x] Context documented
 - [x] Hardware connections (IMU + LiDAR wired and tested)
 - [x] IMU driver (BNO085 over I2C, was MPU-6500)
-- [x] LiDAR driver (TF-LC02 over UART)
+- [x] LiDAR driver (TF40-S, Modbus RTU over UART — replaced TF-LC02 2026-09-11)
 - [x] Combined sensor WebSocket stream (port 9001)
 - [x] Groundstation UI — IMU + LiDAR debug panel
 - [x] IMU calibration (gyro bias + accel bias at startup, persisted to imu_cal.json)

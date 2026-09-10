@@ -1,7 +1,8 @@
 """BNO085 IMU driver over I2C (SHTP / SH-2 protocol).
 
 Raw SHTP implementation over smbus2 rather than adafruit-blinka: this repo's other
-sensor drivers (mpu6500.py, tflc02.py) are direct register/byte-protocol drivers with
+sensor drivers (tf40s.py, and formerly mpu6500.py/tflc02.py) are direct
+register/byte-protocol drivers with
 no framework dependency, and adafruit_bno08x has a real bug conflating host-TX and
 device-RX sequence numbers per channel (see its __init__.py `_sequence_number` TODO) —
 harmless here since we track our own independently, but not something to depend on

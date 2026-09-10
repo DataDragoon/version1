@@ -556,12 +556,19 @@ export default function App() {
   // subtraction adds energy instead of removing it, which manufactures targets.
   // Hence the geometry stamp on new models (handleBgModelAction 'build') and the
   // out-of-span reporting in sfcwProcessed below.
+  // 75 mm for the TF40-S (set 2026-09-11 from the bench). The KEY IS VERSIONED
+  // because the module changed: the old `lidar_antenna_offset_mm` holds a value
+  // measured against the TF-LC02, a physically different part, so a browser that
+  // has run this panel before would otherwise keep an offset that is simply wrong
+  // for the sensor now fitted. Same reasoning as bgmodel_cont_max_speed_v2.
+  // Still a PER-MOUNTING quantity -- re-measure after any re-mount by putting the
+  // antenna aperture against the wall and reading the lidar.
   const [lidarOffsetMm, setLidarOffsetMmState] = useState(() => {
-    const v = parseFloat(localStorage.getItem('lidar_antenna_offset_mm'));
-    return Number.isFinite(v) ? v : 132;
+    const v = parseFloat(localStorage.getItem('lidar_antenna_offset_mm_v2'));
+    return Number.isFinite(v) ? v : 75;
   });
   const setLidarOffsetMm = useCallback((v) => {
-    localStorage.setItem('lidar_antenna_offset_mm', String(v));
+    localStorage.setItem('lidar_antenna_offset_mm_v2', String(v));
     setLidarOffsetMmState(v);
   }, []);
   const lidarOffsetRef = useRef(lidarOffsetMm);
@@ -569,21 +576,22 @@ export default function App() {
 
   // Distinct lidar readings seen since the last sweep. Deduped by `lidar_seq`
   // (added to the Pi packet 2026-08-28): the stream broadcasts at ~50 Hz while
-  // the LiDAR is polled at 20 Hz and only updates internally at ~17 Hz, so most
-  // packets repeat the previous reading. Averaging the repeats would understate
+  // the TF40-S measures at 5.5 Hz, so most packets repeat the previous reading. Averaging the repeats would understate
   // the spread and silently weight each reading by how long it happened to be
   // held, so `lidar_n` and `lidar_std` recorded on each sweep would be fiction.
   const lidarAccumRef = useRef([]);
   const lidarLastSeqRef = useRef(null);
   // Most recent GENUINELY-FRESH reading and when it arrived. Needed because the
-  // sweep period (65 ms at the 2048-sample RX buffer, 2026-09-06) is now SHORTER
-  // than the TF-LC02's own update period (~60-90 ms internally, 11-17 Hz
-  // measured), so whether any given sweep window contains a fresh reading is a
-  // phase race -- lidar_n === 0 on a large fraction of sweeps is now the normal,
-  // healthy state, not a fault. Verified live while diagnosing the flapping
-  // "standoff is stale" warning: the sensor was delivering a perfectly clean
-  // 16.2 fresh readings/s with zero seq gaps while the warning strobed at the
-  // sweep rate. A sweep with no fresh reading falls back to this one if it is
+  // sweep period (27 ms in NIOS mode) is far SHORTER than the LiDAR's own update
+  // period, so whether any given sweep window contains a fresh reading is a
+  // phase race -- lidar_n === 0 on most sweeps is the normal, healthy state, not
+  // a fault. Verified live while diagnosing the flapping "standoff is stale"
+  // warning: the sensor was delivering a perfectly clean 16.2 fresh readings/s
+  // with zero seq gaps while the warning strobed at the sweep rate.
+  //
+  // The TF40-S (2026-09-11) makes this MORE pronounced, not less: it measures at
+  // 5.5 Hz where the TF-LC02 ran at 11-17 Hz, so an even larger fraction of
+  // sweeps carry no fresh reading and the carry below does more of the work. A sweep with no fresh reading falls back to this one if it is
   // younger than LIDAR_CARRY_MS; lidar_n stays 0 for that sweep (the count of
   // fresh readings is provenance and must stay honest), only the standoff is
   // carried. Older than LIDAR_CARRY_MS means the lidar has actually gone quiet
@@ -1437,15 +1445,16 @@ export default function App() {
       // near zero means the standoff is stale, not that the model is wrong.
       const accum = lidarAccumRef.current;
       const lidarN = accum.length;
-      // No fresh reading this sweep is NORMAL at 15 Hz sweeps against an
-      // 11-17 Hz lidar (see lidarLastFreshRef above) -- carry the last fresh
+      // No fresh reading this sweep is NORMAL -- sweeps run at 15-36 Hz against
+      // a 5.5 Hz lidar (see lidarLastFreshRef above) -- carry the last fresh
       // reading forward if it is recent, so the standoff (and everything that
       // consumes it, the BG-model inference especially) does not strobe
       // null/non-null at the sweep rate. lidar_n is NOT inflated by the carry.
-      // ~11-16 lidar periods. Was 400 ms, raised 2026-09-06: bursts of invalid
-      // reads (TF-LC02 error_code != 0 at a poor target angle -- documented at
-      // 30-40% of reads on this bench) can outlast 400 ms, and the warning was
-      // still flapping. Carrying a reading this old is safe for what consumes
+      // ~5.5 TF40-S measurement periods (it was ~11-16 under the TF-LC02, so the
+      // slower sensor eats into this margin -- 1 s is now the floor rather than
+      // generous, and it should not be reduced). Was 400 ms, raised 2026-09-06:
+      // bursts of invalid reads at a poor target angle can outlast 400 ms, and
+      // the warning was still flapping. Carrying a reading this old is safe for what consumes
       // it: the lidar's own zero-drift is ~1 mm over MINUTES, so a 1 s-old
       // reading on a static or slowly-moving rig is still sub-mm.
       const LIDAR_CARRY_MS = 1000;
