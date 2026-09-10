@@ -1,0 +1,201 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v9_signaltap.rbf
+=========================================================
+
+Status:  DEBUG IMAGE -- SignalTap instrumented. SETUP TIMING IS CLEAN.
+         First image in this series that is both instrumented AND meets
+         timing. Supersedes v8 for all debug use.
+
+         Setup slack positive at every corner. Two hold violations remain,
+         both on altera_reserved_tck (the JTAG readback clock, not the
+         design) -- see TIMING below.
+
+Build date:        2026-09-10 13:04 IST
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-10_13.04.20
+md5    (.rbf):     12c3d40ecca09e1df56fd14c8e7b8f03 (see .rbf.md5)
+sha256 (.rbf):     0da5cec3c914658432e2bfe0040d22aa4ca78624b4dd6240207562c65f25fc71
+md5    (.sof):     209faf5e430cd67e2024f60183ec21d3
+Source tree:       bladerf-src @ d41819f5, branch sfcw-fpga-dsp.
+                   Same commit as v8. The ONLY difference between v8 and v9 is
+                   the SignalTap configuration -- no RTL changed. 23 untracked
+                   paths, one of which is a build input: signaltap/dsp_fifo.stp.
+                   Archived beside this file as the .stp.
+Quartus:           18.1.0.625 Standard, device 5CEBA9F23C8.
+
+FILES IN THIS RELEASE
+---------------------
+    .rbf    the bitstream, for bladeRF-cli
+    .sof    REQUIRED for SignalTap. Keep paired -- work/output_files/hosted.sof
+            is overwritten by every build.
+    .stp    the SignalTap configuration the .sof was compiled against.
+
+WHY THIS IMAGE EXISTS
+---------------------
+v8 answered "does the chain SEQUENCE" but explicitly could not answer "does the
+FIFO get filled, and with what" -- its own provenance says so under WHAT THIS
+TAP SET CANNOT TELL YOU. v9 adds the missing taps.
+
+    Instance     dsp_fifo
+    Width        83 bits
+    Depth        2048 samples
+    Clock        rx_clock (fifo_writer's clock domain)
+
+    NEW IN v9 -- the FIFO itself:
+      rx:U_rx|sample_fifo_51:\dsp_average:U_dsp_fifo|wr_ptr[6..0]
+      rx:U_rx|complex_div:\dsp_average:U_complex_div|i_out[30..0]
+      rx:U_rx|complex_div:\dsp_average:U_complex_div|q_out[30..0]
+      rx:U_rx|complex_div:\dsp_average:U_complex_div|zero_den
+
+    CARRIED OVER FROM v8:
+      complex_div state.{IDLE,PRODUCTS,OUTPUT}
+      seq_adder U_acc_rx1/U_acc_rx2 state.{ACCUM,FLUSH,WAIT_RESTART}
+      cw_nco phase[0], phase[6]
+      dsp_restart_d, dsp_restart_pulse
+
+    REMOVED FROM v8 -- and this is the whole timing story:
+      synchronizer:U_sync_dsp_path_en|sync
+
+TIMING -- RECOVERED, AND WHY v8's DIAGNOSIS WAS WRONG
+------------------------------------------------------
+                                            v7        v8        v9
+    Slow 1100mV 85C Setup, pll_sclk       +0.409    -3.057    +0.024
+    Slow 1100mV  0C Setup, pll_sclk       +0.203    -2.952    +0.065
+    Fast 1100mV 85C Setup, pll_sclk           --    -1.484    +2.219
+    Fast 1100mV  0C Setup, pll_sclk           --    -1.350    +2.408
+    Negative-slack entries, all corners        0         6         2
+
+v8's provenance attributes the pll_sclk regression to "something between
+c6acd064 and d41819f5, or a fitter placement change" and states that SignalTap
+was not the cause because the failure "appeared at 15:43, BEFORE the SignalTap
+instance was added at 16:05."
+
+That reasoning is incorrect on its own terms: the 15:43 build already contained
+SignalTap. Its fit report carries 152 sld_signaltap references. SignalTap was
+not added at 16:05; it was present at 15:43 too.
+
+The actual cause, from report_timing on the v9-precursor database:
+
+    Slack     : -2.954 (VIOLATED)
+    From Node : synchronizer:U_sync_dsp_path_en|sync
+    To Node   : sld_signaltap:dsp_fifo|acq_data_in_reg[2]
+
+U_sync_dsp_path_en|sync is in the FX3 pclk domain -- it was deliberately moved
+there to fix an earlier CDC bug on the FIFO read-enable path. Tapping it into an
+instance clocked by the AD9361 clock creates a clock crossing straight into
+SignalTap's acquisition register, which STA correctly flags.
+
+Removing that ONE node, changing nothing else, took the AD9361 clock from
+-2.954 to +0.024. The next-worst path in the failing build was -0.002 ns, which
+is what made it obvious the rest of the design was already at zero.
+
+So: v8's slack was never an RTL regression. No source diff between c6acd064 and
+d41819f5 is needed, and none was performed. The RTL in v8 and v9 is identical.
+
+REMAINING VIOLATIONS -- altera_reserved_tck hold, Fast corners
+--------------------------------------------------------------
+    Fast 1100mV 85C Hold, altera_reserved_tck   -0.014
+    Fast 1100mV  0C Hold, altera_reserved_tck   -0.041
+
+Same class as v8's. This is the JTAG clock -- the clock SignalTap uses to shift
+capture data out, not a clock the design runs on. A hold violation here can
+corrupt the READBACK rather than the design. If a capture shows impossible
+state transitions (e.g. both accumulators in two states at once), suspect this
+before believing the RTL is wrong.
+
+Unfixed, and accepted: it affects the observation path only, and the setup
+timing that governs whether the FPGA computes correctly is clean.
+
+WHAT THIS TAP SET CAN AND CANNOT TELL YOU
+------------------------------------------
+CAN:
+    Is the Nios pulsing dsp_restart per retune          dsp_restart_pulse
+    Are the accumulators cycling, and IN STEP            U_acc_rx1/rx2 state
+    Is the divider producing one result per step         state.OUTPUT
+    Is RX2 summing to zero                               zero_den
+    IS THE FIFO BEING FILLED, and how far                wr_ptr
+    WHAT VALUES are going in                             i_out / q_out
+
+CANNOT:
+    Whether the FX3 drains the FIFO. rd_ptr is in the FX3 clock domain and is
+    deliberately NOT tapped -- putting it in this instance is exactly the
+    mistake that cost v8 its timing. It needs a second instance clocked by
+    fx3_pclk. Expect wr_ptr to climb to 51 and stop: fx3_gpif is unmodified,
+    rx_fifo_enough still wants 2048 half-words or a non-empty meta FIFO, and a
+    sweep is ~100 half-words writing no metadata. Nothing collects it.
+
+    dsp_path_en state. Removed for the timing reason above. It is a static
+    config bit, not something that moves during a sweep.
+
+USING IT
+--------
+Two settings are NOT stored in the .stp and must be set each session:
+
+    Storage qualifier -> type: Transitional
+        Without this you capture 26 us of a 290 us step (ACCUM_N = 2900 at
+        10 MS/s) and see one frozen value instead of the sweep.
+
+    i_out / q_out -> Bus Display Format -> Signed
+        These are 31-bit fields. Bit 31 does not exist in the netlist -- the
+        fitter absorbed it, no node of any name matches i_out[31]. A signed
+        31-bit read is exact for any |value| < 2**30, and h in Q14 is around
+        16384, so this is lossless in practice. Check: h = -1.0 is 0xFFFFC000;
+        bits 30:0 are 0x7FFFC000, which as signed-31 is -16384.
+
+A SWEEP MUST BE RUNNING. dsp_restart is pulsed by the Nios inside
+profile_activate(), which only runs on a RETUNE. A static rx start at a fixed
+frequency leaves both accumulators parked in WAIT_RESTART and wr_ptr at 0 --
+indistinguishable from a broken design. TX must be on too, or RX2 has no
+reference and zero_den goes high.
+
+READING IT
+----------
+    wr_ptr climbing 0->51 then stopping     working; FIFO full, FX3 not draining
+    i_out/q_out changing per step           the FIFO contents; /16384 for h
+    wr_ptr 0, acc in WAIT_RESTART           no retunes happening
+    wr_ptr 0, acc in FLUSH/ACCUM, frozen    no samples; check rx_enable, rx_mux_sel
+    acc_rx1 and acc_rx2 in DIFFERENT states channels not arriving together --
+                                            the divider is latching a mismatched
+                                            pair, and every result is wrong
+    state.OUTPUT pulses, wr_ptr stuck       results produced but dropped (full)
+    zero_den = 1                            RX2 summed to zero
+
+RESOURCES
+---------
+                        v7        v8        v9      delta v8->v9
+    Logic (ALMs)      8,476     8,715     8,991         +276
+    Registers        18,079    18,663    19,442         +779
+    DSP blocks           34        34        34            0
+    RAM blocks           --       319       333          +14
+    Block memory bits    --  2,539,968 2,681,280    +141,312
+
+Growth is the wider capture buffer: 83 bits x 2048 deep against v8's 14 x 2048.
+
+VERIFICATION
+------------
+No new testbenches were run for v9 -- the RTL is byte-identical to v8, only the
+.stp differs. The simulation evidence that applies is v7's suite, in particular
+the full-scale sweep testbench (rx_sweep_tb: 50 steps x 4096 samples,
+self-checking against a reference model built from the same integers) which
+passed with worst error 1 count in 16384.
+
+That suite exercised the DATAPATH with dsp_restart driven by the testbench and
+the FIFO read directly. It does not cover the two things that gate this image on
+real hardware: whether the Nios actually pulses bit 24, and whether the FX3 ever
+collects the sweep.
+
+Not run on hardware at time of writing.
+
+LOADING
+-------
+    bladeRF-cli -l hostedxA9_niosIIf_sweep_dsp_v9_signaltap.rbf
+
+-l, into RAM. Do not flash. v7 stays in flash as the fallback image.
+
+    quartus_stpw hostedxA9_niosIIf_sweep_dsp_v9_signaltap.stp
+
+Point the SOF Manager at the .sof BESIDE THIS FILE. Use Quartus 18.1 -- the node
+names were extracted from the 18.1 netlist and 25.1std cannot open this
+database.
+
+Note: opening the .stp in quartus_stpw and setting the SOF Manager re-stamps the
+.sof in place -- its md5 changes while the .rbf does not. The .rbf is the
+invariant; check that one.
