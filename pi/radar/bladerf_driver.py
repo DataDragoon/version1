@@ -447,9 +447,9 @@ class BladeRFDriver:
                 -> BLADERF_ERR_INVAL, "Invalid operation or parameter"
 
         because the timestamp enable is a single global GPIO bit, not per
-        direction. PACKET_META requires timestamps, so the moment RX moves to
-        the DSP path TX has to move to SC16_Q11_META as well or sync_config
-        fails outright at stream start.
+        direction. The DSP path's RX is plain SC16_Q11 (start_rx_dsp), so TX
+        must be plain too; pass timestamped=True only if RX is going to use a
+        *_META format, or sync_config fails outright at stream start.
         """
         if self.tx_running:
             return

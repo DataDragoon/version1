@@ -1020,11 +1020,17 @@ class SFCWEngine:
         # float64 expression this replaced: worst relative error 1.4e-5 (-97.2 dB),
         # against a system limited at ~42 dB S_repeat. 55 dB of margin.
         self._ref_tone_c64 = self._ref_tone_scaled.astype(np.complex64)
-        # TX must be timestamped whenever RX is. PACKET_META requires
-        # timestamps and the enable is one global GPIO bit, so mixing
-        # SC16_Q11 on TX with PACKET_META on RX makes sync_config return
-        # BLADERF_ERR_INVAL before the stream ever starts.
-        self.driver.start_tx_dual(timestamped=(self.sweep_mode == 'dsp'))
+        # TX and RX must agree on timestamps: the enable is one global GPIO
+        # bit, and perform_format_config() (bladerf2/common.c) returns
+        # BLADERF_ERR_INVAL if one direction's format needs them and the
+        # other's does not. Every mode now streams plain SC16_Q11 on RX --
+        # dsp mode included, since start_rx_dsp() moved to sample mode in
+        # aafe1c5 -- so TX is plain SC16_Q11 everywhere. (Until 2026-09-11 dsp
+        # mode still started TX as SC16_Q11_META from its PACKET_META days;
+        # start_rx_dsp() then failed sync_config with ERR_INVAL before any
+        # read, and every sweep fell back in ~3 ms: 5299 'fallback' results
+        # in 15 s, nothing ever asked of the FPGA.)
+        self.driver.start_tx_dual(timestamped=False)
         if self.sweep_mode == 'dsp':
             # DELIBERATELY NOT STARTED HERE.
             #
