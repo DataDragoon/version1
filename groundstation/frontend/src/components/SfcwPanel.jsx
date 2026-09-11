@@ -643,9 +643,8 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
               <InfoTile
                 label="S_repeat"
                 value={Number.isFinite(coherenceResult.s_repeat_db)
-                  ? coherenceResult.s_repeat_db.toFixed(1)
+                  ? `${coherenceResult.s_repeat_db.toFixed(1)} dB`
                   : '--'}
-                unit="dB"
               />
             </div>
             <div className="text-[9px] text-[#555] px-1 space-y-0.5">
