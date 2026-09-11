@@ -64,29 +64,45 @@ async def run(mode):
         # sync_config runs), it just has to come from the same place that
         # normally starts sweeps.
         print("setting sweep_mode = {}".format(mode))
-        await send({'cmd': 'sfcw_set_params', 'sweep_mode': mode})
-        await asyncio.sleep(0.5)
 
-        # Read it back so the change is confirmed rather than assumed.
-        await send({'cmd': 'sfcw_get_status'})
-        for _ in range(20):
+        # The server pushes an sfcw_status on connect and after every
+        # command, on top of answering sfcw_get_status. Anything already
+        # queued predates our command, so drain it first, then accept only a
+        # status that actually carries the requested mode. Reading the first
+        # status in the queue reported 'nios' after a successful switch to
+        # 'dsp' (2026-09-11).
+        while True:
             try:
-                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
+                await asyncio.wait_for(ws.recv(), timeout=0.15)
             except asyncio.TimeoutError:
                 break
+
+        await send({'cmd': 'sfcw_set_params', 'sweep_mode': mode})
+        await send({'cmd': 'sfcw_get_status'})
+
+        got = None
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=1.0))
+            except asyncio.TimeoutError:
+                continue
             for blob in (msg, msg.get('data') or {}):
                 if isinstance(blob, dict) and 'sweep_mode' in blob:
                     got = blob['sweep_mode']
-                    print("server now reports sweep_mode =", got)
-                    if got != mode:
-                        print("WARNING: not the mode requested")
-                        return 1
-                    print("\nNow STOP and START the sweep from the GUI for it "
-                          "to take effect.")
-                    return 0
-        print("mode was set, but the server did not report it back; "
-              "stop and start the sweep from the GUI anyway")
-        return 0
+                    if got == mode:
+                        print("server now reports sweep_mode =", got)
+                        print("\nNow STOP and START the sweep from the GUI for it "
+                              "to take effect.")
+                        return 0
+        if got is None:
+            print("mode was set, but the server did not report it back; "
+                  "stop and start the sweep from the GUI anyway")
+            return 0
+        print("server still reports sweep_mode =", got)
+        print("WARNING: not the mode requested (no status carried "
+              "{!r} within 5 s)".format(mode))
+        return 1
 
 
 def main():

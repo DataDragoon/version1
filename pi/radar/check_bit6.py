@@ -22,10 +22,12 @@ Verdict table:
 
     bit 12 does not read back      -> the write (or the read) is not reaching
                                       the Nios at all; host/USB/Nios problem
-    bit 12 ok, bit 6 reads 0       -> the loaded image is NOT v10 (or older
-                                      than v10): load it with
-                                      bladeRF-cli -l fpga/images/hostedxA9_niosIIf_sweep_dsp_v10_signaltap.rbf
-    bit 12 ok, bit 6 reads 1       -> the write lands and v10 is running; if
+    bit 12 ok, bit 6 reads 0       -> the loaded image is older than v10
+                                      (typically the board's flash image
+                                      after a power cycle): load the current
+                                      one, e.g.
+                                      bladeRF-cli -l .../fpga/images/hostedxA9_niosIIf_sweep_dsp_v11_signaltap.rbf
+    bit 12 ok, bit 6 reads 1       -> the write lands and v10+ is running; if
                                       the FX3 still delivers raw samples the
                                       fault is inside the FPGA between
                                       nios_gpo_slv(6) and the rx.vhd mux
@@ -105,15 +107,16 @@ def main():
             return 2
         if not ok6:
             print("VERDICT: writes land, but this image has no bit-6 readback: "
-                  "the running FPGA is NOT v10. Load it:")
-            print("  bladeRF-cli -l fpga/images/hostedxA9_niosIIf_sweep_dsp_v10_signaltap.rbf")
+                  "the running FPGA is older than v10. Load the current image:")
+            print("  bladeRF-cli -l /home/sfr/vikram_fpga_dump/version1/fpga/images/"
+                  "hostedxA9_niosIIf_sweep_dsp_v11_signaltap.rbf")
             print("then run this again; bit 6 must read back before the DSP "
                   "path can be judged.")
             return 1
-        print("VERDICT: v10 is running and bit 6 lands in the control register. "
-              "If the FX3 still delivers raw samples with bit 6 set, the fault "
-              "is inside the FPGA: nios_gpo_slv(6) -> U_sync_dsp_path_en -> "
-              "rx.vhd mux.")
+        print("VERDICT: a v10-or-later image is running and bit 6 lands in the "
+              "control register. (v10 and v11 both report 0.16.0; the version "
+              "number cannot tell them apart -- the md5 of the file you loaded "
+              "can: v10 8079e007..., v11 4d0ff508....)")
         return 0
     finally:
         d.close()
