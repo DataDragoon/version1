@@ -834,7 +834,6 @@ class BladeRFDriver:
         nsamp = getattr(self, '_dsp_buf_samples', 2048)
         buf = bytearray(nsamp * 4)
 
-        reasserted = False
         raw_seen = 0
         timeout_ms = int(timeout_s * 1000)
         t_start = time.monotonic()
@@ -890,27 +889,36 @@ class BladeRFDriver:
                         + 1j * (payload[1::2].astype(np.float32) / scale)
                         ).astype(np.complex64)
 
-            # Not a DSP burst. Raw samples mean the FIFO mux was on the stock
-            # path when this buffer was captured: bit 6 not in effect.
-            #
-            # Re-assert it ONCE, then keep READING -- do not drain. A genuine
-            # burst may already be queued behind the raw ones (the mux moved
-            # while they were in flight), and a drain would throw it away and
-            # then wait a whole sweep for the next. Reading through the check
-            # consumes the raw backlog one buffer at a time and returns the
-            # first real burst it meets.
+            # Not a DSP burst: raw samples, captured while the FIFO mux was on
+            # the stock path. A handful are EXPECTED after every
+            # start_rx_dsp() / dsp_resync() -- the stock FIFO streams for the
+            # milliseconds between enable_module and bit 6 taking effect --
+            # so read through them silently; a genuine burst may be queued
+            # right behind. Only a whole ring of them means bit 6 is not in
+            # effect at all, and that is diagnosed below.
             raw_seen += 1
-            if not reasserted:
-                print("[bladerf] DSP read: buffer is raw samples, not a DSP "
-                      "burst ({} distinct values in the {}-DWORD tail) -- "
-                      "dsp_path_en (config_gpio bit {}) is not in effect; "
-                      "re-asserting it and reading on".format(
-                          len(np.unique(tail[:256])), tail.size,
-                          self.DSP_PATH_BIT))
-                self.dsp_path_enable(True)
-                reasserted = True
 
         print("[bladerf] DSP read: {} consecutive raw buffers and no DSP burst "
-              "-- dsp_path_en (bit {}) is not taking effect on the FPGA; this "
-              "is not a host problem".format(raw_seen, self.DSP_PATH_BIT))
+              "-- dsp_path_en (bit {}) is not taking effect on the FPGA "
+              "(check_bit6.py tells whether the write lands)".format(
+                  raw_seen, self.DSP_PATH_BIT))
         return None
+
+    def dsp_resync(self):
+        """Realign the FPGA's DSP FIFO with the next sweep, keeping the stream.
+
+        v11 clears the DSP result FIFO, its sweep counter and the FIFO gate
+        whenever dsp_path_en is LOW (rx.vhd), so dropping bit 6 and raising it
+        again throws away a partial sweep -- the leftover of a step whose
+        accumulation was cut short -- without touching the RX stream. Before
+        this the only way to clear it was stop_rx_dsp()/start_rx_dsp(): a
+        sync_config, two enable_module calls and a ring drain, about a second.
+
+        On v9/v10 the toggle is harmless but clears nothing; the partial sweep
+        then stays and the next burst spans two sweeps.
+
+        Raw buffers land in the ring while bit 6 is low; dsp_read_sweep reads
+        through them.
+        """
+        self.dsp_path_enable(False)
+        self.dsp_path_enable(True)

@@ -187,7 +187,14 @@ NIOS_MIN_DWELL = 4096
 # cycles) at COMPILE time. Both must fit inside one step or seq_adder's restart
 # throws away a part-accumulated window and that step returns garbage. Changing
 # this needs a new FPGA image, not a set_params call.
-DSP_MIN_DWELL = 1088 + 2900
+# rx.vhd DSP_FLUSH_N + DSP_ACCUM_N of the image in the board. v9/v10 were
+# 1088 + 2900 = 3988; v11 is 1088 + 2400 = 3488. This is the floor the FPGA
+# can physically meet, not a safe dwell: the Nios restart jitters by tens of
+# microseconds, so the dwell must leave hundreds of samples above it.
+DSP_MIN_DWELL = 1088 + 2400
+# Consecutive missed bursts before the RX stream is torn down and rebuilt
+# instead of just resynced (see _sweep_core_dsp).
+DSP_MISSES_BEFORE_REBUILD = 5
 # Hard cap on a bulk capture, in RX buffers (~0.25 s at 2048-sample buffers).
 # A pipelined inflight capture between on-demand sweeps (warm B-scan mode)
 # would otherwise grow without bound at ~78 MB/s. The sweep itself completes
@@ -2115,15 +2122,30 @@ class SFCWEngine:
             budget = (num_steps * dwell) / float(self.driver.sample_rate) + 1.0
             h_cal = self.driver.dsp_read_sweep(num_steps, timeout_s=budget)
             if h_cal is None:
-                # A failed read usually means the sync worker stopped, and it
-                # will not recover on its own -- every later read would return
-                # the same error forever. Tear the stream down so the next
-                # sweep builds a fresh one.
+                # No burst: the FIFO ended the sweep short of num_steps (a
+                # step's accumulation was cut by the next restart), and the
+                # leftover would make the NEXT burst span two sweeps. Toggle
+                # bit 6 -- v11 clears the FIFO on that -- and keep the stream:
+                # two GPIO writes instead of the ~1 s teardown/rebuild.
+                # Only a run of misses gets the full rebuild, in case the
+                # sync worker itself has died.
+                self._dsp_misses = getattr(self, '_dsp_misses', 0) + 1
+                if self._dsp_misses >= DSP_MISSES_BEFORE_REBUILD:
+                    self._dsp_misses = 0
+                    try:
+                        self.driver.stop_rx_dsp()
+                    except Exception:
+                        pass
+                    return fallback("DSP FIFO read returned no complete sweep "
+                                    f"{DSP_MISSES_BEFORE_REBUILD} times running; "
+                                    "rebuilding the RX stream")
                 try:
-                    self.driver.stop_rx_dsp()
+                    self.driver.dsp_resync()
                 except Exception:
                     pass
-                return fallback("DSP FIFO read returned no complete sweep")
+                return fallback("DSP FIFO read returned no complete sweep; "
+                                "FIFO resynced for the next one")
+            self._dsp_misses = 0
         except Exception as e:
             return fallback(f"DSP sweep raised {e!r}")
 
