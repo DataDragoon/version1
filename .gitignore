@@ -19,3 +19,4 @@ data/
 recordings/
 pi/sensors/imu_cal.json
 groundstation/models
+pi/rover/rover_state.json
