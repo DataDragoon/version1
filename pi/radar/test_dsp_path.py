@@ -141,7 +141,7 @@ def _mag_stats(hs):
             'min': mags[0], 'max': mags[-1]}
 
 
-async def run_mode(ws, mode, seconds):
+async def run_mode(ws, mode, seconds, dwell=None):
     print(f"--- {mode}: stopping sweep")
     if not await _stop(ws):
         print("FAIL  could not stop the sweep (status never reported running=False)")
@@ -152,6 +152,12 @@ async def run_mode(ws, mode, seconds):
         print(f"FAIL  requested {mode!r} but engine reports {got!r} "
               f"(no status carried {mode!r} within 5 s of sfcw_set_params)")
         return None
+    if dwell is not None:
+        await _flush(ws)
+        await ws.send(json.dumps({'cmd': 'sfcw_set_params', 'nios_dwell': int(dwell)}))
+        st = await _drain_until(ws, 'sfcw_status', timeout=5)
+        print(f"--- {mode}: nios_dwell requested {dwell}, engine reports "
+              f"{st.get('nios_dwell') if st else '?'} samples per step")
     await ws.send(json.dumps({'cmd': 'sfcw_start'}))
     print(f"--- {mode}: started, collecting for {seconds:.0f} s")
     results, errors = await _collect(ws, seconds)
@@ -244,7 +250,7 @@ async def main(args):
                 print(f"      nios |h|: median={rs['median']:.4f} "
                       f"min={rs['min']:.4f} max={rs['max']:.4f}")
 
-        r = await run_mode(ws, 'dsp', args.seconds)
+        r = await run_mode(ws, 'dsp', args.seconds, dwell=args.dwell)
         if r is None:
             return 1
         results, errors = r
@@ -277,6 +283,11 @@ if __name__ == '__main__':
                     help='capture a nios-mode run first and compare |h|')
     ap.add_argument('--leave', default='dsp', choices=['dsp', 'nios', 'standard'],
                     help="sweep mode to leave the engine in (default dsp)")
+    ap.add_argument('--dwell', type=int, default=None,
+                    help="samples per step for the dsp run (nios_dwell; engine "
+                         "rounds to 64 and floors at 4096). The FPGA needs "
+                         "FLUSH_N+ACCUM_N = 3988 of it per step; 4096 leaves "
+                         "108 samples of margin. Try 8192 to test that margin.")
     a = ap.parse_args()
     try:
         sys.exit(asyncio.run(main(a)))

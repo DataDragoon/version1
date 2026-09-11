@@ -778,15 +778,18 @@ class BladeRFDriver:
         buf = bytearray(nsamp * 4)
         drained = 0
         for i in range(limit):
+            t0 = time.monotonic()
             try:
                 self.device.sync_rx(buf, nsamp, timeout_ms=timeout_ms)
                 drained += 1
             except Exception as exc:
-                # ERR_TIMEOUT (-6): ring empty, which is the goal. The
-                # sync-worker STARTUP race (ERR_UNEXPECTED, -1) can hit the
-                # very first call after sync_config; retry that a few times.
+                # Ring empty, which is the goal. libbladeRF reports the
+                # timed-out wait as -1 (see dsp_read_sweep), so -1 after
+                # ~timeout_ms is the normal end; -1 within a few ms on the
+                # first call is the sync-worker STARTUP race, retried.
                 code = exc.args[0] if getattr(exc, 'args', None) else None
-                if code == -1 and drained == 0 and i < 3:
+                waited_ms = (time.monotonic() - t0) * 1000.0
+                if code == -1 and waited_ms < 50.0 and drained == 0 and i < 3:
                     time.sleep(0.05)
                     continue
                 break
@@ -833,25 +836,43 @@ class BladeRFDriver:
 
         reasserted = False
         raw_seen = 0
+        timeout_ms = int(timeout_s * 1000)
+        t_start = time.monotonic()
         # Bounded by the ring depth: raw buffers are consumed one per
         # iteration, so this can never spin on a stale backlog, and a genuine
         # timeout ends it immediately.
         for attempt in range(RX_RING_DEPTH + 8):
             # sync_rx raises on error and returns None -- there is no count to
             # check in sample mode; a return means the whole buffer was filled.
-            # The retry covers the sync-worker STARTUP race (ERR_UNEXPECTED,
-            # -1) straight after sync_config; see SYNC_STATE_CHECK_WORKER.
+            #
+            # A TIMEOUT ARRIVES AS -1, NOT -6. libbladeRF's thread.h
+            # posix_cond_timedwait() returns -1 on ETIMEDOUT, but
+            # sync.c wait_for_buffer() compares against THREAD_TIMEOUT
+            # (= ETIMEDOUT), never matches, and reports BLADERF_ERR_UNEXPECTED.
+            # So "-1 after >= timeout_ms" means no buffer came, full stop. The
+            # same -1 inside a few ms is the sync-worker STARTUP race straight
+            # after sync_config (SYNC_STATE_CHECK_WORKER); only that is retried.
+            t0 = time.monotonic()
             try:
-                self.device.sync_rx(buf, nsamp,
-                                    timeout_ms=int(timeout_s * 1000))
+                self.device.sync_rx(buf, nsamp, timeout_ms=timeout_ms)
             except Exception as exc:
                 code = exc.args[0] if getattr(exc, 'args', None) else '?'
-                if code == -1 and attempt < 2:
+                waited_ms = (time.monotonic() - t0) * 1000.0
+                if code == -1 and waited_ms < 50.0 and attempt < 3:
                     time.sleep(0.05)
                     continue
+                if code == -1 and waited_ms >= 0.9 * timeout_ms:
+                    print("[bladerf] DSP read: no burst within {:.0f} ms of "
+                          "EXEC{} -- the DSP FIFO did not reach {} results "
+                          "this sweep (a step's accumulation was cut short, "
+                          "or a restart was missed)".format(
+                              (time.monotonic() - t_start) * 1000.0,
+                              " after {} raw buffer(s)".format(raw_seen)
+                              if raw_seen else "", num_steps))
+                    return None
                 print("[bladerf] DSP sweep read failed: {} ({}, code {}) "
-                      "requesting {} samples{}".format(
-                          exc, type(exc).__name__, code, nsamp,
+                      "after {:.0f} ms requesting {} samples{}".format(
+                          exc, type(exc).__name__, code, waited_ms, nsamp,
                           " after {} raw buffer(s)".format(raw_seen)
                           if raw_seen else ""))
                 return None
@@ -859,6 +880,10 @@ class BladeRFDriver:
             raw = np.frombuffer(bytes(buf), dtype='<i4')
             tail = raw[want_dwords:]
             if tail.size and np.all(tail == tail[0]):
+                print("[bladerf] DSP burst {:.0f} ms after EXEC{}".format(
+                    (time.monotonic() - t_start) * 1000.0,
+                    " ({} raw buffer(s) first)".format(raw_seen)
+                    if raw_seen else ""))
                 payload = raw[:want_dwords]
                 scale = float(1 << self.DSP_FRAC_BITS)
                 return ((payload[0::2].astype(np.float32) / scale)
