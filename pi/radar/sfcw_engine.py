@@ -657,38 +657,55 @@ class SFCWEngine:
             'nios_primed': self._nios_primed,
         }
 
-    def run_coherence_test(self, callback=None):
-        """Run 3 consecutive sweeps and compute repeatability + correlation metrics.
+    # Sweeps in a coherence test. Was 3 -- two adjacent pairs, which says
+    # nothing about a 1-in-20 miss or slow drift. 100 sweeps is ~2 s in dsp
+    # mode (48 Hz) and ~3 s in nios mode.
+    COHERENCE_SWEEPS = 100
 
-        Runs in a new thread. Results sent via callback as a dict with type='coherence_result'.
+    def run_coherence_test(self, callback=None, num_sweeps=None):
+        """Run consecutive sweeps and compute repeatability + correlation metrics.
+
+        Runs in a new thread. Results sent via callback as a dict with
+        type='coherence_result'. num_sweeps defaults to COHERENCE_SWEEPS.
         """
         if self.running:
             return
         self.running = True
         self._stop_event.clear()
-        t = threading.Thread(target=self._coherence_test_worker, args=(callback,), daemon=True)
+        n = int(num_sweeps) if num_sweeps else self.COHERENCE_SWEEPS
+        n = max(2, n)
+        t = threading.Thread(target=self._coherence_test_worker,
+                             args=(callback, n), daemon=True)
         t.start()
 
-    def _coherence_test_worker(self, callback):
+    def _coherence_test_worker(self, callback, num_sweeps):
         try:
             self._configure_hardware()
             self._start_tx_rx()
             time.sleep(0.1)
 
             sweeps = []
-            for i in range(3):
+            cores = {}
+            for i in range(num_sweeps):
                 if self._stop_event.is_set():
                     return
-                if callback:
-                    callback({'type': 'progress', 'step': i, 'total': 3, 'freq_mhz': 0})
+                if callback and (i % 10 == 0 or i == num_sweeps - 1):
+                    callback({'type': 'progress', 'step': i, 'total': num_sweeps, 'freq_mhz': 0})
                 result = self._perform_sweep()
                 if result and result.get('type') == 'range_profile':
+                    core = result.get('sweep_core', '?')
+                    cores[core] = cores.get(core, 0) + 1
+                    # A fallback sweep in dsp mode is all zeros by design; it
+                    # must not be scored as a decorrelation.
+                    if core == 'fallback':
+                        continue
                     h_cal = np.array(result['h_cal_real']) + 1j * np.array(result['h_cal_imag'])
                     sweeps.append(h_cal)
 
             if len(sweeps) < 2:
                 if callback:
-                    callback({'error': 'Not enough sweeps completed'})
+                    callback({'error': 'Not enough sweeps completed '
+                                       f'({len(sweeps)} of {num_sweeps}; cores {cores})'})
                 return
 
             reps = []
@@ -706,6 +723,14 @@ class SFCWEngine:
                 )
                 corrs.append(float(corr))
 
+            # S_repeat: signal energy over adjacent-sweep difference energy, /2
+            # (the same figure benchmark_sweep.py reports). Drift-immune.
+            arr = np.array(sweeps)
+            diff = np.diff(arr, axis=0)
+            e_sig = float(np.mean(np.abs(arr) ** 2))
+            e_dif = float(np.mean(np.abs(diff) ** 2))
+            s_repeat_db = 10.0 * np.log10(e_sig / (e_dif / 2.0)) if e_dif > 0 else float('inf')
+
             if callback:
                 callback({
                     'type': 'coherence_result',
@@ -713,7 +738,11 @@ class SFCWEngine:
                     'correlation': corrs,
                     'avg_repeatability': float(np.mean(reps)),
                     'avg_correlation': float(np.mean(corrs)),
+                    'min_correlation': float(np.min(corrs)),
+                    's_repeat_db': float(s_repeat_db),
                     'num_sweeps': len(sweeps),
+                    'requested_sweeps': num_sweeps,
+                    'sweep_cores': cores,
                 })
         except Exception as e:
             if callback:

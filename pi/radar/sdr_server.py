@@ -206,7 +206,10 @@ class SDRServer:
                 if self.sfcw.running:
                     await ws.send(json.dumps({'type': 'error', 'message': 'Stop sweep before running coherence test'}))
                 else:
-                    self.sfcw.run_coherence_test(self._sfcw_callback)
+                    # Optional 'num_sweeps' (default SfcwEngine.COHERENCE_SWEEPS = 100).
+                    n = cmd.get('num_sweeps')
+                    self.sfcw.run_coherence_test(self._sfcw_callback,
+                                                 num_sweeps=int(n) if n else None)
                     await self._broadcast_sfcw_status()
 
             elif action == 'sfcw_get_status':
