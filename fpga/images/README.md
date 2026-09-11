@@ -25,17 +25,29 @@ Together these take the 51-step sweep to **27.5 ms (36.4 Hz)**.
 
 ## Loading it
 
-    bladeRF-cli -l fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf
+**This image is FLASHED TO SPI as of 2026-09-11, so the board autoloads it and
+nothing needs doing after a power cycle.** It was RAM-loaded (`-l`) until then,
+which meant every power cycle silently halved the sweep rate — that is exactly
+how it was lost on 2026-09-11, while the LiDAR was being rewired. The stock
+0.16.0 image is no longer on the board; reverting means re-downloading it from
+Nuand.
 
-**`-l` loads into RAM and reverts on power cycle. That is deliberate — do not
-use `-L` (SPI flash) without deciding to.** Confirm it took with
-`bladeRF-cli -e info`, which should say *"configured by USB host"*.
+    bladeRF-cli -L fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf   # flash, persists
+    bladeRF-cli -l fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf   # RAM, for testing
 
-If the board has been power-cycled and reverted to the stock flash image,
-nothing breaks: `SFCWEngine` detects the dead sample counter at the first EXEC,
-prints
+**Do not verify with the "configured by ..." string — its meaning flipped when
+this was flashed.** *"configured from SPI flash"* used to mean the stock image
+and was the signature of the fault; it now means this image loaded correctly.
+*"configured by USB host"* now means something was `-l`-loaded over the top.
+
+**Verify behaviourally instead:** run a sweep and read `sweep_core` on
+`sfcw_result` — `nios` is working, `standard` means the capability latch tripped.
+The rate alone also identifies it: ~37 Hz autonomous, **~18 Hz = this image but
+no NIOS sweep**, ~15 Hz = the old II/e image.
+
+If the sample counter is ever dead, nothing breaks: `SFCWEngine` detects it at
+the first EXEC, prints
 
     [sfcw] NIOS autonomous sweep unavailable on this FPGA image ...
 
 and runs the standard host-driven sweep for the rest of the session (~18 Hz).
-Reload the image and restart the sweep to get 36 Hz back.

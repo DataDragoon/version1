@@ -5129,13 +5129,23 @@ the current `sfcw_engine.py`. Confirmed working on the GUI by the operator, incl
 target-in / target-out case that broke an earlier draft (see "the resolver that had to
 go" below). **The image is committed at `fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf`**
 (sha256 `3449d1af...`, provenance + load instructions in `fpga/images/README.md`).
-**It is RAM-loaded only (`bladeRF-cli -l fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf`)
-and reverts on power cycle -- SPI flash still holds the OLD image; flashing (`-L`) is the
-operator's call.** After a
-power cycle, reload it or the engine prints one line ("NIOS autonomous sweep unavailable
-on this FPGA image") and runs the standard sweep for the session: the capability latch
-(`_nios_unavailable`) detects the dead sample counter at the first EXEC, so a stock image
-degrades to exactly the old behaviour rather than churning. `docs/nios_sweep.md` (copied
+**FLASHED TO SPI 2026-09-11, so it now survives a power cycle and needs no host
+action.** It was RAM-loaded only (`-l`) until then, which cost a silent 2x regression
+every power cycle -- see "The 18 Hz regression" below. `bladeRF-cli -L
+fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf` is what flashed it; the stock 0.16.0
+image is no longer on the board, so reverting means re-downloading it from Nuand.
+
+**THE DIAGNOSTIC INVERTED WHEN IT WAS FLASHED, and this is the trap.** `bladeRF-cli -e
+info` reporting *"configured from SPI flash"* used to mean the STOCK image and was the
+signature of the fault; it now means the II/f image loaded correctly and is the HEALTHY
+state. *"configured by USB host"* means someone `-l`-loaded something over the top.
+**The string is no longer diagnostic on its own** -- the only reliable check is
+behavioural: run a sweep and read `sweep_core` on `sfcw_result` (`nios` = working,
+`standard` = the latch tripped), or just look at the rate. If the sample counter is ever
+dead again the engine prints one line ("NIOS autonomous sweep unavailable on this FPGA
+image") and runs the standard sweep for the session: the capability latch
+(`_nios_unavailable`) detects it at the first EXEC, so a stock image degrades to exactly
+the old behaviour rather than churning. `docs/nios_sweep.md` (copied
 from `fpga_branch`, plus a 2026-09-07 II/f addendum) holds the protocol and firmware side.
 
 Measured through the full stack (`start.py` + one websocket client), 51 steps, settle 0:
@@ -5306,6 +5316,36 @@ never guess).
   corrupted several blocks during this session and cost real debugging time; repeated
   start/stop cycling also still degrades the device (recover by restarting `start.py`
   after a 15-20 s gap, or `usbreset` if it wedges).
+
+### The 18 Hz regression: the FPGA image silently reverted (2026-09-11)
+
+Reported as "the sweeps are running at 18fps, from the 37 we had already achieved".
+Nothing had slowed down -- **the NIOS autonomous sweep was not running at all**, and
+18 Hz is simply what the II/f image does host-driven. The bench had been power-cycled
+while the LiDAR was rewired back to the TF-LC02, the image was RAM-loaded only, so the
+FPGA reverted to the stock SPI image and the capability latch tripped at the first EXEC.
+Fixed by flashing the image to SPI (`-L`), verified 35.9 Hz with 0.75-1.00% fallbacks.
+
+**18 Hz is a DIAGNOSIS, not just a number, and the rate table above is the lookup.**
+The three regimes are far enough apart to identify the cause from the rate alone:
+~37 Hz = NIOS autonomous; **~18 Hz = II/f image present but NIOS not running**;
+~15 Hz = the old II/e image. So ~18 Hz specifically means the sweep firmware is
+unreachable while the II/f image is loaded -- look at the FPGA image and the latch,
+never at `settle_count` or the host path.
+
+**Confirm it with `sweep_core` on `sfcw_result`, which names the cause directly**
+(`nios` / `fallback` / `standard`) -- that field exists precisely so this does not have
+to be inferred from a rate. A 100% `standard` block is the latch; a 100% `fallback`
+block is the span gate refusing every sweep, which is a different fault with the same
+rate.
+
+**The failure is quiet by design and that is the real cost here.** Degrading to the
+standard sweep is the right behaviour -- it is a correct, slower sweep, not a broken one
+-- but it announces itself with a single stdout line at startup that nobody is watching,
+and the GUI's rate readout is the only other evidence. A halving of throughput should
+probably be louder than one line; it went unnoticed long enough to be reported as a
+mystery. Note `start.py` still does not touch the FPGA, so the flash is now the only
+thing keeping this from recurring.
 
 ## The sweep "stuck in websocket": one slow client froze every client (2026-09-10)
 
