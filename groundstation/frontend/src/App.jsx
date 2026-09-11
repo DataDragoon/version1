@@ -29,6 +29,27 @@ const SPEED_OF_LIGHT = 299792458;
 // this repo before with duplicated kernels (CFAR, SAFT), and here the failure
 // would be invisible: both grids would still render, disagreeing about what a
 // cell contains.
+// Readings older than this are dropped from the lidar/pose accumulators before a
+// sweep reads them, which bounds both arrays without needing a clear-on-stop
+// hook anywhere. Generous on purpose: the job is to exclude the IDLE period, not
+// to trim a legitimately slow sweep, and the slowest sweep this system has ever
+// run is ~550 ms (2026-08-20, 151 steps) against 28-230 ms today. A reading 2 s
+// old is in any case already past LIDAR_CARRY_MS -- past the age at which App
+// itself calls the standoff stale -- so it cannot belong to the sweep being
+// recorded.
+const ACCUM_WINDOW_MS = 2000;
+// Prune is by AGE; this only says how often to bother doing it, so that an idle
+// tab cannot accumulate without bound between sweeps. Comfortably above what
+// either accumulator holds in one window (~40 lidar, ~100 pose), so it never
+// fires during normal sweeping.
+const ACCUM_PRUNE_AT = 512;
+
+function pruneAccum(ref, nowMs) {
+  if (ref.current.length <= ACCUM_PRUNE_AT) return;
+  const cutoff = nowMs - ACCUM_WINDOW_MS;
+  ref.current = ref.current.filter(r => r.t >= cutoff);
+}
+
 function buildCellRecord({ sweeps, meta, cell, grid, rover, target, roverXStd }) {
   const meanSweep = coherentMean(sweeps, meta.num_steps);
   const mean = (vals) => (vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null);
@@ -573,6 +594,13 @@ export default function App() {
   // packets repeat the previous reading. Averaging the repeats would understate
   // the spread and silently weight each reading by how long it happened to be
   // held, so `lidar_n` and `lidar_std` recorded on each sweep would be fiction.
+  // Entries are { mm, t }, pruned by age -- see ACCUM_WINDOW_MS. They used to
+  // be bare numbers and were cleared ONLY in the sfcw_result handler, so with no
+  // sweep running the array grew at the measurement rate for as long as the tab
+  // was open: a slow leak, and worse, the first sweep of the next session got a
+  // standoff averaged over the entire idle period -- i.e. over wherever the head
+  // happened to be while it was being carried into place -- reported with an
+  // `lidar_n` in the thousands that made it look exceptionally well measured.
   const lidarAccumRef = useRef([]);
   const lidarLastSeqRef = useRef(null);
   // Most recent GENUINELY-FRESH reading and when it arrived. Needed because the
@@ -1370,8 +1398,13 @@ export default function App() {
       const seq = msg.lidar_seq;
       if (seq === undefined || seq === null || seq !== lidarLastSeqRef.current) {
         lidarLastSeqRef.current = seq;
-        lidarAccumRef.current.push(msg.lidar);
-        lidarLastFreshRef.current = { mm: msg.lidar, t: performance.now() };
+        const nowMs = performance.now();
+        lidarAccumRef.current.push({ mm: msg.lidar, t: nowMs });
+        pruneAccum(lidarAccumRef, nowMs);
+        // `piTs` is the Pi's own time.time() at the moment this MEASUREMENT
+        // appeared, the same clock sfcw_result.timestamp uses. Staleness is
+        // judged on it rather than on `t` -- see the carry test below.
+        lidarLastFreshRef.current = { mm: msg.lidar, t: nowMs, piTs: msg.lidar_ts ?? null };
         // Continuous BG capture interpolates standoff at each sweep's own
         // instant, so it needs the measurement TRACK rather than the per-sweep
         // average. `lidar_ts` is the Pi's time.time() at the moment the
@@ -1391,10 +1424,13 @@ export default function App() {
     const a = msg.accel;
     if (Array.isArray(a) && a.length === 3 && a.every(v => typeof v === 'number')) {
       const [fwd, left, up] = a;
+      const poseNow = performance.now();
       poseAccumRef.current.push({
+        t: poseNow,
         roll: Math.atan2(left, up) * 180 / Math.PI,
         pitch: Math.atan2(-fwd, Math.hypot(left, up)) * 180 / Math.PI,
       });
+      pruneAccum(poseAccumRef, poseNow);
     }
   }, []);
 
@@ -1435,7 +1471,11 @@ export default function App() {
       // are actually for is telling a bad standoff apart from a bad model when
       // a sweep does cancel poorly, which was previously impossible: lidar_n
       // near zero means the standoff is stale, not that the model is wrong.
-      const accum = lidarAccumRef.current;
+      // Drop anything that predates this sweep's plausible window before
+      // measuring it. Without this the accumulator spans the whole idle period
+      // since the last sweep (see ACCUM_WINDOW_MS at its declaration).
+      const accumCutoff = performance.now() - ACCUM_WINDOW_MS;
+      const accum = lidarAccumRef.current.filter(r => r.t >= accumCutoff).map(r => r.mm);
       const lidarN = accum.length;
       // No fresh reading this sweep is NORMAL at 15 Hz sweeps against an
       // 11-17 Hz lidar (see lidarLastFreshRef above) -- carry the last fresh
@@ -1450,8 +1490,30 @@ export default function App() {
       // reading on a static or slowly-moving rig is still sub-mm.
       const LIDAR_CARRY_MS = 1000;
       const fresh = lidarLastFreshRef.current;
+      // Age is measured on the PI'S CLOCK when both ends have it: `lidar_ts` is
+      // stamped when the measurement appeared and `msg.timestamp` when the sweep
+      // ended, both time.time() on the Pi (the same pairing bgContinuous.js
+      // relies on). It used to be performance.now() at BOTH ends -- i.e. when
+      // the browser got around to handling each packet -- which measures the
+      // browser's scheduling, not the sensor.
+      //
+      // That was a live bug, not a nicety. A main-thread stall past
+      // LIDAR_CARRY_MS (the 4 Hz live-flush derive chain measures 32-52 ms per
+      // pass over a few hundred cells, and bscanData reaches tens of MB, so GC
+      // pauses are real) made every reading look stale the moment the thread
+      // resumed -- so a C-scan at a rock-steady 200 mm, where the sensor is
+      // measurably perfect (37,211 consecutive valid reads at 300 mm), still
+      // produced scattered null standoffs and therefore scattered INVALID red-X
+      // cells. The frequency tracked browser load, which is exactly why it read
+      // as random and got worse on bigger grids.
+      //
+      // Falls back to the browser clock only when the Pi did not send a
+      // timestamp (pre-2026-08-28 stream.py, or no measurement yet this run).
+      const ageMs = (fresh && fresh.piTs != null && typeof msg.timestamp === 'number')
+        ? (msg.timestamp - fresh.piTs) * 1000
+        : (fresh ? performance.now() - fresh.t : Infinity);
       const carried = lidarN === 0 && fresh !== null
-        && (performance.now() - fresh.t) < LIDAR_CARRY_MS;
+        && ageMs >= 0 && ageMs < LIDAR_CARRY_MS;
       const avgLidarMm = lidarN > 0
         ? accum.reduce((s, v) => s + v, 0) / lidarN
         : (carried ? fresh.mm : null);
@@ -1461,7 +1523,7 @@ export default function App() {
       const standoffMm = avgLidarMm !== null ? avgLidarMm - lidarOffsetRef.current : null;
       lidarAccumRef.current = [];
 
-      const pose = poseAccumRef.current;
+      const pose = poseAccumRef.current.filter(r => r.t >= accumCutoff);
       const poseN = pose.length;
       const rollDeg = poseN > 0 ? pose.reduce((s, v) => s + v.roll, 0) / poseN : null;
       const pitchDeg = poseN > 0 ? pose.reduce((s, v) => s + v.pitch, 0) / poseN : null;

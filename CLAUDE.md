@@ -64,7 +64,10 @@ throttle the LiDAR rate. The LiDAR read is guarded the same way.
 **Diagnosing a missing standoff readout:** the sidebar's IMU Hz tile is on every panel and
 tells the two cases apart. Hz blank -> the sensor stream (port 9001) is down, check
 `stream.py`'s stdout on the Pi. Hz live but Standoff `—` -> the stream is up and
-`read_distance()` is returning `None`, so it's the TF-LC02 serial path (`/dev/serial0`).
+`read_distance()` is returning `None`, so it's the TF-LC02 path.
+**Since 2026-09-11 you no longer have to guess which:** the packet carries `lidar_err`
+naming the cause, and `stream.py` logs a dropout in plain words. See "LiDAR dropouts are
+the SENSOR refusing to range" below -- do NOT start from the wiring again.
 
 **LiDAR silent-serial investigation (2026-08-24), unresolved — needs a bench check, not
 more code.** `read_distance()` returns `None` because the TF-LC02 gives back literally zero
@@ -273,6 +276,240 @@ above), so don't just guess a lower rate to silence it without testing on the be
 The `[INFO @ .../version.c]` firmware/FPGA-newer-than-compatibility-table lines are harmless
 and expected — libbladeRF's bundled compatibility table just lags the flashed firmware/FPGA
 versions; ignore them, don't chase a libbladeRF upgrade just to silence an INFO line.
+
+## LiDAR dropouts are the SENSOR refusing to range, not the link (2026-09-11)
+
+Reported as "random issues with the lidar sometimes not working", and separately as
+"running long c scans, randomly the lidar data stops and I get those scans with the x
+mark". Both are one fault, now measured and now self-reporting.
+
+### What it is
+
+**The module answers every single command and reports a non-zero `error_code`.** Measured
+live on the bench: over 30 s, 16.9% of reads failed, **every one of them sensor-reported,
+with zero link failures**. The UART underneath is spotless --
+`TIOCGICOUNT` on `/dev/ttyAMA3` (read without consuming bytes, alongside a running
+`stream.py`) gives **888 B/s TX = 177.6 commands/s against 1423 B/s RX = 177.9 replies/s,
+a clean 1:1, and 0 frame / parity / overrun / break / buf_overrun over 100 s.**
+
+So this is a SIGHTING problem -- target range, angle, reflectivity, ambient IR -- and the
+fix is to aim the head, not to re-check cables. **Do not re-run the 2026-08-24 wiring
+investigation.** That one was real and is fully resolved (dead UART0 receiver); this is a
+different failure with the same symptom, and the two were indistinguishable until now.
+
+The dropouts are **total and long**: runs of 9.0 s, 22.3 s, 2.4 s and 1.1 s were caught,
+all self-recovering, against 420 s and 180 s windows elsewhere with none at all. They are
+condition-dependent, which is exactly why they read as "random".
+
+### The error code is a BITFIELD, and blackouts raise bits ordinary misses do not
+
+Codes observed: **4, 6, 20, 22, 52, 54, 128**. They decompose cleanly into bits --
+4 = bit2, 6 = bits1+2, 20 = bits2+4, 22 = bits1+2+4, 52 = bits2+4+5, 54 = bits1+2+4+5,
+128 = bit7 alone. So it is a flags register, not an enum, and `error_code != 0` is throwing
+away the only information that separates the two regimes:
+
+| | codes |
+|---|---|
+| ordinary scattered misses (blackout-free windows) | almost entirely **`sensor:4`**, occasionally `128` |
+| a real blackout | **`4` + `6` + `20` + `22` together, in the hundreds** |
+
+**Bits 1, 4 and 5 essentially only appear during a sustained out-of-range run**, while an
+isolated miss is almost always bare `4`. Useful as a signature, but note BOTH carry 8888
+(see below), so the difference is in how the module grades its own failure, not in whether
+a measurement was available.
+
+**ROOT CAUSE, settled by a raw probe: the target is simply OUT OF RANGE, and the module
+says so with a literal distance of 8888.** Driving the driver directly (stream.py stopped)
+while the module was pointed across a room:
+
+| code | reads | distance returned |
+|---|---|---|
+| 0 | 5,947 | 288-404 mm, real |
+| 4 / 6 / 20 / 22 / 54 | 33,825 | **ALL exactly 8888, without exception** |
+
+and a separate 70 s run held at ~300 mm gave **37,211 reads, 100% `error_code 0`, zero
+failures** -- at 531 reads/s, i.e. three times harder than `stream.py` polls. So:
+
+- **Nothing usable is being discarded.** Every rejected read carried the 8888 sentinel, so
+  the 2026-08-24 decision to reject on `error_code != 0` costs no measurements. Returning
+  8888 would put the standoff at 8.888 m and destroy any BG model.
+- **Short range is flawless and hammering it is harmless.** Poll rate is exonerated; the
+  `--lidar-rate` A/B below is no longer worth running.
+- **A "blackout" is not a fault at all.** It is a healthy module reporting that the target
+  is beyond what it can measure. Runs of 41.6 s, 16 s and 14.4 s were logged while the
+  module was waved around a room.
+
+**An EARLIER ENTRY IN THIS SECTION CLAIMED RANGE WAS FALSIFIED AS THE TRIGGER. THAT WAS
+WRONG** and is corrected here. It rested on a 180 s window that swept 31-847 mm with no
+blackout -- but that window simply never exceeded the module's reach. 847 mm is inside it;
+a room is not. The reach is not a fixed number: it depends on the target's reflectivity and
+angle, which is why a bright surface at 850 mm reads fine and a far wall does not.
+
+Operationally this means the blackouts seen while hand-waving are EXPECTED and say nothing
+about a scan. During a real C-scan the standoff is 130-400 mm, where the module is
+measurably perfect -- so **X marks appearing in an actual raster are far more likely to be
+the transport fault below than the sensor.**
+
+`read_distance_detail()` therefore reports `oor:<code>` (distance was 8888) separately from
+`sensor:<code>` (non-zero code with a plausible distance -- never yet observed) and
+`link:*`, via `is_out_of_range_reason()`. The dropout log names it in words: *"target OUT OF
+RANGE -- the module is working and returns its 8888 sentinel"*. The distinction matters
+because the operator reported the old 8888-passthrough as "way more responsive and
+predictable" -- the information it carried was real, and suppressing the VALUE without
+surfacing the FACT is what made a working sensor look broken.
+
+### Why it produces the red X, and why only sometimes
+
+`lidar_standoff_mm` goes null after `LIDAR_CARRY_MS` (1 s) of CONTINUOUS failure. Every
+cell captured from then on records a null standoff, and `backgroundFor()` in `bscanBg.js`
+returns `BG_STATUS.NO_STANDOFF` -> drawn as a red cross on dark red, excluded from both
+colour scales. A 9-22 s dropout is several cells, mid-raster.
+
+**It only happens under a BG MODEL.** A captured reference and Super Fit do not consume
+standoff at all, so the identical cells subtract normally in those modes -- which is what
+makes it look intermittent and mode-dependent. Two neighbours worth knowing: **SAR does
+NOT flag these cells**, it fills them with the median standoff (`sar.worker.js`), so a
+dropout degrades SAR quietly rather than visibly; and continuous BG capture refuses to
+interpolate across a gap > `MAX_BRACKET_GAP_S`, so a dropout silently thins the run.
+
+### The reason a failure now has a reason
+
+`read_distance()` collapsed FIVE distinct failures into a bare `None` -- timeout, no
+header, short frame, bad footer, bad opcode, and `error_code != 0`. Nothing in the system
+could tell "the module cannot see the target" from "the module is dead", which is why the
+last investigation spent days on cables. `read_distance_with_error()` existed and was
+never called.
+
+`tflc02.py` now has ONE parse path (`_read_response` returns `(dist, error_code, reason)`)
+with `read_distance()` / `read_distance_detail()` / `read_distance_with_error()` as thin
+wrappers -- the two hand-copied parsers it used to carry were the same drift hazard this
+repo already records for CFAR and the SAFT kernel. Reasons split into two classes that
+demand opposite responses: `sensor:<n>` (module answered; aim/range/reflectivity) and
+`link:*` (module did not answer; power/wiring/baud), separated by `is_link_reason()`.
+
+On the wire, additively (a groundstation that predates them ignores them):
+`lidar_err`, `lidar_last_good_mm`, `lidar_last_good_age_s`.
+
+**`stream.py` logs a dropout in plain words**, and the rate-limiting is the load-bearing
+part. Nothing is printed below `LIDAR_DROPOUT_WARN_S = 1.0 s` of CONTINUOUS failure --
+that is not a round number, it is exactly `LIDAR_CARRY_MS` in `App.jsx`, i.e. the moment
+the standoff actually goes null and cells actually start rendering invalid, so every line
+printed corresponds to something the operator is about to see. A persisting dropout
+repeats only every `LIDAR_DROPOUT_REPEAT_S = 15 s`. Verified head-first (15 checks, fake
+clock, scripted sensor): a healthy stream and a **40%-scattered-invalid stream are both
+completely silent**, a sustained dropout prints exactly one warning naming the dominant
+reason and one recovery line with the duration, and a 60 s dropout prints 3-6 lines rather
+than 12,000. That silence is the point -- a recurring benign line is what trained the
+operator to ignore the `_sweep_core` 2-tuple error for weeks.
+
+### Also fixed: the accumulators grew for as long as the tab was open
+
+`lidarAccumRef` / `poseAccumRef` in `App.jsx` were cleared ONLY inside the `sfcw_result`
+handler, so with no sweep running they grew at the measurement rate indefinitely. Besides
+the leak, **the first sweep of the next session got a standoff averaged over the entire
+idle period** -- over wherever the head was while being carried into place -- reported with
+an `lidar_n` in the thousands, which makes it look exceptionally well measured. Entries are
+now `{mm, t}`, filtered to `ACCUM_WINDOW_MS = 2000` before a sweep reads them and pruned at
+`ACCUM_PRUNE_AT = 512` so an idle tab cannot accumulate. 2 s is generous on purpose: the
+job is to exclude the idle period, not to trim a slow sweep, and a 2 s-old reading is
+already past the age at which App calls the standoff stale.
+
+### A SECOND, independent cause of the same X marks: one slow client froze the stream
+
+**This is the one that produces a "LiDAR blackout" with a perfectly healthy LiDAR, and it
+is now FIXED.** `stream.py`'s broadcast was `await gather(*(c.send(msg) for c in clients))`
+with no timeout -- the same slow-client bug already fixed in `sdr_server.py`
+(`_send_to_all`) and `rover_server.py` (`_fanout`), left latent here because this file's
+gather happened to be safe from the *other* half of that bug (the set-mutation
+RuntimeError).
+
+Measured 2026-09-11 against the shipped server, one client that never reads:
+
+| | healthy client alongside it |
+|---|---|
+| before | 34.0 Hz, worst gap **10,000 ms**, 3 gaps > 1 s in 40 s |
+| after `BROADCAST_TIMEOUT_S = 0.5` | 47.8 Hz, worst gap **503 ms**, 0 gaps > 1 s |
+
+A 50 ms-per-packet stall alone (not a full stop) already cost 48.6 -> 36.5 Hz. The residual
+503 ms is exactly the one frame that hits the timeout before the client is dropped.
+
+**How this was caught, and the lesson: the Pi log and the UI disagreed.** The operator
+reported repeated 5-10 s freezes of the standoff readout with the warning line showing,
+over a 12-minute period in which `stream.log` recorded **zero** dropout lines and a
+180 s capture measured 0.3% null over 31-847 mm. A LiDAR fault cannot be invisible to the
+sensor's own log; a transport fault is invisible to it by construction. **Whenever the UI
+says the LiDAR is out and the Pi log is silent, it is not the LiDAR.**
+
+**Contributing factor worth checking on any repeat: how many clients are actually
+attached.** `ss -tn | grep :9001` during the incident showed **six** connections from three
+machines -- three from one host, plus two in FIN-WAIT-2 (tabs closed without completing the
+close, which the 20 s keepalive had not yet reaped) and one with 504 bytes backed up in
+Send-Q. Note `rover_server.py` is NOT among them: it never connects to 9001. But each
+browser tab opens THREE sockets (9001 sensor, 9002 rover, 9003 SDR) drained by the SAME
+main thread, so rover-panel rendering competes with draining the LiDAR socket -- which is
+worst during a rover-driven C-scan, exactly when the X marks were reported.
+
+### THE ACTUAL CAUSE of random X marks in a real C-scan: staleness was timed on the BROWSER clock
+
+This is the one that matches the operator's real complaint -- *"C-scans at a near-constant
+range of around 200 mm, random cross marks, sometimes rare, sometimes quite frequent"* --
+and it is neither of the two above. At 200 mm the sensor is measurably perfect (37,211
+consecutive reads at 300 mm, 100% valid, and the module's cadence is FASTEST at short
+range), so a null standoff there could never have been the LiDAR.
+
+`App.jsx` decided whether to carry the last reading forward with
+
+    (performance.now() - fresh.t) < LIDAR_CARRY_MS
+
+where `fresh.t` was also `performance.now()`, stamped when the browser got around to
+HANDLING the lidar packet. **Both ends were the browser's own scheduling clock, so the test
+measured how busy the main thread was, not how old the measurement was.** Any stall past
+1 s -- the 4 Hz live-flush derive chain is 32-52 ms per pass over a few hundred cells,
+`bscanData` reaches tens of MB, and GC pauses are real -- made every reading look stale the
+instant the thread resumed. The sweep landing in that window recorded a null standoff and
+its cell rendered INVALID.
+
+That explains every part of the report that the sensor theory could not:
+- **constant 200 mm** -- irrelevant, the test never looked at the sensor;
+- **random** -- it tracks browser load, not anything physical;
+- **"sometimes rare, sometimes quite frequent"** -- the derive chain cost scales with cell
+  count, so a big or long-running grid stalls more often than a small one.
+
+Both quantities are already available on the **Pi's** clock -- `lidar_ts` (stamped when the
+measurement appeared) and `sfcw_result.timestamp` -- and they are the same `time.time()`,
+the pairing `bgContinuous.js` already depends on. The age is now computed from those, with
+the browser clock kept only as a fallback for a Pi that sends no `lidar_ts`. Verified by
+extracting the SHIPPED expression out of `App.jsx` and driving it (11 checks): a 3 s browser
+stall now carries correctly, a genuine 3 s sensor outage still goes null, a measurement
+stamped after its sweep is refused rather than treated as infinitely fresh, and the fallback
+path behaves as before.
+
+**The general lesson, which this repo keeps relearning: an instrument fed from a throttled,
+decimated or re-timed copy of the data reports on the copy.** Same class as `lidar_seq`
+counting reads rather than measurements, and as the SFCW header reporting the throttled
+display rate as the radar's sweep rate.
+
+Note the send timeout above stops one stalled client taking the others down, but it was
+never going to fix this: the stalling client and the scanning tab are the same tab.
+
+The two causes are now distinguishable, which is the practical payoff of the logging:
+
+- **runs of adjacent invalid cells + a `no valid LiDAR reading for N s` line in the Pi log**
+  -> the sensor could not range. Re-aim.
+- **isolated invalid cells and the Pi log SILENT** -> the browser stalled. Nothing is wrong
+  with the LiDAR.
+
+### What to do about the blackouts themselves
+
+The instrumentation names the cause; it does not stop it, and the physical trigger is not
+yet known (see above -- range is ruled out). **Before the next long C-scan, watch
+`stream.log` for a minute:** a low steady `sensor:4` rate is normal and harmless; a run
+past 1 s now announces itself and is the cue to re-aim rather than to scan.
+
+**The poll-rate hypothesis is dead, do not spend time on it.** The idea was that adaptive
+integration (17.2 Hz at 165 mm falling to 11.5 Hz at 340 mm) might never complete against a
+command every 5.6 ms. Measured: 37,211 consecutive reads at **531/s** with **zero** failures
+at 300 mm. Polling hard does not break it.
 
 ## Living Documentation Rule
 
