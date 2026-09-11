@@ -25,10 +25,13 @@ def cleanup(sig=None, frame=None):
 signal.signal(signal.SIGINT, cleanup)
 signal.signal(signal.SIGTERM, cleanup)
 
+# -u: the services' stdout is block-buffered whenever it is a pipe (tee, a
+# log file, systemd), so their prints only appear 8 KB at a time -- the
+# [bladerf]/[sfcw] diagnostics were invisible in /tmp/sdr.log on 2026-09-11.
 services = [
-    [sys.executable, os.path.join(base, 'sensors', 'stream.py')],
-    [sys.executable, os.path.join(base, 'radar', 'sdr_server.py')],
-    [sys.executable, os.path.join(base, 'rover', 'rover_server.py')],
+    [sys.executable, '-u', os.path.join(base, 'sensors', 'stream.py')],
+    [sys.executable, '-u', os.path.join(base, 'radar', 'sdr_server.py')],
+    [sys.executable, '-u', os.path.join(base, 'rover', 'rover_server.py')],
 ]
 
 print(f"Starting {len(services)} service(s)...")
