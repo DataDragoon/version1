@@ -1,0 +1,117 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v10_signaltap.rbf
+==========================================================
+
+Status:  DEBUG IMAGE -- SignalTap instrumented (same taps as v9).
+         TIMING CLEAN: every clock positive on setup AND hold at every
+         corner (v9 still had two hold violations on altera_reserved_tck).
+         Supersedes v9.
+
+Build date:        2026-09-11 14:13 IST  (18 min wall)
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-11_14.13.54
+md5    (.rbf):     8079e007e2a1c0a3bf8b58b16ce7fa7d (see .rbf.md5)
+sha256 (.rbf):     342b72c2b12a2de6abf6540b604562a506dc8f8a66015d2348bbe82f95687341
+md5    (.sof):     131fe30659cc7a7df6212b2ffb407d4e
+Source tree:       bladerf-src @ d41819f5, branch sfcw-fpga-dsp, dirty.
+                   Same commit as v8/v9. Tracked RTL differs from v9 in
+                   ONE file, bladerf-hosted.vhd, +16/-1 lines (see below).
+                   rx.vhd and every DSP block are byte-identical to v9.
+                   SignalTap input: signaltap/dsp_fifo.stp, unchanged from
+                   v9, archived beside this file as the .stp.
+Quartus:           18.1.0.625 Standard, device 5CEBA9F23C8, seed 1.
+
+FILES IN THIS RELEASE
+---------------------
+    .rbf    the bitstream, for bladeRF-cli
+    .sof    REQUIRED for SignalTap. Keep paired.
+    .stp    the SignalTap configuration the .sof was compiled against.
+
+WHAT CHANGED vs v9 -- the config-GPIO readback of bit 6
+--------------------------------------------------------
+Root cause found in code, 2026-09-11:
+
+  bladerf_config_gpio_read() returned pack(nios_gpio.i, '0')
+  (bladerf-hosted.vhd, Nios gpio_in_port). pack(nios_gpi_t) in bladerf_p.vhd
+  copies only the NAMED nios_gpo_t fields (usb_speed, rx_mux_sel, packet_en,
+  ...). Bit 6 -- dsp_path_en -- is not a named field; it is tapped raw from
+  nios_gpo_slv(6) for U_sync_dsp_path_en. So the readback word had bit 6 =
+  'U' and the host always read it as 0, whatever had been written.
+
+  libbladeRF does read-modify-write on this register: perform_format_config()
+  (every sync_config), bladerf_set_pll_enable(), clock select, ... Each of
+  those read bit 6 as 0 and wrote it back as 0. Any such call after
+  dsp_path_enable(True) silently deselected the DSP FIFO, and the FX3 went
+  back to draining the stock sample FIFO -- raw samples at the Nios sweep
+  rate, which is exactly the symptom observed on the Pi.
+
+The fix (bladerf-hosted.vhd):
+
+    signal nios_gpi_slv : std_logic_vector(31 downto 0);
+    ...
+    gpi_readback : process(all)
+        variable v : std_logic_vector(31 downto 0);
+    begin
+        v    := pack(nios_gpio.i, '0');
+        v(6) := nios_gpo_slv(6);      -- dsp_path_en now reads back
+        nios_gpi_slv <= v;
+    end process;
+    ...
+    gpio_in_port => nios_gpi_slv,     -- was pack(nios_gpio.i, '0')
+
+Effect: bladerf_config_gpio_read() returns the true state of bit 6, so every
+libbladeRF read-modify-write preserves it, and the Pi driver's
+"config_gpio=0x..." print will show 0x40 set while the DSP path is selected.
+The host-side ordering in version1 commit aafe1c5 (write bit 6 last,
+re-assert on a raw buffer) remains as a second line of defence.
+
+Host-side counterpart: version1/pi/radar/bladerf_driver.py @ aafe1c5+,
+test: python3 radar/test_dsp_path.py.
+
+TIMING (Slow 1100mV 85C, worst slack per clock, ns)
+----------------------------------------------------
+                                   v9 setup    v10 setup    v10 hold
+    pll_sclk (AD9361 rx_clock)     +0.024      +0.110       +0.261
+    fx3_virtual                       --        +0.630      +24.246
+    pll_fclk                          --        +0.740       +2.365
+    U_fx3_pll (fx3_pclk_pll)          --        +2.078       +0.378
+    U_system_pll (80 MHz)             --        +2.469       +0.294
+    fx3_pclk                          --        +3.737       +0.491
+    altera_reserved_tck (JTAG)        --        +5.817       +0.187  (v9: hold NEGATIVE)
+    c5_clock2                         --        +8.778       +0.362
+    Global minimum, all corners/all checks: +0.011 ns. TNS 0 everywhere.
+
+Fitter 0 errors / 39 warnings, Timing Analyzer 0 / 6, Assembler 0 / 0.
+The readback change is 32 bits of Avalon read mux on the 80 MHz Nios clock;
+the +0.086 ns gain on pll_sclk is placement noise (seed 1 both builds), not
+a design change.
+
+SIGNALTAP -- unchanged from v9
+------------------------------
+    Instance     dsp_fifo
+    Width        83 bits
+    Depth        2048 samples
+    Clock        rx_clock
+    Nodes        sample_fifo_51 wr_ptr[6..0], complex_div i_out/q_out[30..0],
+                 zero_den, complex_div state, seq_adder states, cw_nco phase,
+                 dsp_restart_d / dsp_restart_pulse.
+    Storage qualifier: set Transitional in the GUI. i_out/q_out radix Signed.
+
+    Rule: USB configures, JTAG observes. Load the .rbf with bladeRF-cli from
+    the Pi; open the .sof + .stp in SignalTap over the USB-Blaster; never
+    quartus_pgm while the Pi holds the device. One SignalTap instance at a
+    time (the Nios debug module shares the JTAG hub).
+
+HOW TO USE
+----------
+    Pi:    bladeRF-cli -l hostedxA9_niosIIf_sweep_dsp_v10_signaltap.rbf
+           (services restarted from the version1 tree, then
+            python3 radar/set_sweep_mode.py dsp / python3 radar/test_dsp_path.py)
+
+    Expect on the sdr_server console:
+           [bladerf] DSP result path selected, sample mode (config_gpio=0x....4.)
+                                                                           ^ bit 6
+    and test_dsp_path.py: RESULT: PASS with sweep_core='dsp'.
+
+    If the driver still reports "buffer is raw samples ... bit 6 is not in
+    effect" on THIS image, the write itself is not arriving (host -> FX3 ->
+    Nios); the readback now makes that visible: read config_gpio straight
+    after dsp_path_enable(True) and bit 6 will be 0.
