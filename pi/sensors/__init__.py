@@ -1,1 +1,1 @@
-# Sensor drivers: TF40-S LiDAR (Modbus RTU over UART), BNO085 IMU
+# Sensor drivers: TF-LC02 LiDAR, BNO085 IMU

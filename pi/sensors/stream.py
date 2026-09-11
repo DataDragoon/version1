@@ -9,39 +9,41 @@ import signal
 import websockets
 
 from bno085 import BNO085
-from tf40s import TF40S
+from tflc02 import TFLC02
 from imu_calibration import CalibratedIMU
 
 clients = set()
 
-# The TF40-S measures at a fixed 5 Hz and the driver runs it in CONTINUOUS
-# mode, so TF40S.read_distance() blocks until the sensor's next streamed frame
-# arrives (~172 ms) and every successful read is a genuinely new measurement.
+# The TF-LC02's internal measurement updates at ~11-17 Hz (measured 2026-08-27:
+# a median run of 34 identical consecutive polls at ~584 Hz; and 17.2 Hz at
+# 165 mm falling to 11.5 Hz at 340 mm, which is adaptive integration time, not a
+# settable frame clock). Polling faster CANNOT produce more measurements.
 #
-# 0 = uncapped, and that is the RIGHT setting here rather than a lazy one: the
-# loop self-paces on the stream, so it runs at exactly the sensor's own cadence
-# with no polling waste. A non-zero cap can only add latency between a frame
-# arriving and it being published.
+# It is still polled fast, at 200 Hz, and that is deliberate: the poll rate does
+# not set how many measurements exist, it sets how late we learn that one has
+# appeared. At 20 Hz that was up to 50 ms, which on a hand-swept module at
+# 25 mm/s is 1.25 mm of position error -- and a DIRECTION-DEPENDENT one, since
+# the sign flips when the sweep reverses, so an out-and-back pass lays the same
+# physical standoff down in two places. At 200 Hz it is 5 ms / 0.13 mm. The cost
+# was measured at 584 Hz (2026-08-27) and is nil: broadcast 48.35 vs 48.79 Hz,
+# IMU rate slightly BETTER at 33.83 vs 32.66 Hz.
 #
-# Do NOT restore a fast poll here. Measured 2026-09-11, single-shot polling
-# answers 16-52% of requests for ~0.5-1.1 readings/s at ANY pacing, because the
-# module drops a request that lands mid-measurement; continuous gives 100% at
-# 5.1-5.8 Hz. Polling faster cannot create measurements -- the same rule that
-# held for the TF-LC02, for the same reason.
-LIDAR_POLL_HZ = 0
+# What makes that safe for everything downstream is that `seq` now counts
+# MEASUREMENTS, not reads -- see lidar_poll_loop. Publishing 200 reads/s of a
+# 14 Hz value would have inflated the groundstation's `lidar_n` and deflated
+# `lidar_std` into fiction, which is exactly the trap the 20 Hz cap was avoiding.
+LIDAR_POLL_HZ = 200
 
 # A poll whose value differs from the last is unambiguously a new measurement.
 # The converse is not true: on a still target two genuine measurements can land
-# on the same integer millimetre. Rather than undercount, a reading that has
-# been stable for this long is republished as a new measurement -- it IS a
-# current reading of a static target, so stamping it "now" is correct.
-#
-# Raised 0.25 -> 0.5 s for the TF40-S. The rule is that it must sit WELL ABOVE
-# the sensor's slowest internal measurement period or it fires between two
-# genuinely-new measurements and invents readings. The TF-LC02's period was
-# ~87 ms (11.5 Hz) so 0.25 s cleared it; the TF40-S measures at 5 Hz, i.e. a
-# 200 ms period, which 0.25 s does NOT clear with any margin.
-LIDAR_STABLE_REPUBLISH_S = 0.5
+# on the same integer millimetre (raw sigma is 0.66-0.78 mm against 1 mm
+# quantisation, so identical pairs run ~40%). Rather than undercount, a reading
+# that has been stable for this long is republished as a new measurement -- it
+# IS a current reading of a static target, so stamping it "now" is correct, and
+# the case only arises when the true spread over the window really is ~zero.
+# Chosen well above the slowest observed internal period (~87 ms at 11.5 Hz) so
+# it cannot fire between two genuinely-new measurements.
+LIDAR_STABLE_REPUBLISH_S = 0.25
 
 
 async def register(ws):
@@ -85,11 +87,9 @@ async def lidar_poll_loop(lidar, state, rate=LIDAR_POLL_HZ):
     """Reads the LiDAR in its own loop, publishing the latest reading into
     `state`.
 
-    Polled at LIDAR_POLL_HZ (20), above the TF40-S's own 5 Hz measurement rate
-    but far below the old TF-LC02 setting -- see the constant for why. On this
-    sensor a read TRIGGERS the measurement, so the request itself timestamps it;
-    polling faster cannot create measurements and merely queues on a 9600-baud
-    link.
+    Polled at LIDAR_POLL_HZ (200), which is far above the sensor's own 11-17 Hz
+    measurement rate ON PURPOSE -- see the constant for why: fast polling buys a
+    tight TIMESTAMP for each measurement, not more of them.
 
     `seq` and `ts` therefore describe MEASUREMENTS, not reads. `seq` advances
     only when the value changes (or when a stable value ages past
@@ -102,13 +102,11 @@ async def lidar_poll_loop(lidar, state, rate=LIDAR_POLL_HZ):
     per-read counter was at 20 Hz, where 20-40% of reads were already repeats.
 
     This is deliberately NOT awaited inline in sensor_loop's broadcast loop:
-    TF40S.read_distance() blocks for as long as the sensor takes to answer --
-    up to its 0.3 s timeout when the sensor is silent, and legitimately ~200 ms
-    when it is measuring, since the read is what triggers the measurement.
-    Awaiting it directly in the broadcast loop would cap the whole stream (IMU
-    included) at that rate regardless of `rate`; that is exactly what a blocking
-    LiDAR read did on 2026-08-24, pinning everything to ~10 Hz. Running it here,
-    in its own task via
+    TFLC02.read_distance() blocks on a 100ms UART timeout whenever the sensor
+    doesn't answer, which happened to be true throughout the 2026-08-24
+    debugging above. Awaiting it directly in the broadcast loop caps the whole
+    stream (IMU included) at ~10Hz regardless of `rate` -- confirmed by timing
+    read_distance() in isolation. Running it here, in its own task via
     run_in_executor, means a slow or dead LiDAR only slows *this* loop; the
     broadcast loop below keeps running at its full requested rate using
     whatever LiDAR reading was most recently published, stale or not."""
@@ -117,49 +115,20 @@ async def lidar_poll_loop(lidar, state, rate=LIDAR_POLL_HZ):
     interval = 1.0 / rate if rate and rate > 0 else 0.0
     last_dist = None
     last_pub = 0.0
-    # A streaming driver discards frames it could not keep up with. That is the
-    # right behaviour (freshness beats completeness for a standoff) but it is
-    # also the only evidence that this loop is falling behind, and the symptom
-    # of NOT noticing is a standoff that lags reality by the whole backlog. So
-    # it is reported -- but only when non-zero and at most every 10 s, because a
-    # line that prints unconditionally is one the operator learns to ignore.
-    skip_report_t = time.monotonic()
-    skip_seen = 0
     while True:
         t0 = time.monotonic()
-        if t0 - skip_report_t >= 10.0:
-            grew = getattr(lidar, 'skipped', 0) - skip_seen
-            if grew:
-                skip_seen = lidar.skipped
-                print(f"NOTE: LiDAR dropped {grew} stale frame(s) in the last "
-                      f"{t0 - skip_report_t:.0f}s -- this loop is behind the sensor")
-            skip_report_t = t0
         try:
             dist = await loop.run_in_executor(None, lidar.read_distance)
             state['dist'] = dist
             if dist is not None:
                 now = time.time()
-                if getattr(lidar, 'continuous', False):
-                    # Streaming: the module emits exactly one frame per
-                    # measurement, so every successful read IS a new
-                    # measurement and there is nothing to infer. Counting them
-                    # directly is both simpler and more honest than the
-                    # value-change rule below, which UNDER-counts a static
-                    # target badly -- measured on the bench at a fixed 1.000 m,
-                    # it reported ~2 Hz (the republish timeout) against a real
-                    # 5 Hz, so `lidar_n` and `lidar_std` would describe fewer
-                    # looks than were actually taken.
+                # A changed value is unambiguously a new measurement. An
+                # unchanged one is ambiguous, so it is republished only once it
+                # has outlived any plausible internal period.
+                if dist != last_dist or (now - last_pub) >= LIDAR_STABLE_REPUBLISH_S:
                     state['seq'] += 1
                     state['ts'] = now
-                else:
-                    # Polled: a re-read can return the sensor's cached value, so
-                    # a changed value is the only unambiguous evidence of a new
-                    # measurement. An unchanged one is republished once it has
-                    # outlived any plausible internal period.
-                    if dist != last_dist or (now - last_pub) >= LIDAR_STABLE_REPUBLISH_S:
-                        state['seq'] += 1
-                        state['ts'] = now
-                        last_pub = now
+                    last_pub = now
                 last_dist = dist
             fail_streak = 0
         except Exception as e:
@@ -172,7 +141,7 @@ async def lidar_poll_loop(lidar, state, rate=LIDAR_POLL_HZ):
 
 
 async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ):
-    lidar = TF40S()
+    lidar = TFLC02()
 
     imu = None
     try:
@@ -182,7 +151,7 @@ async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ):
     except Exception as e:
         print(f"WARNING: IMU init failed ({e!r}), streaming without IMU")
 
-    print(f"TF40-S on {lidar.ser.port} @ {lidar.ser.baudrate} baud (Modbus RTU)")
+    print(f"TF-LC02 on {lidar.ser.port}")
 
     interval = 1.0 / rate
     print(f"Streaming sensors at {rate}Hz on ws://0.0.0.0:9001")
@@ -193,7 +162,7 @@ async def sensor_loop(rate, skip_cal=False, lidar_rate=LIDAR_POLL_HZ):
     # than the LiDAR updates and the repeats that come from polling faster.
     lidar_state = {'dist': None, 'seq': 0, 'ts': None}
     print(f"LiDAR polled at {lidar_rate}Hz "
-          f"(TF40-S measures at 5Hz; seq counts measurements, not polls)")
+          f"(sensor measures internally at ~11-17Hz; seq counts measurements, not polls)")
     poll_tasks = [asyncio.create_task(lidar_poll_loop(lidar, lidar_state, lidar_rate))]
     if imu is not None:
         poll_tasks.append(asyncio.create_task(imu_poll_loop(imu, imu_state)))
@@ -241,9 +210,9 @@ async def main():
     parser.add_argument('--skip-cal', action='store_true', help='Skip gyro calibration (use saved)')
     parser.add_argument('--lidar-rate', type=float, default=LIDAR_POLL_HZ,
                         help=f'LiDAR poll rate in Hz (default: {LIDAR_POLL_HZ}; '
-                             '0 = uncapped). Cannot create measurements -- the '
-                             'TF40-S measures at 5 Hz whatever this is, and one '
-                             'Modbus transaction costs ~18 ms at 9600 baud.')
+                             '0 = uncapped. Sets timestamp precision, not the '
+                             'number of measurements -- the sensor measures at '
+                             '11-17 Hz whatever this is)')
     args = parser.parse_args()
 
     stop = asyncio.get_event_loop().create_future()

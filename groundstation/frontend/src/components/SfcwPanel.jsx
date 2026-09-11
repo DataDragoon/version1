@@ -337,8 +337,8 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
               value={lidarProvenance?.lidar_n != null ? String(lidarProvenance.lidar_n) : '—'}
             />
           </div>
-          {/* Warn on a genuinely dead standoff, not on lidar_n === 0: the sweep
-              period (27-65 ms) is far shorter than the TF40-S's own ~182 ms
+          {/* Warn on a genuinely dead standoff, not on lidar_n === 0: at 15 Hz
+              sweeps the sweep period is shorter than the TF-LC02's own ~60-90 ms
               update period, so individual sweeps routinely and healthily contain
               zero fresh readings (App.jsx carries the last fresh reading forward
               for up to 1 s). Two more rules, both from the warning flapping in

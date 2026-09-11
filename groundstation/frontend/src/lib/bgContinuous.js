@@ -19,19 +19,11 @@
 // averaged reading. This is the whole accuracy argument, so it is worth stating
 // in full.
 //
-// The TF40-S measures at 5 Hz (measured 5.5 Hz through stream.py) -- its own
-// fixed frame rate, so polling faster cannot produce more measurements. Sweeps
-// arrive at 36 Hz. So the great majority of sweeps contain no new measurement at
-// all, and `App.jsx` carries the last one forward so the live display does not
-// strobe.
-//
-// NOTE this got HARDER with the 2026-09-11 LiDAR swap, not easier: the TF-LC02
-// ran at 11-17 Hz, so the TF40-S gives roughly a THIRD as many measurements per
-// unit of hand travel and every bracket is ~3x longer. Everything below still
-// holds structurally, but the accuracy numbers quoted from the TF-LC02 era were
-// measured against ~14 Hz and have NOT been re-measured at 5.5 Hz -- expect the
-// interpolation residual to be worse than the 0.322 mm recorded there, and
-// re-measure before quoting it.
+// The TF-LC02 measures at 11-17 Hz (its own integration cadence -- polling
+// faster cannot produce more measurements, and it gets SLOWER with distance
+// because integration is adaptive). Sweeps arrive at 36 Hz. So most sweeps
+// contain no new measurement at all, and `App.jsx` carries the last one forward
+// so the live display does not strobe.
 //
 // Attaching that carried reading to a moving sweep is the error to avoid. It is
 // a pure LAG: the standoff used is always the last one measured, so it trails
@@ -122,42 +114,17 @@ import { computeCaptureStats } from './bgCaptureStats';
 // Half-width of the window used to fit velocity from the lidar track. Wide
 // enough that the fit averages down the lidar's own noise, short enough to
 // follow a hand reversing direction.
-// Raised 0.35 -> 0.6 for the TF40-S (2026-09-11). The window is +/-, so this is
-// 1.2 s of track: ~6.6 points at the TF40-S's 5.5 Hz, against ~3.8 at the old
-// 0.35 and ~10 at the TF-LC02's 14 Hz. The margin matters because the fit FAILS
-// OPEN -- velocityAt() returns null below SPEED_MIN_POINTS and file() then skips
-// the motion gate entirely, so a thin window does not reject sweeps, it silently
-// stops screening them.
-//
-// Widening costs responsiveness to a hand reversing direction, and that is
-// acceptable here rather than merely tolerable: at 5.5 Hz a reversal cannot be
-// resolved faster than ~0.4 s anyway, and speed near a reversal is low, so the
-// smoothing under-reads exactly where the gate does not bite. Mid-pass, where
-// the gate does bite, the motion is close to constant velocity and a longer fit
-// is strictly better -- it averages down more of the lidar's own noise.
-const SPEED_WINDOW_S = 0.6;
+const SPEED_WINDOW_S = 0.35;
 const SPEED_MIN_POINTS = 3;
 
 // Two measurements further apart than this did not bracket the sweep in any
 // useful sense -- the sensor was not reporting, and a straight line across the
-// hole is an invention.
-//
-// Raised 0.25 -> 0.5 for the TF40-S (2026-09-11). The rule is that it must sit
-// COMFORTABLY above the sensor's own measurement period or ordinary cadence
-// trips it and healthy sweeps are thrown away. 0.25 s was 2.9x the TF-LC02's
-// ~87 ms; against the TF40-S's ~182 ms it is only 1.4x, so a SINGLE dropped
-// frame (364 ms) would have failed the gate. 0.5 s restores the same ~2.75x
-// margin and still refuses a genuinely quiet sensor.
-//
-// The cost is real and is the price of the slower sensor: a bracket this long
-// spans ~12 mm of travel at a 25 mm/s wave, and the interpolation across it is
-// a straight line through whatever the hand actually did. That is why the
-// motion gate below matters more now than it did.
-const MAX_BRACKET_GAP_S = 0.5;
+// hole is an invention. Comfortably above the slowest observed internal period
+// (~87 ms at 11.5 Hz) so ordinary cadence never trips it.
+const MAX_BRACKET_GAP_S = 0.25;
 
 // Lidar history retained. Only enough to bracket the pending sweeps and fit a
-// velocity; at the TF40-S's 5.5 Hz this is ~27 points, still comfortably more
-// than SPEED_WINDOW_S needs.
+// velocity; at ~14 Hz this is ~70 points.
 const TRACK_KEEP_S = 5;
 
 // Adjacent sweep intervals used to estimate the sweep period, whose half is the

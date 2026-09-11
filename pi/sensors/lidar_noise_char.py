@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Characterise TF40-S LiDAR noise as a function of averaging window.
+"""Characterise TF-LC02 noise as a function of averaging window.
 
 Why this exists: background subtraction (groundstation/frontend/src/lib/
 bgModelInterp.js) evaluates the model at a lidar-derived standoff, and two-way
@@ -27,7 +27,7 @@ import time
 
 import numpy as np
 
-from tf40s import TF40S
+from tflc02 import TFLC02
 
 # Two-way phase sensitivity: 4*pi*f/c in rad/mm at the top of the sweep band.
 SPEED_OF_LIGHT = 299792458.0
@@ -57,30 +57,21 @@ def suppression_db(sigma_mm):
 
 
 def collect(lidar, seconds):
-    """Poll as fast as the driver allows, recording (t, dist, error_code).
-
-    The TF40-S reports failure as a sentinel in the top byte of the distance
-    word rather than as a separate code, so its read_distance_with_error()
-    returns (mm, None) when good and (None, sentinel) when not. That is
-    normalised here to the convention the rest of this file uses -- 0 for a
-    valid reading, -1 for no/malformed frame, and the sentinel byte itself
-    otherwise -- so `valid = (err == 0)` and the error histogram both still hold.
-    """
+    """Poll as fast as the driver allows, recording (t, dist, error_code)."""
     t, dist, err = [], [], []
     t0 = time.monotonic()
     while time.monotonic() - t0 < seconds:
         r = lidar.read_distance_with_error()
         now = time.monotonic() - t0
-        t.append(now)
         if r is None:
+            t.append(now)
             dist.append(np.nan)
-            err.append(-1)  # no/malformed frame, distinct from a real code
-        elif r[1] is not None:
-            dist.append(np.nan)
-            err.append(int(r[1]))  # 0xFF/0xFE/0xFD/0xFC -- see tf40s.ERROR_SENTINELS
+            err.append(-1)  # -1 = no/!malformed frame, distinct from a real code
         else:
-            dist.append(float(r[0]))
-            err.append(0)
+            d, e = r
+            t.append(now)
+            dist.append(float(d))
+            err.append(int(e))
     return np.array(t), np.array(dist), np.array(err)
 
 
@@ -169,8 +160,7 @@ def characterise(t, d, err, label, seconds):
 
     codes, counts = np.unique(err, return_counts=True)
     hist = {int(c): int(k) for c, k in zip(codes, counts)}
-    print(f"error-code hist    {hist}   (-1 = no/malformed frame; "
-          f"252-255 = sensor error sentinels 0xFC-0xFF)")
+    print(f"error-code hist    {hist}   (-1 = no/malformed frame)")
     out.update(samples=n, span_s=span, poll_rate_hz=poll_rate,
                valid_frac=float(valid.sum() / max(n, 1)), error_hist=hist)
 
@@ -251,8 +241,8 @@ def main():
     ap.add_argument('--json', default=None, help='write results + raw series to this JSON')
     args = ap.parse_args()
 
-    lidar = TF40S(port=args.port)
-    print(f"TF40-S on {lidar.ser.port}; collecting {args.seconds:.0f} s "
+    lidar = TFLC02(port=args.port)
+    print(f"TF-LC02 on {lidar.ser.port}; collecting {args.seconds:.0f} s "
           f"for '{args.label}'...")
     try:
         t, d, e = collect(lidar, args.seconds)
