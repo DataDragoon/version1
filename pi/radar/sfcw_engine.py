@@ -2028,6 +2028,7 @@ class SFCWEngine:
             self._nios_last_score = -1.0
             self._last_sweep_core = 'fallback'
             self._nios_fallbacks += 1
+            self._dsp_last_fallback_reason = reason
             self._log_nios_fallback(reason)
             if reprime:
                 self._nios_primed = False
@@ -2177,7 +2178,21 @@ class SFCWEngine:
             return None
 
         if dropped_steps > 0:
-            print(f"[sfcw] WARNING: {dropped_steps}/{num_steps} steps had incomplete captures")
+            if self.sweep_mode == 'dsp' and self._last_sweep_core == 'fallback':
+                # The DSP core dropped the whole sweep on purpose (see
+                # fallback() in _sweep_core_dsp). Say WHY, on a timer -- the
+                # bare "incomplete captures" line at sweep rate buried the
+                # reason on 2026-09-11.
+                now = time.time()
+                last = getattr(self, '_dsp_warn_last', 0.0)
+                if now - last >= NIOS_FALLBACK_LOG_PERIOD_S:
+                    self._dsp_warn_last = now
+                    reason = getattr(self, '_dsp_last_fallback_reason', '?')
+                    print(f"[sfcw] WARNING: DSP sweep fell back -- {reason} "
+                          f"-- {dropped_steps}/{num_steps} steps empty; the "
+                          f"[bladerf] lines above say what the read saw")
+            else:
+                print(f"[sfcw] WARNING: {dropped_steps}/{num_steps} steps had incomplete captures")
 
         self._warn_if_adc_hot(adc_peak)
         result = self._process_h_cal(h_cal, adc_peak)
