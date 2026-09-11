@@ -65,14 +65,36 @@ async def _drain_until(ws, want_type, pred=lambda m: True, timeout=10.0):
     return None
 
 
+async def _flush(ws, quiet=0.15):
+    """Discard everything already queued on the socket.
+
+    The server pushes an sfcw_status on connect, after sfcw_stop and after
+    sfcw_set_params, on top of answering sfcw_get_status -- so without a
+    flush a status request can be answered by a stale broadcast from before
+    the command it is meant to check.
+    """
+    while True:
+        try:
+            await asyncio.wait_for(ws.recv(), timeout=quiet)
+        except asyncio.TimeoutError:
+            return
+
+
 async def _status(ws, timeout=10.0):
+    await _flush(ws)
     await ws.send(json.dumps({'cmd': 'sfcw_get_status'}))
     return await _drain_until(ws, 'sfcw_status', timeout=timeout)
 
 
-async def _set_mode(ws, mode):
+async def _set_mode(ws, mode, timeout=5.0):
+    """Request the mode, then wait for a status that actually reports it."""
+    await _flush(ws)
     await ws.send(json.dumps({'cmd': 'sfcw_set_params', 'sweep_mode': mode}))
-    await asyncio.sleep(0.3)
+    st = await _drain_until(ws, 'sfcw_status',
+                            pred=lambda m: m.get('sweep_mode') == mode,
+                            timeout=timeout)
+    if st is not None:
+        return mode
     st = await _status(ws)
     return st.get('sweep_mode') if st else None
 
@@ -127,7 +149,8 @@ async def run_mode(ws, mode, seconds):
     got = await _set_mode(ws, mode)
     print(f"--- {mode}: sweep_mode reads back as {got!r}")
     if got != mode:
-        print(f"FAIL  requested {mode!r} but engine reports {got!r}")
+        print(f"FAIL  requested {mode!r} but engine reports {got!r} "
+              f"(no status carried {mode!r} within 5 s of sfcw_set_params)")
         return None
     await ws.send(json.dumps({'cmd': 'sfcw_start'}))
     print(f"--- {mode}: started, collecting for {seconds:.0f} s")
