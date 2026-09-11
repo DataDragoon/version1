@@ -26,6 +26,7 @@ const ROVER_PHASE_TEXT = {
 export default function Viewport({
   activePanel,
   isConnected,
+  sweepPeriodMs,
   imuData,
   txActive,
   rxActive,
@@ -100,7 +101,20 @@ export default function Viewport({
   const cscanRootRef = useRef(null);
   // Called unconditionally, before any of the per-panel early returns -- hooks cannot
   // live inside those branches. Idles to null whenever the SFCW pane is not the one up.
-  const sweepRate = useSweepRate(sfcwResult, activePanel === 'sfcw' && (sfcwRunning || !!sfcwResult));
+  // The sweep rate is measured in App.jsx from EVERY sfcw_result, before the
+  // ~20 Hz live-display throttle. It must not be derived from `sfcwResult` here:
+  // that state is only set inside the throttle gate, so this header would report
+  // the DISPLAY rate while claiming to report the radar's. The two alias badly --
+  // a 50 ms gate against a 27.9 ms sweep passes exactly every other one, so a
+  // healthy 35.9 Hz radar read 17.9 Hz, which is indistinguishable from the
+  // ~18 Hz a board that has reverted to the stock FPGA image actually runs at
+  // (see CLAUDE.md, "The 18 Hz regression"). That collision cost a real
+  // debugging session: the FPGA was reloaded, the wire measured at 35.9 Hz, and
+  // the readout did not move. Keep this on the unthrottled measurement.
+  const sweepActive = activePanel === 'sfcw' && (sfcwRunning || !!sfcwResult);
+  const sweepRate = (sweepActive && sweepPeriodMs > 0)
+    ? { ms: sweepPeriodMs, hz: 1000 / sweepPeriodMs }
+    : null;
 
   if (!activePanel) {
     return (
@@ -589,34 +603,6 @@ export default function Viewport({
 // Live sweep cadence, measured from the Pi's own timestamps rather than from render
 // timing, so it reports what the radar is actually doing and not how fast React redrew.
 // Median of the adjacent differences, so one dropped or stalled frame does not move it.
-const SWEEP_RATE_WINDOW = 12;
-
-function useSweepRate(result, active) {
-  const buf = useRef([]);
-  const lastTs = useRef(null);
-  const [rate, setRate] = useState(null);
-
-  useEffect(() => {
-    if (!active) { buf.current = []; lastTs.current = null; setRate(null); }
-  }, [active]);
-
-  useEffect(() => {
-    const t = result && result.timestamp;
-    if (!t || t === lastTs.current) return;
-    lastTs.current = t;
-    buf.current.push(t);
-    if (buf.current.length > SWEEP_RATE_WINDOW) buf.current.shift();
-    if (buf.current.length < 3) return;
-    const d = [];
-    for (let i = 1; i < buf.current.length; i++) d.push(buf.current[i] - buf.current[i - 1]);
-    d.sort((a, b) => a - b);
-    const med = d[d.length >> 1];
-    if (med > 0) setRate({ ms: med * 1000, hz: 1 / med });
-  }, [result]);
-
-  return rate;
-}
-
 function PaneHeader({ icon: Icon, label, active, color, meta, action }) {
   const colorMap = {
     orange: { accent: '#D1855C', to: '#E5A986' },

@@ -5339,6 +5339,41 @@ to be inferred from a rate. A 100% `standard` block is the latch; a 100% `fallba
 block is the span gate refusing every sweep, which is a different fault with the same
 rate.
 
+### There were TWO 18 Hz faults, and they masked each other (2026-09-11)
+
+After the FPGA was reflashed and the wire measured **35.9 Hz**, the browser still
+read 18 -- because the SFCW pane header was reporting the DISPLAY rate while
+claiming to report the radar's, and the two numbers collide almost exactly.
+
+`Viewport.jsx`'s `useSweepRate` derived the rate from the `sfcwResult` STATE, but
+`App.jsx` only sets that inside the ~20 Hz live-display throttle added on
+2026-09-10 (the slow-client fix). A fixed 50 ms gate against a 27.9 ms sweep
+passes **exactly every other sweep**, so the header read the doubled period:
+
+| real sweep | what the header USED to say | what it says now |
+|---|---|---|
+| 27.9 ms (35.87 Hz, NIOS, II/f) | **17.93 Hz** | 35.87 Hz |
+| 55.5 ms (18.02 Hz, stock image) | **18.02 Hz** | 18.02 Hz |
+| 65.5 ms (15.27 Hz, old II/e) | 15.27 Hz | 15.27 Hz |
+
+**17.93 against 18.02 is not a distinguishable difference on a readout**, so the
+header showed ~18 Hz whether the radar was healthy or the FPGA had reverted --
+and it had shown ~18 ever since the throttle landed, which is why the rate looked
+like it "dropped from 37" long after the throttle actually took it there. Fixing
+the FPGA moved the wire from 18 to 36 and moved the readout not at all.
+
+**Fixed by deriving the header from the measurement `App.jsx` already takes above
+the throttle** (`sweepPeriodMs`, median of adjacent Pi timestamps over 12 sweeps),
+which the C-scan panel was already using correctly for its traverse-sampling
+arithmetic. `useSweepRate` is deleted; do not reintroduce a rate derived from
+`sfcwResult`, and note that the throttle means **any** state gated behind it is
+unsafe to measure timing from.
+
+The general lesson is the one this file keeps relearning: **an instrument fed from
+a throttled, decimated, or averaged copy of the data reports on the copy.** Same
+class as `lidar_seq` counting reads rather than measurements, and as the C-scan
+recomputing its own range profiles while the panel beside it showed the Pi's.
+
 **The failure is quiet by design and that is the real cost here.** Degrading to the
 standard sweep is the right behaviour -- it is a correct, slower sweep, not a broken one
 -- but it announces itself with a single stdout line at startup that nobody is watching,

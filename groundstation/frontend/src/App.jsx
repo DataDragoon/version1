@@ -1479,11 +1479,16 @@ export default function App() {
       };
 
       // Sweep period from the PI's own timestamps -- median of the adjacent
-      // differences over a 12-sweep window, the same statistic (and for the
-      // same reason: one stalled or dropped frame must not move it) as
-      // Viewport's useSweepRate. The C-scan panel needs it to say what a given
-      // traverse speed will actually sample at, since sweep spacing is
+      // differences over a 12-sweep window (median, not mean, so one stalled or
+      // dropped frame does not move it). This is THE sweep-rate measurement:
+      // the SFCW pane header reads it, and the C-scan panel needs it to say what
+      // a given traverse speed will actually sample at, since sweep spacing is
       // v * T_sweep and everything else follows from that.
+      //
+      // It is computed HERE, above the ~20 Hz display throttle, deliberately --
+      // it must see every sweep. Viewport used to re-derive it from the
+      // throttled `sfcwResult` and so reported the display rate as the radar's;
+      // see the note in Viewport.jsx for why that was expensive.
       {
         const sp = sweepPeriodRef.current;
         if (sp.last != null) {
@@ -2456,6 +2461,7 @@ export default function App() {
       <Viewport
         activePanel={activePanel}
         isConnected={isConnected}
+        sweepPeriodMs={sweepPeriodMs}
         imuData={imuData}
         roverStatus={roverStatus}
         roverTrail={roverTrail}

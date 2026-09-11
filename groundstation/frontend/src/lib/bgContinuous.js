@@ -130,7 +130,7 @@ const TRACK_KEEP_S = 5;
 // Adjacent sweep intervals used to estimate the sweep period, whose half is the
 // offset from the Pi's end-of-sweep timestamp back to the sweep's midpoint.
 // Median, not mean, so one stalled frame does not move it -- the same choice
-// Viewport.jsx's useSweepRate makes for the same reason.
+// App.jsx's sweep-period measurement makes for the same reason.
 const PERIOD_WINDOW = 12;
 
 // A sweep whose complex correlation with the rest of its own bin is below this
