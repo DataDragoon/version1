@@ -1,0 +1,127 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v11_signaltap.rbf
+==========================================================
+
+Status:  DEBUG IMAGE -- SignalTap instrumented (same taps as v9/v10).
+         TIMING CLEAN: every clock positive on setup AND hold at every
+         corner; pll_sclk +0.275 ns, the best in the series (v10 +0.110).
+         Supersedes v10.
+
+Build date:        2026-09-11 19:28 IST  (15 min wall, fitter seed 2)
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-11_19.28.32
+md5    (.rbf):     4d0ff508b537f160674e9ba4da23b0b6 (see .rbf.md5)
+sha256 (.rbf):     c7254aee005fd4b57df5948d16db997682cd72ede2dfbbfc539cbd7db0772f4c
+md5    (.sof):     15edbc96001469dc0af5df7a5f445dca
+Source tree:       bladerf-src @ d41819f5, branch sfcw-fpga-dsp, dirty.
+                   Same commit as v8-v10. Tracked RTL differs from v10 in
+                   rx.vhd and cw_nco.vhd (see below); bladerf-hosted.vhd
+                   carries v10's bit-6 readback unchanged.
+                   SignalTap input: signaltap/dsp_fifo.stp, unchanged since
+                   v9, archived beside this file as the .stp.
+Quartus:           18.1.0.625 Standard, device 5CEBA9F23C8, SEED 2.
+
+FILES IN THIS RELEASE
+---------------------
+    .rbf    the bitstream, for bladeRF-cli -l
+    .sof    REQUIRED for SignalTap. Keep paired.
+    .stp    the SignalTap configuration the .sof was compiled against.
+
+WHY THIS IMAGE EXISTS -- what v10 showed on hardware
+----------------------------------------------------
+v10 was the first image whose DSP path was actually exercised on the board
+(2026-09-11; every earlier run had the board's FLASH image loaded, and the
+host had two faults of its own -- see version1 commits 0b6ff7b, 65f4e85).
+Result: the path WORKS -- bursts of 51 Q14 ratios arrived 21 ms after EXEC,
+the length of the sweep -- but only on 2 sweeps in 7. The other 5: no burst
+within 1 s.
+
+Cause, from the FPGA parameters: FLUSH_N + ACCUM_N = 1088 + 2900 = 3988
+samples per step against a 4096-sample dwell -- 108 samples, ~11 us at
+10 MS/s, for the Nios's profile_activate() (SPI writes to the AD9361) to
+land the restart. It jitters by more than that. An early restart makes
+seq_adder discard the part-accumulated step; the step produces no word; the
+FIFO ends the sweep short of 51 and the gate (rx.vhd dsp_gate) never opens.
+Worse, the leftover stayed in the FIFO, the NEXT sweep topped it up, and
+that burst was the tail of one sweep and the head of the next: misaligned
+data with nothing on the host able to tell.
+
+WHAT CHANGED vs v10
+-------------------
+rx.vhd
+  1. DSP_ACCUM_N 2900 -> 2400 (24 whole 100-sample tone cycles).
+     Per-step need 3488 samples; 608 samples (~61 us) of guard at dwell
+     4096. Cost 0.8 dB of per-point SNR. Sweep stays 21 ms / ~48 Hz.
+  2. DSP FIFO, sweep counter (dsp_meta_writer) and gate (dsp_gate) are
+     held CLEAR while dsp_path_en is low:
+         dsp_fifo_aclr <= sample_fifo_raclr or not dsp_path_en;
+     plus a second synchroniser (U_sync_dsp_path_en_rx) for the counter
+     in the rx_clock domain. The host realigns the FIFO with the next
+     sweep by dropping bit 6 and raising it -- bladerf_driver.dsp_resync()
+     -- two GPIO writes, the RX stream untouched. One lost step costs one
+     sweep, never the following ones. Nothing is collected while the path
+     is deselected (priming retunes, for instance).
+  3. dsp_in_reg: the mixers' input samples registered once. The rx mux
+     (ADC / loopback / generator) is combinational and fed the DSP-block
+     multiply directly; that was the first v11 fit's worst path (-0.233).
+cw_nco.vhd
+  4. cos_out/sin_out registered. phase -> 100-way ROM mux -> DSP multiply
+     was the second fit's worst path (-0.543). The tone now trails the
+     sample by one entry: a constant -2*pi/100 on the demodulated result,
+     identical on both channels, cancels exactly in h.
+
+Simulation (ModelSim 2020.1, rx_dsp_onoff_tb, real rx.vhd + real fx3_gpif):
+    sim_dsp_on.do      5 steps, path on   : burst of 2048 DWORDs, 5 ratios
+                       within 3 LSB of the reference, constant tail   PASS
+    sim_dsp_off.do     path off           : raw samples as injected     PASS
+    sim_dsp_resync.do  3 steps in (gate held, no burst), bit 6 1->0->1,
+                       5 fresh steps: ONE burst, the 5 fresh values,
+                       nothing of the 3 stale ones                     PASS
+
+TIMING (Slow 1100mV 85C, worst slack per clock, ns)
+----------------------------------------------------
+    fit                    1 (seed 1)   2 (seed 1)   3 (seed 1)   4 (seed 2) = THIS
+    pll_sclk setup         -0.233       -0.543       -0.123       +0.275
+      worst path           rx mux ->    NCO ROM ->   tx_tamer ->  (none of the
+                           mixer mult   mixer mult   meta_time_go  above)
+      fix applied          dsp_in_reg   NCO reg      seed 2
+    fit 3's path is Nuand's stock 64-bit timestamp compare in the TX path,
+    placement-dependent, not touched.
+
+    pll_sclk       +0.275 setup / +0.265 hold
+    pll_fclk       +0.727 / +2.395
+    U_fx3_pll      +2.221 / +0.394
+    U_system_pll   +2.279 / +0.295
+    fx3_pclk       +4.540 / +0.448
+    tck            +3.969 / +0.200
+    c5_clock2      +8.899 / +0.423
+    Global minimum, all corners / all checks: +0.009 ns. TNS 0 everywhere.
+
+SIGNALTAP -- unchanged from v9/v10
+----------------------------------
+    Instance dsp_fifo, 83 bits, 2048 samples, clock rx_clock:
+    sample_fifo_51 wr_ptr[6..0], complex_div i_out/q_out[30..0], zero_den,
+    complex_div / seq_adder states, cw_nco phase, dsp_restart_d/_pulse.
+    Storage qualifier: Transitional (set in the GUI). i_out/q_out: Signed.
+    Rule: USB configures, JTAG observes.
+
+HOST-SIDE COUNTERPART (version1, branch sfcw-default-range-offset)
+------------------------------------------------------------------
+    5fdcc7e  dsp_resync() on a missed burst, stream kept; rebuild only
+             after 5 misses running; DSP_MIN_DWELL = 3488
+    65f4e85  -1 from sync_rx is a timed-out wait (thread.h/sync.c), reported
+             as "no burst within N ms"; test_dsp_path.py --dwell
+    0b6ff7b  TX plain SC16_Q11 in dsp mode (was _META: ERR_INVAL)
+    e261052  check_bit6.py: which image is running, does bit 6 land
+
+HOW TO USE
+----------
+    Pi, services stopped:
+      bladeRF-cli -l /home/sfr/vikram_fpga_dump/version1/fpga/images/hostedxA9_niosIIf_sweep_dsp_v11_signaltap.rbf
+      python3 radar/check_bit6.py        -> HOST, bit 6 reads back
+    then start.py and
+      python3 radar/test_dsp_path.py --seconds 20
+    Expect every sweep 'dsp', "DSP burst 21 ms after EXEC" per sweep, and
+    RESULT: PASS. A sweep that still misses now prints "no burst within
+    ... ms" once and the next sweep starts from a cleared FIFO.
+
+    The image is lost on power cycle (flash still holds the old 0.16.0
+    image); check_bit6.py shows FLASH + bit 6 = 0 when that has happened.
