@@ -106,8 +106,11 @@ export default function BgModelDisplay({ captures, capturing, sfcwProgress, stop
       if (snr == null) return;
       const frac = (snr - (snrMin - snrSpan * 0.15)) / (snrSpan * 1.15);
       const barH = Math.max(2, frac * snrH);
+      // null coherence means a single-sweep position, which cannot be scored at
+      // all -- neutral grey, distinct from both a good bar and a bad one.
       const coh = p.stats.coherence;
-      ctx.fillStyle = coh > 0.95 ? 'rgba(74,222,128,0.55)'
+      ctx.fillStyle = coh == null ? 'rgba(148,163,184,0.45)'
+        : coh > 0.95 ? 'rgba(74,222,128,0.55)'
         : coh > 0.85 ? 'rgba(250,204,21,0.55)'
         : 'rgba(248,113,113,0.55)';
       ctx.fillRect(x - 2.5, snrTop + snrH - barH, 5, barH);

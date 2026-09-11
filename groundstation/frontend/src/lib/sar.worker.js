@@ -278,6 +278,12 @@ self.onmessage = function (e) {
   const pixelsX = 100;
   const pixelsZ = 100;
 
+  // NOTE: `bscanData` here is NOT a full C-scan record list. `useSarWorker`
+  // projects it down to the handful of fields read below before posting, because
+  // structured-cloning the whole thing (every raw sweep of every cell) reached
+  // 282 MB and 3.2 s on a long scan and threw DataCloneError. If you need
+  // another field, add it to SAR_INPUT_FIELDS in hooks/useSarWorker.js -- a
+  // field that is not projected arrives as `undefined`, silently.
   const numPositions = bscanData.length;
   if (numPositions < 2 || !bscanData[0].magnitudes || !bscanData[0].distances) {
     self.postMessage({ type: 'result', result: null });
@@ -366,7 +372,7 @@ self.onmessage = function (e) {
   const numBins = distances.length;
   const numSteps = hasHcal ? bscanData[0].h_cal_real.length : 0;
   const freqStepHz = bscanData[0].step_size || 20000000;
-  const rangeOffset = bscanData[0].range_offset || 0.5;
+  const rangeOffset = bscanData[0].range_offset || 0.378;
 
   // The two paths index DIFFERENT profiles -- the coherent one rebuilds its own
   // zero-padded IFFT from h_cal, the incoherent one uses the magnitudes/distances that

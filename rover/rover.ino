@@ -84,8 +84,22 @@ static uint32_t idleDisableMs = IDLE_DISABLE_MS;
 static uint32_t lastSeq = 0;
 static uint32_t inFlightSeq = 0;
 static bool movePending = false;
+// Which axes the in-flight move actually commanded. `stop_reason` is per axis
+// and is NOT cleared by moveTo, so an axis left out of a move still carries
+// whatever ended its previous one -- and reporting that as this move's outcome
+// makes a perfectly good move come back as 'limit' or 'requested'. The Pi
+// aborts a raster on any reason but 'completed', so that is a scan lost to a
+// stale byte.
+static bool inFlightAxes[NUM_AXES] = { false, false };
 
 static bool linkUp = false;
+// Consecutive failed sendTXT calls. A half-open TCP connection -- the state a
+// Pi that loses power abruptly leaves behind, with no FIN and no RST -- keeps
+// the library reporting the client as connected until its own heartbeat gives
+// up. A failed write is the earliest unambiguous evidence there is, it costs
+// nothing (the board is already sending 20 status frames a second), and the old
+// firmware threw the return value away.
+static uint16_t txFails = 0;
 static uint32_t lastStatusMs = 0;
 static uint32_t lastMotionMs = 0;
 static bool persistDirty = false;
@@ -231,7 +245,12 @@ static void send(const proto::Writer& w) {
         Serial.println("[tx] DROPPED: message overflowed the buffer");
         return;
     }
-    if (linkUp) webSocket.sendTXT(w.c_str());
+    if (!linkUp) return;
+    if (webSocket.sendTXT(w.c_str())) {
+        txFails = 0;
+    } else if (txFails < 0xFFFF) {
+        ++txFails;
+    }
 }
 
 static void sendHello() {
@@ -353,7 +372,11 @@ static void dispatchQueued() {
     movePending = true;
     noInterrupts();
     for (uint8_t i = 0; i < NUM_AXES; ++i) {
+        inFlightAxes[i] = m.has[i];
         if (!m.has[i]) continue;
+        // Clear the previous move's outcome before starting this one, so the
+        // reason reported below can only have come from this move.
+        axes[i].stop_reason = STOP_NONE;
         axes[i].moveTo(m.rel ? axes[i].position + m.value[i] : m.value[i]);
     }
     interrupts();
@@ -591,12 +614,14 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
     case WStype_CONNECTED:
         linkUp = true;
+        txFails = 0;
         Serial.println("[ws] connected");
         sendHello();
         break;
 
     case WStype_DISCONNECTED:
         linkUp = false;
+        txFails = 0;
         Serial.println("[ws] disconnected");
         movePending = false;
         // Losing the link must not leave the rover driving. The jog dead-man
@@ -627,6 +652,53 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 }
 
 // ── network bring-up ────────────────────────────────────────────────────────
+//
+// WHY THIS IS A LADDER AND NOT TWO INDEPENDENT KEEP-ALIVES
+// -------------------------------------------------------
+// The previous version had two layers with a strictly one-way trust
+// relationship: linkReady() was the sole authority on the WiFi layer, and the
+// socket layer deferred to it unconditionally ("ensureNetwork owns that case").
+// That is the bug behind "it never even tries to come back, and only a ROUTER
+// restart fixes it".
+//
+// WiFi.status() and WiFi.localIP() are not measurements of a working network.
+// They are the modem's opinion of itself, and the modem latches: after the AP
+// goes away without a clean deauth -- which is exactly what a power cut at
+// either end leaves behind, and what an AP still holding a stale station entry
+// for this MAC produces -- status() can sit at WL_CONNECTED with the last-known
+// address still in localIP() indefinitely. When that happened, ensureNetwork()
+// returned at its first line every single iteration and never re-associated,
+// while ensureSocket() churned disconnect()/begin() against a dead stack
+// forever. Nothing could break the deadlock, because the one piece of hard
+// evidence available -- a socket that will not come back -- was never allowed
+// to act on the layer below it.
+//
+// So: a socket that stays dead is now treated as evidence about the RADIO, and
+// the radio is checked against the NETWORK (a gateway ping) rather than against
+// its own status register. The ladder, keyed on how long the link has been
+// down:
+//
+//   0-10 s    nothing; the library's own reconnect is given its chance
+//   10 s      restart the websocket client
+//   ~30 s     after NET_RECYCLE_AFTER_TRIES restarts, ask the gateway whether
+//             the network is actually there:
+//               it answers  -> radio and LAN are fine, the Pi is simply not
+//                              running. Keep retrying the socket. Do NOT
+//                              recycle and do NOT reset -- a Pi that is off is
+//                              an everyday state, not a fault.
+//               it is silent -> the radio is lying about being connected. Tear
+//                              it all the way down (WiFi.end()) and start over,
+//                              which is the only thing that reliably clears a
+//                              wedged modem and reclaims the sockets it holds.
+//   5 min     the network has not answered once in all that time and every
+//             recycle has failed. Reset the board. That is the state this
+//             firmware could not otherwise clear, and it is what the operator
+//             was reaching for by hand -- except they were power-cycling the
+//             ROUTER, because power-cycling the BOARD did not help either.
+//
+// Nothing here can leave the rover driving: losing the link already stops the
+// axes and clears the queue (see WStype_DISCONNECTED), the jog dead-man lives
+// in the ISR, and the reset is refused unless the rig is parked.
 
 // Prints the radio's MAC in both byte orders, because this family of libraries
 // fills the array backwards (the Arduino examples print index 5 down to 0) and
@@ -646,14 +718,81 @@ static void printMacAddress() {
     Serial.println(fwd);
 }
 
-// Associated AND actually on the network. These are different states, and
-// conflating them is what let the board wedge: an AP holding a stale lease for
-// this MAC (after a power cycle, say) will happily associate it and then never
-// answer its DHCP request, leaving WiFi.status() == WL_CONNECTED forever with
-// no address. Anything that only tests status() will never retry.
+// Associated AND holding an address. Necessary, not sufficient -- see the note
+// above about the modem latching this. Never treat it as proof of a network.
 static bool linkReady() {
     return WiFi.status() == WL_CONNECTED &&
            WiFi.localIP() != IPAddress(0, 0, 0, 0);
+}
+
+// Is there actually a network out there? This is the only question in this file
+// whose answer does not come from the modem's opinion of itself, which is why
+// the whole ladder turns on it. A gateway that answers ICMP proves the radio is
+// associated, that the link passes traffic, and that the LAN is up -- all of
+// which WiFi.status() will happily claim while none of them are true.
+//
+// Deliberately NOT a ping of the Pi: the Pi being off is an ordinary state and
+// must never be mistaken for a broken radio.
+static bool networkResponds() {
+#if NET_USE_PING
+    const IPAddress gw = WiFi.gatewayIP();
+    if (gw == IPAddress(0, 0, 0, 0)) return false;
+    // Returns the round trip in ms, or negative on timeout/unreachable.
+    return WiFi.ping(gw) >= 0;
+#else
+    // Fallback if WiFi.ping() is unavailable on this core. It answers NO, not
+    // linkReady(): the whole question being asked is whether to believe the
+    // modem, and answering it with the modem's own opinion reinstates the exact
+    // deadlock this file exists to break -- a latched WL_CONNECTED would report
+    // a healthy network for ever and nothing would ever escalate.
+    //
+    // Saying no instead means the ladder can no longer tell "the Pi is off"
+    // from "the radio is wedged", so it recycles the radio (and eventually
+    // resets) in both cases. That is wasteful when the Pi is merely off, and it
+    // is the right way round: a needless recycle costs a few seconds, a missed
+    // one costs the session.
+    return false;
+#endif
+}
+
+// Reports whether the configured SSID is even on the air, and at what level.
+// Run only after repeated association failures, because a scan takes seconds
+// and disturbs an association attempt. It is the measurement that separates
+// "the AP is refusing this board" from "the AP is not there at all" -- and
+// without it both look identical in the log, which is how this fault came to be
+// diagnosed as "restart the router" rather than as anything specific.
+static void reportScan() {
+    Serial.println("[wifi] scanning to see whether the AP is on the air...");
+    const int n = WiFi.scanNetworks();
+    if (n <= 0) {
+        Serial.println("[wifi] scan found NO networks at all -- that is this "
+                       "radio or its antenna, not the AP");
+        return;
+    }
+    bool found = false;
+    for (int i = 0; i < n; ++i) {
+        const char* ssid = WiFi.SSID(i);
+        if (ssid && strcmp(ssid, WIFI_SSID) == 0) {
+            found = true;
+            Serial.print("[wifi] '");
+            Serial.print(WIFI_SSID);
+            Serial.print("' IS visible, rssi ");
+            Serial.println((long)WiFi.RSSI(i));
+        }
+    }
+    if (!found) {
+        Serial.print("[wifi] '");
+        Serial.print(WIFI_SSID);
+        Serial.print("' NOT visible among ");
+        Serial.print(n);
+        Serial.println(" networks -- wrong SSID, out of range, or the AP is on "
+                       "a band or channel this radio cannot see");
+    } else {
+        Serial.println("[wifi] the AP is there and we still cannot join it: "
+                       "wrong password, MAC filtering, or the AP is holding a "
+                       "stale station entry for this MAC. If only a ROUTER "
+                       "restart ever clears it, enable USE_STATIC_IP.");
+    }
 }
 
 static bool connectWiFi(uint32_t timeoutMs) {
@@ -678,6 +817,11 @@ static bool connectWiFi(uint32_t timeoutMs) {
     if (WiFi.status() != WL_CONNECTED) {
         Serial.print("[wifi] association failed, status=");
         Serial.println(WiFi.status());
+        // Printed on FAILURE as well as on success. The MAC is what a DHCP
+        // reservation is keyed on, so it is wanted exactly when the board is
+        // NOT getting on the network -- the old firmware printed it only after
+        // a successful connect, i.e. never when it mattered.
+        printMacAddress();
         return false;
     }
 
@@ -691,77 +835,207 @@ static bool connectWiFi(uint32_t timeoutMs) {
         // in this half-connected state, so the next attempt starts clean.
         Serial.println("[wifi] associated but got NO DHCP LEASE -- disconnecting "
                        "so the next attempt starts fresh");
+        printMacAddress();
         WiFi.disconnect();
         return false;
     }
     Serial.print("[wifi] ip ");
     Serial.print(WiFi.localIP());
+    Serial.print("  gw ");
+    Serial.print(WiFi.gatewayIP());
     Serial.print("  rssi ");
     Serial.println(WiFi.RSSI());
     printMacAddress();
     return true;
 }
 
-// Retries forever with a bounded backoff. The previous firmware returned from
-// setup() on a WiFi failure, leaving loop() servicing an uninitialised socket
-// until someone power-cycled the board.
-static void ensureNetwork() {
-    static uint32_t nextAttempt = 0;
-    static uint32_t backoff = 2000;
-    static uint16_t failures = 0;
-
-    // linkReady(), not status(): see the note above it. Testing status() alone
-    // is what left the board unable to recover from a power cycle -- it would
-    // sit associated with no IP and this function would return here every time.
-    if (linkReady()) {
-        backoff = 2000;
-        failures = 0;
-        return;
-    }
-    if (millis() < nextAttempt) return;
-
-    Serial.print("[wifi] link not ready (status=");
-    Serial.print(WiFi.status());
-    Serial.print(" ip=");
-    Serial.print(WiFi.localIP());
-    Serial.print(") attempt ");
-    Serial.println(failures + 1);
-
-    if (connectWiFi(15000)) {
-        backoff = 2000;
-        failures = 0;
-        webSocket.begin(PI_HOST, PI_PORT, "/");
-    } else {
-        ++failures;
-        // Back off, but never so far that the rover is unusable for minutes.
-        backoff = (backoff < 20000) ? backoff * 2 : 20000;
-        if (failures == 5) {
-            Serial.println("[wifi] five failed attempts -- if this only clears "
-                           "when the ROUTER is restarted, the AP is holding a "
-                           "stale lease: enable USE_STATIC_IP in config.h");
-        }
-    }
-    nextAttempt = millis() + backoff;
+// Tear the radio all the way down and bring it back. WiFi.disconnect() only
+// drops the association; WiFi.end() stops the WiFi stack in the modem, which is
+// what releases the sockets it is still holding and re-arms its connection
+// state machine. Reconnecting without it is what leaves a wedged modem wedged --
+// and the socket layer asks for a fresh client on every reconnect attempt, so a
+// link that has been down for an hour has asked the modem for hundreds of them.
+static bool recycleRadio() {
+    Serial.println("[wifi] RECYCLING the radio (end + re-associate)");
+    webSocket.disconnect();
+    WiFi.disconnect();
+    WiFi.end();
+    delay(500);
+    return connectWiFi(NET_ASSOC_TIMEOUT_MS);
 }
 
-// Last resort for a socket that will not come back on its own. The library
-// reconnects by itself in the normal case; this covers the case where it does
-// not -- notably when the far end (rover_server.py) restarts, which happens
-// routinely and would otherwise strand the board with healthy WiFi and a dead
-// link until someone power-cycled it.
-static void ensureSocket() {
-    static uint32_t lastLinkUpMs = 0;
-    const uint32_t now = millis();
-    if (linkUp) {
-        lastLinkUpMs = now;
-        return;
-    }
-    if (!linkReady()) return;                       // ensureNetwork owns that case
-    if (now - lastLinkUpMs < WS_RECONNECT_FORCE_MS) return;
-    Serial.println("[ws] socket down too long -- restarting the client");
+static void restartSocket() {
     webSocket.disconnect();
     webSocket.begin(PI_HOST, PI_PORT, "/");
-    lastLinkUpMs = now;
+}
+
+// A reset is only ever taken from a standstill. It is not a safety event in
+// itself -- motion is already stopped by the time the ladder gets this far, and
+// the position survives in flash -- but it must not silently clear a latched
+// E-stop or re-validate a position the operator was told not to trust.
+static bool boardParked() {
+    if (estopLatched) return false;
+    if (movePending || qCount > 0) return false;
+    return !axes[AXIS_V].isMoving() && !axes[AXIS_H].isMoving();
+}
+
+// Make the flash copy agree with the live one before a deliberate reset.
+// loadPosition() marks the position VALID whenever it finds a well-formed blob,
+// so coming back from a reset with a stale-but-checksummed blob would silently
+// re-declare a position an E-stop had invalidated. Clearing the magic is how
+// "no trustworthy position" is expressed in that format.
+//
+// Both branches are guarded against writing bytes that are already there. A
+// board that can never reach the network resets every NET_REBOOT_MS, so an
+// unconditional write here would be a flash erase every five minutes for as
+// long as the fault lasts -- some 300 a day against the data flash's endurance,
+// for no information gained.
+static void persistBeforeReset() {
+    if (positionValid) {
+        if (axes[AXIS_V].position != persistedPos[AXIS_V] ||
+            axes[AXIS_H].position != persistedPos[AXIS_H]) {
+            savePosition();
+        }
+        return;
+    }
+    PersistBlob cur;
+    EEPROM.get(0, cur);
+    if (cur.magic == 0) return;          // already says "nothing trustworthy"
+    PersistBlob b;
+    b.magic = 0;
+    b.pos[AXIS_V] = 0;
+    b.pos[AXIS_H] = 0;
+    b.check = 0;
+    EEPROM.put(0, b);
+}
+
+// The whole ladder. Called once per loop(); everything is rate-limited inside.
+static void serviceNetwork() {
+    // Last moment the NETWORK was known good -- a live websocket, or a gateway
+    // that answered. Only this drives the reset, so a Pi that is simply off can
+    // never cause one however long it stays off.
+    static uint32_t netOkMs = 0;
+    static uint32_t nextTryMs = 0;
+    static uint32_t wifiBackoff = NET_WIFI_RETRY_MS;
+    static uint8_t socketTries = 0;
+    static uint16_t assocFailures = 0;
+
+    const uint32_t now = millis();
+
+    // The one unambiguous good state. txFails is folded in because a websocket
+    // whose writes all fail is not up, whatever the library thinks -- see
+    // send(), where a half-open TCP connection first shows itself.
+    if (linkUp && txFails < NET_TX_FAIL_LIMIT) {
+        netOkMs = now;
+        nextTryMs = now + WS_RECONNECT_FORCE_MS;
+        wifiBackoff = NET_WIFI_RETRY_MS;
+        socketTries = 0;
+        assocFailures = 0;
+        return;
+    }
+
+    // Wrap-safe: a plain `now < nextTryMs` stops working after 49.7 days.
+    if ((int32_t)(now - nextTryMs) < 0) return;
+
+    // ── last resort, checked BEFORE acting ──────────────────────────────────
+    // It has to be here rather than after the branches below. Each of them
+    // either returns on success or reschedules, so a modem that kept
+    // associating happily onto a network that does not work would escalate for
+    // ever and never reach a check placed after them -- which is the exact
+    // shape of the wedge this whole ladder exists to break.
+    //
+    // The gateway gets one more chance first: netOkMs is only refreshed by a
+    // live websocket or an answering gateway, so five minutes of silence is
+    // also consistent with the network having come back quietly since the last
+    // ping.
+    if ((uint32_t)(now - netOkMs) >= NET_REBOOT_MS) {
+        if (networkResponds()) {
+            netOkMs = millis();
+        } else if (!boardParked()) {
+            // Refused while there is motion, queued work or a latched E-stop.
+            // Rechecked next tick; the rig cannot be moving for long with no
+            // link, because losing it stops the axes.
+            Serial.println("[net] offline past the reset threshold but the rig "
+                           "is not parked -- holding off");
+            nextTryMs = millis() + WS_RECONNECT_FORCE_MS;
+            return;
+        } else {
+            Serial.print("[net] no network for ");
+            Serial.print((unsigned long)(NET_REBOOT_MS / 1000UL));
+            Serial.println(" s and every recovery has failed -- RESETTING the "
+                           "board");
+            persistBeforeReset();
+            delay(100);          // let the serial line drain
+            NVIC_SystemReset();
+        }
+    }
+
+    if (!linkReady()) {
+        // ── the modem says it is not connected: ordinary re-association ─────
+        Serial.print("[wifi] link not ready (status=");
+        Serial.print(WiFi.status());
+        Serial.print(" ip=");
+        Serial.print(WiFi.localIP());
+        Serial.print(") attempt ");
+        Serial.println(assocFailures + 1);
+
+        // Every attempt after the first goes through a full teardown. The first
+        // does not, because the common case is a brief AP hiccup that a plain
+        // re-associate clears in a second.
+        const bool ok = (assocFailures == 0) ? connectWiFi(NET_ASSOC_TIMEOUT_MS)
+                                             : recycleRadio();
+        if (ok) {
+            assocFailures = 0;
+            wifiBackoff = NET_WIFI_RETRY_MS;
+            socketTries = 0;
+            restartSocket();
+            // A brand-new association deserves the ladder from the top.
+            nextTryMs = millis() + WS_RECONNECT_FORCE_MS;
+            return;
+        }
+
+        ++assocFailures;
+        if (assocFailures % NET_SCAN_EVERY == 0) reportScan();
+        wifiBackoff = (wifiBackoff < NET_WIFI_RETRY_MAX_MS)
+                          ? wifiBackoff * 2
+                          : NET_WIFI_RETRY_MAX_MS;
+        nextTryMs = millis() + wifiBackoff;
+    } else {
+        // ── the modem says it IS connected, but the socket is not ───────────
+        ++socketTries;
+        nextTryMs = now + WS_RECONNECT_FORCE_MS;
+
+        if (socketTries < NET_RECYCLE_AFTER_TRIES) {
+            Serial.print("[ws] socket down -- restarting the client (try ");
+            Serial.print(socketTries);
+            Serial.println(")");
+            restartSocket();
+            return;
+        }
+
+        // The socket has refused to come back several times running. Stop
+        // believing the status register and ask the network itself.
+        socketTries = 0;
+        if (networkResponds()) {
+            // Radio and LAN are fine. The Pi is not running, or not listening.
+            // Nothing to escalate -- keep knocking.
+            netOkMs = now;
+            Serial.println("[net] gateway answers -- the network is fine and "
+                           "the Pi is not. Retrying the socket.");
+            restartSocket();
+            return;
+        }
+
+        Serial.println("[net] socket dead AND the gateway silent, while "
+                       "WiFi.status() claims we are connected -- the radio is "
+                       "not to be trusted");
+        if (recycleRadio()) {
+            restartSocket();
+            nextTryMs = millis() + WS_RECONNECT_FORCE_MS;
+            return;
+        }
+        nextTryMs = millis() + NET_WIFI_RETRY_MS;
+    }
 }
 
 // ── timer bring-up ──────────────────────────────────────────────────────────
@@ -841,22 +1115,26 @@ void setup() {
         setDriversEnabled(true);
     }
 
-    connectWiFi(20000);
-    webSocket.begin(PI_HOST, PI_PORT, "/");
+    // onEvent BEFORE begin: begin() is what arms the client, and a handler
+    // registered after it is a race for no reason.
     webSocket.onEvent(webSocketEvent);
     webSocket.setReconnectInterval(3000);
     // Keeps the socket alive across long moves; the previous firmware could not
     // service pings while moving at all.
     webSocket.enableHeartbeat(15000, 3000, 2);
+
+    // A failure here is not fatal and never was worth blocking on: serviceNetwork()
+    // owns every retry from now on, including this one.
+    connectWiFi(NET_ASSOC_TIMEOUT_MS);
+    restartSocket();
     Serial.println("[ws] client started");
 }
 
 void loop() {
     // No motion code here on purpose -- see the header comment. Everything below
     // is allowed to block for milliseconds without affecting a single step.
-    ensureNetwork();
+    serviceNetwork();
     webSocket.loop();
-    ensureSocket();
 
     dispatchQueued();
 
@@ -866,8 +1144,9 @@ void loop() {
     if (movePending && !axes[AXIS_V].isMoving() && !axes[AXIS_H].isMoving()) {
         movePending = false;
         noInterrupts();
-        const StopReason vr = axes[AXIS_V].stop_reason;
-        const StopReason hr = axes[AXIS_H].stop_reason;
+        // Only the axes this move commanded have anything to say about it.
+        const StopReason vr = inFlightAxes[AXIS_V] ? axes[AXIS_V].stop_reason : STOP_NONE;
+        const StopReason hr = inFlightAxes[AXIS_H] ? axes[AXIS_H].stop_reason : STOP_NONE;
         axes[AXIS_V].done_flag = false;
         axes[AXIS_H].done_flag = false;
         interrupts();

@@ -1,7 +1,14 @@
 // Minimal Arduino API stubs. Exist ONLY so rover/rover.ino can be type-checked
 // with g++ on a machine that has no Arduino toolchain -- see test/build_check.sh.
 // They are never compiled into the firmware.
+//
+// The guard is shared with test/netstubs/Arduino.h, which is a scriptable
+// replacement for this file. Both are reached as "Arduino.h" from the other
+// stub headers, so #pragma once cannot deduplicate them -- whichever the
+// include path finds first wins and the other must fall away.
 #pragma once
+#ifndef ROVER_ARDUINO_STUB_H
+#define ROVER_ARDUINO_STUB_H
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -22,6 +29,8 @@ inline unsigned long millis() { return 0; }
 inline unsigned long micros() { return 0; }
 inline void noInterrupts() {}
 inline void interrupts() {}
+// CMSIS, available on the RA4M1 core through the real Arduino headers.
+inline void NVIC_SystemReset() {}
 
 struct IPAddress;
 
@@ -54,3 +63,5 @@ struct IPAddress {
     bool operator!=(const IPAddress& o) const { return !(*this == o); }
 };
 inline void __ip_printable(const IPAddress&) {}
+
+#endif  // ROVER_ARDUINO_STUB_H

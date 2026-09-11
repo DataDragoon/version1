@@ -377,7 +377,7 @@ class SFCWEngine:
         self.rx2_gain = 5
         self.rx_gain_min = 5
         self.rx_gain_max = 38
-        self.range_offset = 0.5
+        self.range_offset = 0.378
         self.bscan_avg_count = 1
         self.bscan_primer = False
         self.running = False

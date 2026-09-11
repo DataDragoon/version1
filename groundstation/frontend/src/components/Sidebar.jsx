@@ -87,12 +87,14 @@ export default function Sidebar({
   cscanSharedScale,
   cscanBgDiag,
   bscanProcParams,
+  onBscanProcParamsChange,
+  bscanProcLocked,
   bscanCaptureProgress,
   onBgAppliedChange,
   bscanParams,
   onBscanParamsChange,
   onBscanAction,
-  roverScan,
+  roverScan, roverRowStats, sweepPeriodMs, roverOriginAnchor,
   bscanScaleMode,
   onBscanScaleModeChange,
   bscanDisplayMode,
@@ -103,6 +105,10 @@ export default function Sidebar({
   bscanShowGate,
   onBscanShowGateChange,
   cscanProjection,
+  cscanSmooth,
+  onCscanSmoothChange,
+  cscanColormap,
+  onCscanColormapChange,
   onCscanProjectionChange,
   cscanProjector,
   onCscanProjectorChange,
@@ -179,8 +185,23 @@ export default function Sidebar({
   bgModelTrainResult,
   bgModelTrainError,
   bgModelSweepsPerCapture,
+  bgContinuousActive,
+  bgContinuousStats,
+  bgContBinMm,
+  onBgContBinChange,
+  bgContMaxSpeed,
+  onBgContMaxSpeedChange,
   onBgModelSweepsChange,
   onBgModelAction,
+  bgScanMode,
+  onBgScanModeChange,
+  bgRoverSpanMm,
+  onBgRoverSpanChange,
+  bgRoverStepMm,
+  onBgRoverStepChange,
+  bgRoverDirection,
+  onBgRoverDirectionChange,
+  roverBgScan,
   imagingSnapshot,
   imagingSnapshotName,
   onLoadImagingSnapshot,
@@ -327,10 +348,28 @@ export default function Sidebar({
                   trainResult={bgModelTrainResult}
                   trainError={bgModelTrainError}
                   sweepsPerCapture={bgModelSweepsPerCapture}
+                  continuousActive={bgContinuousActive}
+                  continuousStats={bgContinuousStats}
+                  contBinMm={bgContBinMm}
+                  onContBinChange={onBgContBinChange}
+                  contMaxSpeed={bgContMaxSpeed}
+                  onContMaxSpeedChange={onBgContMaxSpeedChange}
                   onSweepsChange={onBgModelSweepsChange}
                   stopFreq={sfcwParams.stopFreq}
                   onModelAction={onBgModelAction}
                   lidarMm={lidarMm}
+                  roverConnected={roverConnected}
+                  roverStatus={roverStatus}
+                  bgScanMode={bgScanMode}
+                  onBgScanModeChange={onBgScanModeChange}
+                  bgRoverSpanMm={bgRoverSpanMm}
+                  onBgRoverSpanChange={onBgRoverSpanChange}
+                  bgRoverStepMm={bgRoverStepMm}
+                  onBgRoverStepChange={onBgRoverStepChange}
+                  bgRoverDirection={bgRoverDirection}
+                  onBgRoverDirectionChange={onBgRoverDirectionChange}
+                  roverBgScan={roverBgScan}
+                  sendRover={sendRover}
                 />
               )}
               {activePanel === 'sfcw' && (
@@ -394,6 +433,8 @@ export default function Sidebar({
                   sharedScale={cscanSharedScale}
                   bgDiag={cscanBgDiag}
                   procParams={bscanProcParams}
+                  onProcParamsChange={onBscanProcParamsChange}
+                  procLocked={bscanProcLocked}
                   captureProgress={bscanCaptureProgress}
                   onBgAppliedChange={onBgAppliedChange}
                   onScanAction={onBscanAction}
@@ -401,6 +442,9 @@ export default function Sidebar({
                   roverStatus={roverStatus}
                   sendRover={sendRover}
                   roverScan={roverScan}
+                  roverRowStats={roverRowStats}
+                  originAnchor={roverOriginAnchor}
+                  sweepPeriodMs={sweepPeriodMs}
                   params={bscanParams}
                   onParamsChange={onBscanParamsChange}
                   scaleMode={bscanScaleMode}
@@ -420,6 +464,10 @@ export default function Sidebar({
                   onShowGateChange={onBscanShowGateChange}
                   projection={cscanProjection}
                   onProjectionChange={onCscanProjectionChange}
+                  smooth={cscanSmooth}
+                  onSmoothChange={onCscanSmoothChange}
+                  colormap={cscanColormap}
+                  onColormapChange={onCscanColormapChange}
                   projector={cscanProjector}
                   onProjectorChange={onCscanProjectorChange}
                   lidarMm={lidarMm}

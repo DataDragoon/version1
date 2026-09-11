@@ -64,7 +64,10 @@ throttle the LiDAR rate. The LiDAR read is guarded the same way.
 **Diagnosing a missing standoff readout:** the sidebar's IMU Hz tile is on every panel and
 tells the two cases apart. Hz blank -> the sensor stream (port 9001) is down, check
 `stream.py`'s stdout on the Pi. Hz live but Standoff `—` -> the stream is up and
-`read_distance()` is returning `None`, so it's the TF-LC02 serial path (`/dev/serial0`).
+`read_distance()` is returning `None`, so it's the TF-LC02 path.
+**Since 2026-09-11 you no longer have to guess which:** the packet carries `lidar_err`
+naming the cause, and `stream.py` logs a dropout in plain words. See "LiDAR dropouts are
+the SENSOR refusing to range" below -- do NOT start from the wiring again.
 
 **LiDAR silent-serial investigation (2026-08-24), unresolved — needs a bench check, not
 more code.** `read_distance()` returns `None` because the TF-LC02 gives back literally zero
@@ -273,6 +276,240 @@ above), so don't just guess a lower rate to silence it without testing on the be
 The `[INFO @ .../version.c]` firmware/FPGA-newer-than-compatibility-table lines are harmless
 and expected — libbladeRF's bundled compatibility table just lags the flashed firmware/FPGA
 versions; ignore them, don't chase a libbladeRF upgrade just to silence an INFO line.
+
+## LiDAR dropouts are the SENSOR refusing to range, not the link (2026-09-11)
+
+Reported as "random issues with the lidar sometimes not working", and separately as
+"running long c scans, randomly the lidar data stops and I get those scans with the x
+mark". Both are one fault, now measured and now self-reporting.
+
+### What it is
+
+**The module answers every single command and reports a non-zero `error_code`.** Measured
+live on the bench: over 30 s, 16.9% of reads failed, **every one of them sensor-reported,
+with zero link failures**. The UART underneath is spotless --
+`TIOCGICOUNT` on `/dev/ttyAMA3` (read without consuming bytes, alongside a running
+`stream.py`) gives **888 B/s TX = 177.6 commands/s against 1423 B/s RX = 177.9 replies/s,
+a clean 1:1, and 0 frame / parity / overrun / break / buf_overrun over 100 s.**
+
+So this is a SIGHTING problem -- target range, angle, reflectivity, ambient IR -- and the
+fix is to aim the head, not to re-check cables. **Do not re-run the 2026-08-24 wiring
+investigation.** That one was real and is fully resolved (dead UART0 receiver); this is a
+different failure with the same symptom, and the two were indistinguishable until now.
+
+The dropouts are **total and long**: runs of 9.0 s, 22.3 s, 2.4 s and 1.1 s were caught,
+all self-recovering, against 420 s and 180 s windows elsewhere with none at all. They are
+condition-dependent, which is exactly why they read as "random".
+
+### The error code is a BITFIELD, and blackouts raise bits ordinary misses do not
+
+Codes observed: **4, 6, 20, 22, 52, 54, 128**. They decompose cleanly into bits --
+4 = bit2, 6 = bits1+2, 20 = bits2+4, 22 = bits1+2+4, 52 = bits2+4+5, 54 = bits1+2+4+5,
+128 = bit7 alone. So it is a flags register, not an enum, and `error_code != 0` is throwing
+away the only information that separates the two regimes:
+
+| | codes |
+|---|---|
+| ordinary scattered misses (blackout-free windows) | almost entirely **`sensor:4`**, occasionally `128` |
+| a real blackout | **`4` + `6` + `20` + `22` together, in the hundreds** |
+
+**Bits 1, 4 and 5 essentially only appear during a sustained out-of-range run**, while an
+isolated miss is almost always bare `4`. Useful as a signature, but note BOTH carry 8888
+(see below), so the difference is in how the module grades its own failure, not in whether
+a measurement was available.
+
+**ROOT CAUSE, settled by a raw probe: the target is simply OUT OF RANGE, and the module
+says so with a literal distance of 8888.** Driving the driver directly (stream.py stopped)
+while the module was pointed across a room:
+
+| code | reads | distance returned |
+|---|---|---|
+| 0 | 5,947 | 288-404 mm, real |
+| 4 / 6 / 20 / 22 / 54 | 33,825 | **ALL exactly 8888, without exception** |
+
+and a separate 70 s run held at ~300 mm gave **37,211 reads, 100% `error_code 0`, zero
+failures** -- at 531 reads/s, i.e. three times harder than `stream.py` polls. So:
+
+- **Nothing usable is being discarded.** Every rejected read carried the 8888 sentinel, so
+  the 2026-08-24 decision to reject on `error_code != 0` costs no measurements. Returning
+  8888 would put the standoff at 8.888 m and destroy any BG model.
+- **Short range is flawless and hammering it is harmless.** Poll rate is exonerated; the
+  `--lidar-rate` A/B below is no longer worth running.
+- **A "blackout" is not a fault at all.** It is a healthy module reporting that the target
+  is beyond what it can measure. Runs of 41.6 s, 16 s and 14.4 s were logged while the
+  module was waved around a room.
+
+**An EARLIER ENTRY IN THIS SECTION CLAIMED RANGE WAS FALSIFIED AS THE TRIGGER. THAT WAS
+WRONG** and is corrected here. It rested on a 180 s window that swept 31-847 mm with no
+blackout -- but that window simply never exceeded the module's reach. 847 mm is inside it;
+a room is not. The reach is not a fixed number: it depends on the target's reflectivity and
+angle, which is why a bright surface at 850 mm reads fine and a far wall does not.
+
+Operationally this means the blackouts seen while hand-waving are EXPECTED and say nothing
+about a scan. During a real C-scan the standoff is 130-400 mm, where the module is
+measurably perfect -- so **X marks appearing in an actual raster are far more likely to be
+the transport fault below than the sensor.**
+
+`read_distance_detail()` therefore reports `oor:<code>` (distance was 8888) separately from
+`sensor:<code>` (non-zero code with a plausible distance -- never yet observed) and
+`link:*`, via `is_out_of_range_reason()`. The dropout log names it in words: *"target OUT OF
+RANGE -- the module is working and returns its 8888 sentinel"*. The distinction matters
+because the operator reported the old 8888-passthrough as "way more responsive and
+predictable" -- the information it carried was real, and suppressing the VALUE without
+surfacing the FACT is what made a working sensor look broken.
+
+### Why it produces the red X, and why only sometimes
+
+`lidar_standoff_mm` goes null after `LIDAR_CARRY_MS` (1 s) of CONTINUOUS failure. Every
+cell captured from then on records a null standoff, and `backgroundFor()` in `bscanBg.js`
+returns `BG_STATUS.NO_STANDOFF` -> drawn as a red cross on dark red, excluded from both
+colour scales. A 9-22 s dropout is several cells, mid-raster.
+
+**It only happens under a BG MODEL.** A captured reference and Super Fit do not consume
+standoff at all, so the identical cells subtract normally in those modes -- which is what
+makes it look intermittent and mode-dependent. Two neighbours worth knowing: **SAR does
+NOT flag these cells**, it fills them with the median standoff (`sar.worker.js`), so a
+dropout degrades SAR quietly rather than visibly; and continuous BG capture refuses to
+interpolate across a gap > `MAX_BRACKET_GAP_S`, so a dropout silently thins the run.
+
+### The reason a failure now has a reason
+
+`read_distance()` collapsed FIVE distinct failures into a bare `None` -- timeout, no
+header, short frame, bad footer, bad opcode, and `error_code != 0`. Nothing in the system
+could tell "the module cannot see the target" from "the module is dead", which is why the
+last investigation spent days on cables. `read_distance_with_error()` existed and was
+never called.
+
+`tflc02.py` now has ONE parse path (`_read_response` returns `(dist, error_code, reason)`)
+with `read_distance()` / `read_distance_detail()` / `read_distance_with_error()` as thin
+wrappers -- the two hand-copied parsers it used to carry were the same drift hazard this
+repo already records for CFAR and the SAFT kernel. Reasons split into two classes that
+demand opposite responses: `sensor:<n>` (module answered; aim/range/reflectivity) and
+`link:*` (module did not answer; power/wiring/baud), separated by `is_link_reason()`.
+
+On the wire, additively (a groundstation that predates them ignores them):
+`lidar_err`, `lidar_last_good_mm`, `lidar_last_good_age_s`.
+
+**`stream.py` logs a dropout in plain words**, and the rate-limiting is the load-bearing
+part. Nothing is printed below `LIDAR_DROPOUT_WARN_S = 1.0 s` of CONTINUOUS failure --
+that is not a round number, it is exactly `LIDAR_CARRY_MS` in `App.jsx`, i.e. the moment
+the standoff actually goes null and cells actually start rendering invalid, so every line
+printed corresponds to something the operator is about to see. A persisting dropout
+repeats only every `LIDAR_DROPOUT_REPEAT_S = 15 s`. Verified head-first (15 checks, fake
+clock, scripted sensor): a healthy stream and a **40%-scattered-invalid stream are both
+completely silent**, a sustained dropout prints exactly one warning naming the dominant
+reason and one recovery line with the duration, and a 60 s dropout prints 3-6 lines rather
+than 12,000. That silence is the point -- a recurring benign line is what trained the
+operator to ignore the `_sweep_core` 2-tuple error for weeks.
+
+### Also fixed: the accumulators grew for as long as the tab was open
+
+`lidarAccumRef` / `poseAccumRef` in `App.jsx` were cleared ONLY inside the `sfcw_result`
+handler, so with no sweep running they grew at the measurement rate indefinitely. Besides
+the leak, **the first sweep of the next session got a standoff averaged over the entire
+idle period** -- over wherever the head was while being carried into place -- reported with
+an `lidar_n` in the thousands, which makes it look exceptionally well measured. Entries are
+now `{mm, t}`, filtered to `ACCUM_WINDOW_MS = 2000` before a sweep reads them and pruned at
+`ACCUM_PRUNE_AT = 512` so an idle tab cannot accumulate. 2 s is generous on purpose: the
+job is to exclude the idle period, not to trim a slow sweep, and a 2 s-old reading is
+already past the age at which App calls the standoff stale.
+
+### A SECOND, independent cause of the same X marks: one slow client froze the stream
+
+**This is the one that produces a "LiDAR blackout" with a perfectly healthy LiDAR, and it
+is now FIXED.** `stream.py`'s broadcast was `await gather(*(c.send(msg) for c in clients))`
+with no timeout -- the same slow-client bug already fixed in `sdr_server.py`
+(`_send_to_all`) and `rover_server.py` (`_fanout`), left latent here because this file's
+gather happened to be safe from the *other* half of that bug (the set-mutation
+RuntimeError).
+
+Measured 2026-09-11 against the shipped server, one client that never reads:
+
+| | healthy client alongside it |
+|---|---|
+| before | 34.0 Hz, worst gap **10,000 ms**, 3 gaps > 1 s in 40 s |
+| after `BROADCAST_TIMEOUT_S = 0.5` | 47.8 Hz, worst gap **503 ms**, 0 gaps > 1 s |
+
+A 50 ms-per-packet stall alone (not a full stop) already cost 48.6 -> 36.5 Hz. The residual
+503 ms is exactly the one frame that hits the timeout before the client is dropped.
+
+**How this was caught, and the lesson: the Pi log and the UI disagreed.** The operator
+reported repeated 5-10 s freezes of the standoff readout with the warning line showing,
+over a 12-minute period in which `stream.log` recorded **zero** dropout lines and a
+180 s capture measured 0.3% null over 31-847 mm. A LiDAR fault cannot be invisible to the
+sensor's own log; a transport fault is invisible to it by construction. **Whenever the UI
+says the LiDAR is out and the Pi log is silent, it is not the LiDAR.**
+
+**Contributing factor worth checking on any repeat: how many clients are actually
+attached.** `ss -tn | grep :9001` during the incident showed **six** connections from three
+machines -- three from one host, plus two in FIN-WAIT-2 (tabs closed without completing the
+close, which the 20 s keepalive had not yet reaped) and one with 504 bytes backed up in
+Send-Q. Note `rover_server.py` is NOT among them: it never connects to 9001. But each
+browser tab opens THREE sockets (9001 sensor, 9002 rover, 9003 SDR) drained by the SAME
+main thread, so rover-panel rendering competes with draining the LiDAR socket -- which is
+worst during a rover-driven C-scan, exactly when the X marks were reported.
+
+### THE ACTUAL CAUSE of random X marks in a real C-scan: staleness was timed on the BROWSER clock
+
+This is the one that matches the operator's real complaint -- *"C-scans at a near-constant
+range of around 200 mm, random cross marks, sometimes rare, sometimes quite frequent"* --
+and it is neither of the two above. At 200 mm the sensor is measurably perfect (37,211
+consecutive reads at 300 mm, 100% valid, and the module's cadence is FASTEST at short
+range), so a null standoff there could never have been the LiDAR.
+
+`App.jsx` decided whether to carry the last reading forward with
+
+    (performance.now() - fresh.t) < LIDAR_CARRY_MS
+
+where `fresh.t` was also `performance.now()`, stamped when the browser got around to
+HANDLING the lidar packet. **Both ends were the browser's own scheduling clock, so the test
+measured how busy the main thread was, not how old the measurement was.** Any stall past
+1 s -- the 4 Hz live-flush derive chain is 32-52 ms per pass over a few hundred cells,
+`bscanData` reaches tens of MB, and GC pauses are real -- made every reading look stale the
+instant the thread resumed. The sweep landing in that window recorded a null standoff and
+its cell rendered INVALID.
+
+That explains every part of the report that the sensor theory could not:
+- **constant 200 mm** -- irrelevant, the test never looked at the sensor;
+- **random** -- it tracks browser load, not anything physical;
+- **"sometimes rare, sometimes quite frequent"** -- the derive chain cost scales with cell
+  count, so a big or long-running grid stalls more often than a small one.
+
+Both quantities are already available on the **Pi's** clock -- `lidar_ts` (stamped when the
+measurement appeared) and `sfcw_result.timestamp` -- and they are the same `time.time()`,
+the pairing `bgContinuous.js` already depends on. The age is now computed from those, with
+the browser clock kept only as a fallback for a Pi that sends no `lidar_ts`. Verified by
+extracting the SHIPPED expression out of `App.jsx` and driving it (11 checks): a 3 s browser
+stall now carries correctly, a genuine 3 s sensor outage still goes null, a measurement
+stamped after its sweep is refused rather than treated as infinitely fresh, and the fallback
+path behaves as before.
+
+**The general lesson, which this repo keeps relearning: an instrument fed from a throttled,
+decimated or re-timed copy of the data reports on the copy.** Same class as `lidar_seq`
+counting reads rather than measurements, and as the SFCW header reporting the throttled
+display rate as the radar's sweep rate.
+
+Note the send timeout above stops one stalled client taking the others down, but it was
+never going to fix this: the stalling client and the scanning tab are the same tab.
+
+The two causes are now distinguishable, which is the practical payoff of the logging:
+
+- **runs of adjacent invalid cells + a `no valid LiDAR reading for N s` line in the Pi log**
+  -> the sensor could not range. Re-aim.
+- **isolated invalid cells and the Pi log SILENT** -> the browser stalled. Nothing is wrong
+  with the LiDAR.
+
+### What to do about the blackouts themselves
+
+The instrumentation names the cause; it does not stop it, and the physical trigger is not
+yet known (see above -- range is ruled out). **Before the next long C-scan, watch
+`stream.log` for a minute:** a low steady `sensor:4` rate is normal and harmless; a run
+past 1 s now announces itself and is the cue to re-aim rather than to scan.
+
+**The poll-rate hypothesis is dead, do not spend time on it.** The idea was that adaptive
+integration (17.2 Hz at 165 mm falling to 11.5 Hz at 340 mm) might never complete against a
+command every 5.6 ms. Measured: 37,211 consecutive reads at **531/s** with **zero** failures
+at 300 mm. Polling hard does not break it.
 
 ## Living Documentation Rule
 
@@ -532,13 +769,173 @@ Setting the timeout back to 0 re-energises immediately rather than at the next m
   `linkReady()` (associated **and** holding an address) that all the retry logic tests,
   and a failed DHCP attempt explicitly disconnects so the next one starts clean.
   `USE_STATIC_IP` in `config.h` sidesteps DHCP altogether if it ever recurs.
+  **PARTLY SUPERSEDED 2026-09-09: this was the address-less variant, and the fix
+  for it was right. There is a second variant it cannot see, where BOTH halves of
+  `linkReady()` lie -- see "The board could never rejoin the network" below.**
 - **The board does not always reconnect by itself.** Restarting `rover_server.py` left it
   with healthy WiFi (still pingable, still associated) and a socket that never came back,
   needing a power cycle. `ensureSocket()` now tears down and restarts the client after
   `WS_RECONNECT_FORCE_MS` (10 s) of downtime while WiFi is up.
+  **SUPERSEDED 2026-09-09: `ensureSocket()` is gone. Restarting the client for ever
+  while the radio is wedged is exactly the deadlock described below; the 10 s
+  interval survives as the ladder's first rung.**
 - **Status arrives at ~11 Hz, not the 20 Hz the firmware aims for.** Harmless -- it is
   display smoothness, not control -- but unexplained. Suspect WiFi latency in the R4's
   socket stack rather than the loop, since the loop does almost nothing.
+
+### The board could never rejoin the network: fixed 2026-09-09
+
+Reported symptom, and it had survived two previous rounds of fixes (both recorded
+above and both correct as far as they went): the Arduino drops off the WiFi, is
+powered off, is powered back on -- and **never tries to reconnect**. Sometimes the
+same happens after the *Pi* is power-cycled. The only reliable cure was restarting
+the ROUTER, which is why it kept being read as an AP problem.
+
+**It was not an AP problem. `ensureNetwork()` was never called again, ever.**
+Reproduced against the pre-fix firmware (`git show HEAD:rover/rover.ino`) driven by
+the new harness: after the AP goes away while the modem stays latched at
+`WL_CONNECTED`, the board calls `WiFi.begin()` **once, at boot, and not once more in
+15 minutes** -- while calling `webSocket.begin()` 100 times against a dead stack --
+and it does **not** recover even after the AP comes back.
+
+**Root cause: the two link layers had a strictly one-way trust relationship.**
+`linkReady()` (`WiFi.status() == WL_CONNECTED && localIP() != 0.0.0.0`) was the sole
+authority on the WiFi layer, and the socket layer deferred to it unconditionally
+(`if (!linkReady()) return;  // ensureNetwork owns that case`). But
+**`WiFi.status()` and `WiFi.localIP()` are the modem's opinion of itself, not a
+measurement of a working network, and the modem latches**: after an AP disappears
+without a clean deauth -- exactly what a power cut at either end leaves behind, and
+what an AP holding a stale station entry for this MAC produces -- `status()` can sit
+at `WL_CONNECTED` with the last-known address in `localIP()` indefinitely. When it
+did, `ensureNetwork()` returned at its first line every single iteration and never
+re-associated, while `ensureSocket()` churned `disconnect()`/`begin()` forever.
+
+The deadlock was structural, so no amount of tuning either layer could break it: the
+one piece of hard evidence available -- **a socket that will not come back** -- was
+never allowed to act on the layer below it. The 2026-08-29 fix addressed the
+*address-less* variant of this (`localIP() == 0.0.0.0`) and was right about that one;
+it could not see the latched variant, where both halves of `linkReady()` lie.
+
+Note the deadlock also explains the second half of the report. Restarting the router
+is not a fix for a stale lease here -- it is simply the only event that changes
+enough state at once, and it *sometimes* worked because it is roughly a coin toss
+whether the modem notices.
+
+**There was also no recovery of last resort.** Nothing in the firmware could
+reinitialise the radio (`WiFi.end()` was never called) or reset the board, so *any*
+wedge -- latched status, a modem holding sockets from hundreds of failed reconnects,
+an AP refusing this MAC -- was permanent until a human power-cycled something.
+
+**Fix: one escalation ladder (`serviceNetwork()`), and the socket layer is now
+allowed to act on the radio.** `ensureNetwork()` and `ensureSocket()` are gone.
+
+|  down for | action |
+|---|---|
+| 0-10 s | nothing; the library's own reconnect gets its chance |
+| 10 s | restart the websocket client |
+| ~30 s | **ask the gateway**, not the status register (see below) |
+| 5 min | `NVIC_SystemReset()` -- refused unless the rig is parked |
+
+**The gateway ping is the load-bearing idea.** `networkResponds()` pings
+`WiFi.gatewayIP()`, and it is the only question in that file whose answer does not
+come from the modem's opinion of itself. It separates the two cases the old firmware
+could not tell apart, and getting that separation is what makes the ladder safe to
+have at all:
+
+- **gateway answers** -> radio and LAN are fine, the Pi is simply not running. Keep
+  retrying the socket; **never** recycle, **never** reset. A Pi that is off is an
+  everyday state (every `rover_server.py` restart), and escalating on it would reboot
+  the board every 5 minutes during ordinary development.
+- **gateway silent while `status()` claims connected** -> the radio is lying. Tear it
+  all the way down and start over.
+
+Deliberately not a ping of the *Pi*, for the same reason. `NET_USE_PING 0` compiles it
+out if `WiFi.ping()` is ever unavailable; that fallback returns **false**, not
+`linkReady()` -- answering "should I believe the modem?" with the modem's own opinion
+would reinstate the exact deadlock. It then cannot tell the two cases apart and
+recycles in both, which is wasteful and the right way round.
+
+Other things that changed with it, each a hole in the old version:
+
+- **`WiFi.end()`, not just `disconnect()`.** `disconnect()` drops the association;
+  `end()` stops the WiFi stack in the modem, which is what releases the sockets it is
+  holding and re-arms its connection state machine. The first re-association attempt
+  is still a plain re-associate (most dropouts are a one-second AP hiccup); every
+  attempt after it is a full teardown.
+- **`send()` uses `sendTXT()`'s return value**, which it used to discard. A half-open
+  TCP connection -- no FIN, no RST, which is what a Pi losing power leaves behind --
+  keeps the library reporting the client connected until its own heartbeat gives up
+  ~36 s later. A failed write is the earliest unambiguous evidence there is and the
+  board is already sending 20 status frames a second. `NET_TX_FAIL_LIMIT = 40` (2 s).
+- **The reset check sits BEFORE the escalation branches, not after.** Each branch
+  either returns on success or reschedules, so a modem that kept associating happily
+  onto a dead network would have escalated for ever and never reached a check placed
+  at the end. Caught by the harness, not by reading.
+- **The reset is refused unless the rig is parked** (`boardParked()`: not moving,
+  nothing queued, no latched E-stop) and `persistBeforeReset()` runs first. That
+  helper also **clears the EEPROM magic when `positionValid` is false**, because
+  `loadPosition()` marks the position valid whenever it finds a well-formed blob --
+  coming back from a reset would otherwise silently re-declare a position an E-stop
+  had invalidated. Both its branches skip the write when the bytes are already
+  correct, or a board that can never reach the network would erase flash every five
+  minutes for as long as the fault lasted.
+- **`printMacAddress()` on failure too.** The MAC is what a DHCP reservation is keyed
+  on, so it is wanted exactly when the board is *not* getting on the network; the old
+  code printed it only after a successful connect, i.e. never when it mattered.
+- **`reportScan()` every 4th failed association**, which is the measurement that
+  separates "the AP is refusing this board" from "the AP is not there at all". Without
+  it both looked identical in the log, which is how this ended up diagnosed as
+  "restart the router" rather than as anything specific. A scan takes seconds and
+  disturbs an attempt, hence not every time.
+- **Association timeout bounded to 10 s** (`NET_ASSOC_TIMEOUT_MS`, was 15-20). The
+  retry blocks in `delay()`, so motion is unaffected (it is generated in the ISR) but
+  the board is deaf to the groundstation for the duration.
+- `onEvent()` now precedes `begin()` in `setup()`, the socket-restart clock no longer
+  starts stale, and the retry gate is wrap-safe past 49.7 days.
+
+### `rover/test/test_net.cpp` -- the harness, and why it exists
+
+125-check `test_core.cpp` could never have caught this: the fault is a **liveness**
+property ("from every bad state, some action eventually restores the link"), and the
+only way to check one is to put the machine in each bad state and run it. Both the
+old code and the new one read perfectly reasonably; only the arrangement differed.
+
+`test_net.cpp` **`#include`s `rover.ino`** so it drives the shipped `serviceNetwork()`
+and its shipped statics -- a retyped copy would have been free to drift, which for
+this file is the whole ballgame. `test/netstubs/` holds scriptable replacements for
+`Arduino.h` / `WiFiS3.h` / `WebSocketsClient.h` (fake clock that `delay()` advances,
+captured serial log, `NVIC_SystemReset()` that throws); `test/stubs/` still supplies
+EEPROM and FspTimer, which is why **netstubs must come FIRST on the include path**
+and why the two `Arduino.h` files share the `ROVER_ARDUINO_STUB_H` guard.
+
+Two details in the model are load-bearing and must not be "simplified":
+
+- **The WiFi model's `latched` flag survives `disconnect()` and is cleared only by
+  `end()`.** That single behaviour is the whole bug; a model without it passes the old
+  firmware.
+- **The websocket model connects from `loop()`, not from `begin()`**, matching the
+  real client. An earlier version connected inside `begin()`, which made the *old*
+  firmware unable to connect at all (it registered `onEvent` after `begin`) and would
+  have made any before/after comparison meaningless.
+
+41 checks: a healthy link left alone for 15 minutes; the Pi off for 20 minutes with
+no recycle and no reset, recovering the moment it returns; the latched-modem fault
+recovering unaided; a permanently wedged modem reaching the reset; the reset refused
+while E-stopped and while work is queued; a half-open socket detected from failed
+writes; an honest disconnect escalating from plain retry to teardown; and a
+never-answering DHCP server retried rather than accepted. `build_check.sh` runs it,
+and also now stands in `secrets.example.h` when `rover/secrets.h` is absent (the type
+check could not run on a fresh checkout before) and type-checks `rover.ino` both with
+and without `NET_USE_PING`.
+
+**Not yet run on the rig.** The model is a model: it has no RF, no real modem
+firmware, and `WiFi.ping()` / `WiFi.end()` are assumed to behave as WiFiS3 documents
+them. What to check on the bench, in order: (1) that `WiFi.ping()` compiles and
+returns sanely on the installed core -- if not, set `NET_USE_PING 0` and accept the
+recycles; (2) pull the AP's power with the board running and confirm the log shows
+`not to be trusted` and then a successful re-associate; (3) confirm a
+`rover_server.py` restart still reconnects in ~10 s and prints `gateway answers`
+rather than recycling anything.
 
 ### Calibration
 
@@ -681,6 +1078,511 @@ reported standing) beside `rover_target_x_mm` / `rover_target_y_mm` (where it wa
 go). Keeping both is the point: slip and missed steps are the only error sources nothing can
 observe, so the two must not be assumed equal. Export is **v6**; import still reads v3-v5.
 Import deliberately does NOT restore `scanMode` -- it is a live control, not data.
+
+## Continuous rover C-scan raster (2026-09-07)
+
+The C-Scan panel's Rover mode gained a **Row traverse** toggle: `continuous` (the new
+default) drives a whole row in ONE move and bins the sweeps by the position they were
+taken at; `stepped` is the original stop-at-every-cell raster, kept unchanged as the
+fallback for ruling the continuous path out. `lib/roverTrack.js` (pure) holds the
+position track, the binning and the sampling arithmetic; `useRoverScan.js` grew
+`row_start -> row_settle -> traversing` beside the existing `moving -> settling ->
+capturing`. **Both walk the grid in the same order** -- `rowTraverse()` reproduces
+`roverCellForIndex()` cell for cell (checked) -- so a grid captured either way is the
+same record and feeds SAR / 2D Map / export identically.
+
+**Why it is now the right thing to do.** The stepped flow was designed around a 550 ms
+sweep, where any motion smeared a sweep across frequency. At the 27.5 ms NIOS sweep the
+per-cell cost is ~93% overhead: `MIN_MOVE_MS` 500 + `roverSettleMs` 200 + one
+deliberately discarded in-flight sweep (`skip: 1`), against ~28 ms of actual sweeping.
+All of it is gone, and the sweeps that used to be thrown away between cells become free
+coherent averaging. Measured in simulation, 1 m row at 5 mm pitch: **stepped 76 s at 1
+sweep/cell; continuous at 20 mm/s 50 s at 8.3 sweeps/cell (+9.2 dB)**; at 100 mm/s a
+3-row 11-cell grid completes in 6.9 s.
+
+### Smear is NOT the limit any more -- spatial sampling is
+
+Motion during a sweep is a phase error bilinear in (step index, velocity). The linear
+term is range-Doppler coupling, an apparent range SHIFT of `(f_start/B) * D * sin(theta)
+~= 0.65 * D` where `D` is the distance moved during the **20.9 ms RF window** (51 steps x
+`NIOS_MIN_DWELL` = 4096 samples at 10 Msps -- note that is the per-STEP dwell, **not**
+`RX_BUFFER_SAMPLES = 2048`, which is the host-driven path's DMA granularity). The
+quadratic term is the actual defocus.
+
+| v (mm/s) | moved per sweep | range shift | quadratic phase |
+|---|---|---|---|
+| 20 | 0.42 mm | 0.27 mm | 0.05 rad |
+| 100 | 2.09 mm | 1.37 mm | 0.26 rad |
+| 150 (X axis max) | 3.13 mm | 2.05 mm | 0.39 rad |
+
+Against a 50 mm range cell and the ~0.79 rad (pi/4) where defocus starts to matter,
+**both are inside budget at any speed this rail can reach.** At 550 ms the quadratic term
+was 3.4 rad at 50 mm/s, which is why the rig had to stop. Range-Doppler coupling also
+says where a sweep "is": the apparent range sits at `f_start/B` = 2/3 through the sweep
+rather than at its midpoint, so the phase centre is 65% of the way through the RF window.
+
+**What binds instead is one number: `sweep spacing = v * T_sweep`** -- 0.69 mm at
+25 mm/s, 2.75 mm at 100, 4.12 mm at 150. **A grid pitch finer than that leaves cells
+empty however long the scan runs**; those sweeps were never taken. Consequently **pitch,
+speed and averaging depth are ONE resource, not three**: `sweeps/cell = pitch /
+(v * T_sweep)`. Pick two. The panel shows spacing, sweeps/cell, coherent gain, row time
+and grid time live, and warns when the pitch is starved.
+
+**Finer is not better past a point.** Spatial Nyquist for the imaging is
+`dx <= lambda_min/(4 sin(theta_max))` = 15-21 mm at 5 GHz, so **5 mm already carries 3x
+margin**; below that, halving the pitch buys no resolution and costs 3 dB of per-cell SNR
+by splitting the same sweeps across twice as many cells. 1 mm is 15x oversampled and
+needs v <= 36 mm/s just to fill one sweep per cell.
+
+### Time base: one clock, and one scalar
+
+Both streams are already stamped on the **Pi's** clock -- `sfcw_result.timestamp` and
+`rover_status.last_status_at` -- so the association never touches `performance.now()`,
+which would fold two independent websocket latencies into the answer. The track
+**interpolates only and never extrapolates**: a sweep newer than the newest position
+frame waits (typically <91 ms, one status period at ~11 Hz) for a frame that brackets it.
+Extrapolating on the reported velocity is exact at constant velocity and wrong by half an
+acceleration term -- **2.07 mm at 500 mm/s^2 over one status gap** -- precisely at the
+ends of a row, where the ramps are.
+
+What remains is a single constant, `roverLatencyMs` (default 0): a sweep is stamped ~14 ms
+after its own phase centre, a status frame after its WiFi transit, and their **difference**
+is all that matters. **It is a BIAS, not noise** -- its sign follows the direction of
+travel, so in a snake it displaces alternate rows oppositely and a straight feature comes
+out as a zigzag of `2*v*tau`. Verified in simulation: 40 ms of unmodelled latency at
+100 mm/s gives per-row bias **+4.20 / -3.70 / +4.30 mm** (sign flipping with direction,
+i.e. an 8 mm zigzag), collapsing to **+0.25 / +0.25 / +0.20 mm** -- a harmless constant
+offset -- once corrected.
+
+**Measure it from ONE out-and-back pass over a row**: the spatial lag between the two
+directions is exactly `2*v*tau`. Same trick this file already proposes for the LiDAR
+timestamp. Note that nothing in the pipeline combines rows coherently today (C-scan
+focusing is per row, SAR treats the capture as one line), so an uncorrected tau costs only
+the plan-view zigzag -- it does not defocus anything.
+
+### Details that are load-bearing
+
+- **The traverse OVERRUNS both ends of every row** (`traverseOverrun` = `v^2/2a` plus
+  `max(10 mm, 0.2*v)`; 10.6 mm at 25 mm/s, 30 mm at 100). Two things must fall outside the
+  grid: the ramps, where interpolation between status frames is wrong by the acceleration
+  term above, and the last ~91 ms of the traverse, which only resolves after the rover has
+  stopped. **A grid whose overrun leaves the rail is refused, not clamped** --
+  `gridRoverExtentContinuous` is what the soft-limit check uses in this mode, and the
+  refusal names the run-up.
+- **Arrival is now reported EXACTLY by the board, not waited out.** `rover_server.py`'s
+  status carries `moves_done` / `last_done_seq` / `last_done_reason`, incremented from the
+  `done` frame the firmware sends once per dispatched move, when every axis it commanded
+  has stopped (`rover.ino`, `movePending` block). The Pi always received it; it just never
+  forwarded it. A client snapshots the counter when it issues a move and waits for it to
+  advance, which is **immune to the ack-before-dispatch window** -- the window that made
+  every other signal a heuristic, since `moving` is false in it and position alone cannot
+  tell a move that has not started from one that has finished.
+
+  `MIN_MOVE_MS` (500 ms) is now a **fallback only**, for a Pi that predates the field, and
+  the panel says so when it is in force. A `done` whose reason is not `completed` (a soft
+  limit, a stop) **aborts the scan**: targets are clamped on both sides, so it means the
+  geometry is wrong and every cell of the row would land in the wrong place.
+
+- **The continuous row has no static settle, and does not need one.** The traverse starts
+  `overrunMm` outside the grid, so the rig spends the whole run-up accelerating and
+  running before the first cell -- **450 ms at 25 mm/s, 400 at 100, 500 at 150** -- all of
+  it after the vertical step-down has completed, all of it outside the cells. That is
+  strictly better settling than standing still for 200 ms, and it is time already being
+  spent. `roverRunupExtraMs` (default **0**) is the escape hatch if the mast is ever
+  actually seen to ring; `roverSettleMs` still applies to the stepped path, which captures
+  standing still and does need it.
+
+- **The row change is purely VERTICAL, and vertical is the slow axis.** A snake ends row
+  N at `lastX + overrun` and starts row N+1 at `firstX + overrun`, which is the *same
+  point*, so the move between rows has no X component at all -- it is one Y step and
+  nothing else. Y runs at 25 mm/s / 100 mm/s^2 against X's 150 / 500, and it takes 6.25 mm
+  just to ramp up and back down, so **any row pitch under 6.25 mm is a triangular move
+  that never reaches full speed**. `axisMoveSeconds()` (`cscanGrid.js`) is the closed form
+  for both cases, checked against numerical integration of the firmware's ramp to <0.1%.
+
+  | row pitch | Y move | old (500 ms gate + 200 ms settle) | now (move + ~1 status frame) |
+  |---|---|---|---|
+  | 2 mm | 0.283 s | 0.70 s | **0.37 s** |
+  | 5 mm | 0.447 s | 0.70 s | **0.54 s** |
+  | 10 mm | 0.650 s | 0.85 s | **0.74 s** |
+  | 20 mm | 1.050 s | 1.25 s | **1.14 s** |
+  | 50 mm | 2.250 s | 2.45 s | **2.34 s** |
+
+  Note the fine pitches gain most, because they were paying the 500 ms gate for a move
+  that took half that. What remains is the Y move itself, which is real mechanics, plus
+  ~90 ms of status-reporting latency at ~11 Hz.
+
+  On a 1 m row the row change is a small share and it grows as the traverse gets faster --
+  15 rows at 10 mm pitch: **2% of the scan at 25 mm/s, 4% at 50, 7% at 100, 10% at 150**.
+  So on a wide grid the vertical axis is not worth optimising, but on a NARROW one (short
+  rows, many of them) it inverts and dominates. The panel shows Run-up, Row change and
+  Grid total separately.
+
+- **Cells are keyed on POSITION, never arrival order.** `Math.round((x - originX)/pitch)`
+  is the half-pitch rule; a sweep landing outside the grid is dropped, not clamped. The
+  two snake directions visit the same columns in opposite orders and a stuttered link can
+  skip a bin, so order means nothing here.
+- **The scan speed IS the rail's max speed for the duration**: `x_max_speed` is pushed via
+  `rover_set_config` at `beginRaster` and restored by `finish()` on every exit path.
+  `set_config` **persists on the Pi**, so failing to restore would quietly slow every
+  later nudge and jog.
+- **A partial row is harvested on ANY end** -- completion, operator stop, e-stop, link
+  loss, or the sweep dying mid-row. A row is a minute of driving; same reasoning as the
+  BG-model continuous capture.
+- **Resume is by ROW, not by cell count.** A row emits however many cells its bins filled,
+  so the flat capture count is not a row counter; `capturedRows` is the number of distinct
+  `grid_iy` present in the data.
+- **Watch the HOLE, not the fill count.** The panel reports the largest run of consecutive
+  empty columns, which is what decides whether a row is usable -- same reason the BG-model
+  continuous capture watches Hole rather than Span.
+- Cells carry `rover_x_mm` (mean of the interpolated positions of the sweeps in that cell)
+  beside `rover_target_x_mm` (the column centre), plus a new **`rover_x_std_mm`** -- the
+  aperture the coherent average was actually taken over. At a 10 mm bin that aperture
+  costs <= 1.65 dB even at grazing incidence, against the 8-13 dB the averaging buys; at a
+  50 mm bin it would be -15.6 dB with a null inside the visible region, which is another
+  reason 50 mm pitch was the wrong place to be.
+- **`buildCellRecord()` in `App.jsx` is now shared by both capture paths** and pools
+  provenance from the looks themselves rather than taking it as an argument. It only ever
+  emits the fields it lists -- spreading a whole look would overwrite `h_cal_real/imag`
+  with a single sweep and silently undo the averaging, which is a bug that was live in the
+  first draft.
+- The new params ride along in the v7 export as provenance but are **not restored on
+  import**, exactly like `scanMode`: they are live controls, not data.
+
+### Verification
+
+`lib/roverTrack.js` and the traverse geometry are pure and were exercised head-first from
+node, and the **real state machine was driven against a simulated ramped gantry and a
+36 Hz sweep stream** (React shimmed to four hooks, timers stubbed, fake clock): a full
+11x3 raster fills all 33 cells in `roverCellForIndex` order with worst |position - column
+centre| of 0.75 mm; the latency bias behaves as derived (above); a stop mid-row harvests
+the partial row and restores the speed; 150 mm/s against a 1 mm pitch reports holes rather
+than hiding them; 20 mm/s at 5 mm pitch gives 8.3 sweeps/cell against the predicted 9.1;
+stepped mode is unchanged; an overrun that leaves the rail is refused; exact arrival
+completes a 6x4 grid 5% faster than the 500 ms fallback gate and both fill it identically;
+and a move reported as `limit` aborts before a single cell is captured. There is still
+no test runner in this repo, so these were throwaway scripts. `vite build` passes.
+
+**NOT yet done on hardware, and these are the things to check first:**
+1. **Does motion itself cost anything?** Unknown -- vibration on rolling wheels is the one
+   term no arithmetic here can reach. Scan one row out and back at speed and score the two
+   passes cell by cell; compare against a stepped pass over the same row.
+2. **`roverLatencyMs` is 0 until measured.** The same out-and-back pass gives it, and
+   running it three times says whether it REPEATS -- latency does, mechanical hysteresis
+   on a rubber-wheel drive reversing direction may not. If it does not repeat, snake is
+   unusable and rows have to be driven unidirectionally with a fly-back (which costs
+   `v_scan/150` of the row time -- 17% at 25 mm/s but 100% at 150).
+3. **Is the ~11 Hz status rate really 11 Hz under load?** Everything above assumes it.
+
+## Continuous rover raster: six bugs found and fixed (2026-09-07)
+
+Driven head-first against a simulated ramped gantry (trapezoidal ramps, a 90 ms
+command link so the ack-before-dispatch window is real, ~11 Hz status frames, the
+Pi's own broadcast-on-`done`-with-a-stale-position behaviour, and a 36 Hz sweep
+stream) with React shimmed to four hooks and a fake clock. 31 checks; `vite build`
+passes, `rover/test/build_check.sh` passes. Throwaway scripts, as usual.
+
+Two symptoms were reported: the drive to the origin "sometimes doesn't go and stop
+at the mentioned values", and the rig "sometimes goes down a row while it's
+sweeping instead of scanning the row then going down". Both reproduce, and they
+are different bugs.
+
+**1. `start()` accepted a MOVING rover, so the origin was read off wherever the
+last status frame caught it.** The origin is `status.x_mm - roverOriginRightMm`,
+i.e. it is only meaningful at rest -- but nothing checked. Reproduced: pressing
+Start 200 ms into a 600 mm nudge anchored the grid on a position the rover was
+already driving away from, and the homing move then timed out chasing it. Gentler
+cases do not error, they just silently put the whole grid somewhere else. `start()`
+now refuses unless `!moving && pending_moves == 0 && queue_depth == 0`.
+
+**2. The origin was RE-DERIVED on every session, including a resume.** The
+"right of / below origin" offsets describe where the head was standing *when they
+were measured*; after a stop it is parked wherever the abandoned row left it, so
+re-deriving anchors the rest of the grid somewhere the operator never measured.
+The origin is now **anchored once per scan** (`roverOriginAnchor` in `App.jsx`,
+published by the hook through `onOriginAnchor`) and reused by every later session
+on that grid. Cleared by New Scan and by import -- deliberately NOT restored from
+an export, for the same reason `scanMode` is not: it is a live property of the rig.
+An anchor whose grid geometry no longer matches is refused rather than reused,
+because changing a count or a step re-keys every cell.
+
+**3. Resume skipped a row that was stopped part way through -- this is the "goes
+down a row while sweeping".** Resume read `capturedRows`, a count of rows holding
+*anything*, so a row stopped mid-traverse counted as done and the next session
+drove down past it. Measured: stopping mid-row-1 of a 3-row grid harvested 6 of 11
+cells and the resume started on row 2, leaving a half-empty row in the middle of
+the grid with nothing on screen saying so -- and, seen from the rig, the raster
+"going down a row" instead of scanning one. Resume is now the first row that is not
+FULL (`firstIncompleteRoverRow` / `roverRowFill` in `cscanGrid.js`, passed to the
+hook as `rowFill`), and `handleRoverRowClose` REPLACES a row's existing columns
+rather than appending beside them -- otherwise a re-driven row leaves two records
+for one cell, which the plan view resolves by drawing the last one while the
+export, SAR and the colour scales all see both.
+
+**4. `traverseOverrun` could be SHORTER THAN HALF A CELL PITCH, so the run-up was
+inside the grid rather than outside it.** Cells are keyed by
+`Math.round((x - originX)/pitch)`, so everything within half a pitch of column 0's
+centre lands in column 0 -- including the rig standing still at the row entry
+waiting for the traverse command to reach the board, and the whole acceleration
+ramp, which is exactly what the overrun exists to exclude. At 25 mm/s the overrun
+was 10.6 mm against a 25 mm half-pitch (50 mm pitch is what this bench uses).
+Measured before the fix, 20 mm/s / 50 mm pitch: end cells took stationary and
+ramping sweeps and every cell reported a position ~7 mm short of its centre.
+`traverseOverrun(speed, accel, hStepMm)` now floors at `pitch/2 + margin`; worst
+cell error over a row went from 6.8 mm to 0.8 mm. **Both the hook and
+`CscanPanel.jsx` must pass the pitch** -- the panel shows the overrun and checks it
+against the soft limits, so a disagreement would refuse or admit the wrong grids.
+
+**5. The per-cell cap TRUNCATED, which biases the coherent average in the
+direction of travel.** `MAX_PER_CELL = 64` dropped everything past the 64th sweep,
+i.e. kept the ones taken over the leading part of the cell. CLAUDE.md's own claim
+that "in practice this never bites" was derived at a 5 mm pitch; at 50 mm and
+20 mm/s a cell holds ~90 sweeps. Measured: every cell's `rover_x_mm` came out 7 mm
+short of its own centre, biased with the direction of travel and therefore opposite
+on alternate rows of a snake -- the same signature as an uncorrected
+`roverLatencyMs`, and just as invisible. `createRowBin` now **decimates**: on
+hitting the cap it halves the kept set (keep every other) and doubles the stride,
+so the retained looks still span the whole cell at between 32 and 64 of them.
+Residual position error after the fix: 0.8 mm. `summary()` reports `decimated`.
+
+**6. `moves_done` advancing does not mean OUR move finished.** The counter is
+snapshotted from whatever status frame the hook happens to hold, so a `done` for
+somebody else's move -- an operator nudge, a stop, a jog ending -- still in flight
+when the raster issues a move makes that snapshot stale by one, and the next frame
+reads as an instant completion. Arrival then collapses back onto position alone,
+which cannot tell a move that has not started from one that has finished: the exact
+ack-before-dispatch window the counter exists to close. It also lets the LATCHED
+`last_done_reason` from a previous session abort a scan on its first move.
+
+Fixed structurally, Pi-side: `rover_move_abs` accepts an opaque **`token`**, which
+`rover_server.py` carries through `_outbox`, maps onto the board sequence the move
+is actually sent with (`pump` now keeps `send_board`'s return), and echoes as
+**`last_done_token`** in status when THAT move's `done` arrives. Waiting for your
+own token back is immune to every other mover on the link and needs no timer. A Pi
+without it falls back to `moves_done` **plus a `MOVE_ACK_FLOOR_MS = 300` floor** (a
+link round trip plus one status period, which no genuine completion can beat), and
+then to the old `MIN_MOVE_MS` timer.
+
+**Also added: a silent-link watchdog.** `board_connected` going false is the Pi
+reporting a known state; a Pi that has simply gone quiet was invisible, and the
+raster would keep issuing moves against a position it could no longer see. The tick
+now aborts after `STATUS_STALE_MS = 4000` without `last_status_at` changing. Note
+it only ever compares the Pi's clock with ITSELF -- what is timed locally is how
+long we have gone without seeing it move.
+
+**Firmware (`rover/rover.ino`): `stop_reason` is per axis and `moveTo` does not
+clear it**, so an axis left out of a move still carried whatever ended its previous
+one -- and `sendDone` read both axes unconditionally. A Y-only move following an X
+move that ended on a limit would report `limit`, and the Pi aborts a raster on any
+reason but `completed`. `dispatchQueued` now clears `stop_reason` on the axes it
+commands and records them in `inFlightAxes`; the done block reads only those.
+Dormant for the raster as it stands (`issueMove` always sends both axes) but live
+for nudges, and one stale byte is a lost scan.
+
+**Also: the hook restores `x_max_speed` on unmount.** `set_config` PERSISTS on the
+Pi, so a tab closed mid-raster left the rail at the scan speed and quietly slowed
+every later nudge and jog. Best effort -- a hard close can outrun the send.
+
+### The plan view now fills DURING a row, not at the end of one (2026-09-08)
+
+Reported: "each row scan updates at the end, can we get the grid to update real
+time, like before." Correct -- the continuous raster emits a row WHOLE, so on a
+1 m row at 25 mm/s the plan view sat blank for ~25 s and then filled in one jump.
+The stepped raster had always drawn each cell as it was captured. The plan view is
+the only thing on screen that says the scan is working, so it should not go dark
+for the length of a row.
+
+`createRowCollector` gained **`liveRow()`** -- `{ geom, cells, kept }` read from
+the open bin WITHOUT closing it. `cells()` was already a pure re-derivation of
+each bin's mean and spread, so calling it repeatedly changes nothing; a cell it
+returns and the same cell from `closeRow()` differ only in the sweeps that landed
+in between.
+
+App's `publishRowStats` (already throttled to 250 ms for the fill counter) now
+also flushes those cells into `bscanData`. **The live flush and the end-of-row
+harvest go through ONE function, `writeRoverRowCells`** -- the replace-by-(ix,iy)
+merge that already existed for resume. That is what makes it safe to call
+repeatedly (each flush supersedes the last, so the close is just the final flush)
+and it is why there is no separate "preview" record shape to keep in step with
+`buildCellRecord`. A cell drawn while the rover is still driving is built by
+exactly the same code as the one that reaches the export.
+
+Verified against the simulated gantry: a row's on-screen fill climbs **1 cell at
+3 s to 11 by 23 s** where it used to show nothing until 25 s; the completed grid
+is **byte-identical** to the close-only path (ix, iy, sweep count, xMean, xStd,
+target, and array ORDER -- so START and the dashed path still read right); no
+duplicate cells; and a stop mid-row keeps at least what the flushes had already
+shown. 17 checks.
+
+Three things that are load-bearing:
+
+- **The flush is skipped unless the bin's `kept` count changed** (`roverRowKeptRef`,
+  reset to -1 on open and on close so those two always write). Rewriting identical
+  cells would churn every downstream memo for no visible change -- which matters
+  during the run-up and wherever the rover is over ground the grid does not cover.
+- **4 Hz is a considered rate, not a default.** The cost is the whole derive chain
+  re-running: `applyBscanBg` over every cell, then the shared scale and the focused
+  cell values. Measured on the Pi at 8 sweeps a cell, **32 ms for a 147-cell grid
+  and 52 ms for 303 cells** -- ~13-21% of one core at 4 Hz there, less on the
+  groundstation. Raising the rate is not free, and 4 Hz already puts two updates
+  inside a 50 mm cell at 100 mm/s. If it ever needs to go faster, memoise
+  `applyBscanBg` PER CELL first (it is a pure per-cell map with no cross-cell
+  dependency, so a WeakMap on the record keyed by the subtraction options works);
+  do not just lower the interval.
+- **The SAR worker's 300 ms debounce therefore never fires DURING a traverse**
+  (250 < 300). Deliberate: a reconstruction of a half-driven row is discarded by
+  the next flush anyway, and it still runs at every row change, where the flushes
+  stop because `publishRowStats` is gated on `isOpen()`.
+
+### Plan-view pixels: exact tiling, and the dashed path is gone (2026-09-08)
+
+Audit of the colouring pipeline after the live flush went in. The cell -> pixel
+mapping and the value pipeline were checked end to end; two things were wrong.
+
+**1. EVERY CELL OVERDREW ITS NEIGHBOURS BY UP TO 1.5 px.** `cellRect` returned the
+raw fractional rectangle and the three fills compensated for the resulting
+hairline gaps with `Math.ceil(r.w) + 0.5, Math.ceil(r.h) + 0.5`. That is a smear,
+and it scales with how fine the grid is: measured against the shipped function,
+**11.6% of a cell wide on a 101-column raster** (the pitch this rig actually
+captures at) and 12.5% tall on an awkward-fraction layout, against ~1.9% on the
+21x7 bench grid. A plan view is a measurement -- a cell must cover its own area
+and nothing else.
+
+`cellRect` now snaps each edge by rounding the cell BOUNDARY rather than a
+position plus a width, so column ix's right edge and column ix+1's left edge are
+the same expression and therefore the same pixel. Verified head-first against the
+function pulled out of the shipped file (not a retyped copy): **zero gaps, zero
+overlaps, zero zero-area cells** across four geometries including to-scale, and
+total width within 1 px of the exact extent. Rounding does NOT accumulate --
+every edge is rounded from its own absolute boundary -- so the to-scale
+projection stays true to within a pixel across the whole grid, which is far
+better than the 1.5 px bleed it replaces.
+
+**2. The dashed capture path is REMOVED.** It drew dotted lines joining captured
+cell centres in capture order, over the very pixels the plan view exists to show.
+It had also become wrong once the grid filled live: a row is written sorted by
+COLUMN, so on a right-to-left traverse the path was drawn back to front, and the
+open row's records are rewritten on every flush so its `order` churned at 4 Hz.
+START still marks where the raster began -- that part reads from the data and is
+worth keeping. The pulsing cyan NEXT-cell marker is also dashed but is a single
+outline, not lines across the image, and stays.
+
+**What was checked and found correct, so do not go looking again:**
+
+- **`cellRect`'s iy flip** (`originY - (iy+1)*cellH`) and `cellAt`'s inverse agree,
+  and `buildCscanGrid`'s `cells[iy*h + ix]` matches the draw loop's indexing. No
+  row mirroring, no off-by-one.
+- **SAFT addresses neighbours by GRID COLUMN** (`t.n`), not array position, so a
+  partial row -- which under live flushing is now the normal case -- does not
+  close the gap up and give every later column the wrong lateral offset.
+- **The live flush does not change the final image.** Simulated a full 11-column
+  traverse (36 Hz sweeps, 11 Hz positions) with flushing on and off and pushed
+  both through `applyBscanBg` -> `computeCellValues` -> `buildCscanGrid`:
+  **coloured values identical to 0 dB with focusing both on and off**, identical
+  shared and grid colour scales, no duplicate cells, a planted target landing in
+  the column it was planted in, and every cell within 1 mm of its column centre.
+
+**Known transient, NOT a defect in the final image.** While a row is filling, a
+cell at the leading edge has neighbours on one side only, and
+`saftFocusedProfile` accumulates a SUM over whatever contributors exist -- so with
+Focus on, the leading cells read dim and brighten as the row completes. It is the
+same truncated-aperture effect that permanently applies at the two ENDS of every
+finished row. Normalising by contributor count would change a kernel shared
+bit-identically with the 2D Map, so it was left alone; the final image is
+unaffected.
+
+### Long-scan failures: a 282 MB worker clone and a 258-byte cfg (2026-09-08)
+
+Two unrelated reports from one long scan, both reproduced and both fixed.
+
+**BROWSER: `DataCloneError: ... out of memory` + "Maximum update depth exceeded".**
+`useSarWorker` posted the WHOLE C-scan record list to the SAR worker, and
+`postMessage` structured-clones -- a synchronous deep copy on the main thread on
+every job. Since v7 every cell carries `sweeps`, every raw look taken there, which
+the worker never reads: it uses only `h_cal_real/imag`, `magnitudes`, `distances`,
+`lidar_standoff_mm`, `step_size`, `range_offset`. Measured cost of one clone:
+
+| grid | whole record | SAR's fields only |
+|---|---|---|
+| 21x7, 18 sweeps/cell | 8.9 MB, 76 ms | 1.6 MB, 7 ms |
+| 101x15, 18 sweeps/cell | 91.5 MB, 916 ms | 16.6 MB, 69 ms |
+| 101x15, 64 sweeps/cell | **282.2 MB, 3176 ms** | 16.6 MB, 70 ms |
+
+282 MB is the OOM. The **multi-second synchronous block** is also the most likely
+explanation for the update-depth error and the `performance.measure` OOM beside it:
+the live flush sets state at 4 Hz and the websockets keep delivering throughout, so
+React resumes into a huge batch under memory pressure. `SAR_INPUT_FIELDS` +
+`projectForSar()` now trim the payload at the postMessage, **5.5-17x less memory and
+11-45x faster**. Projected in the HOOK, not at the call site, so a future caller
+cannot re-widen it; `sar.worker.js` carries a matching comment because a field that
+is not projected arrives as `undefined` rather than raising.
+
+Verified on a real 20-position scan through the actual worker (`self` shimmed,
+`sweeps` fabricated so the projection had something to strip): the full `image` and
+`coherence` arrays and all 23 scalar result fields are **bit-identical** between the
+full and projected inputs. Only `computeTimeMs` differs, being a measurement.
+
+**I did NOT positively identify a self-triggering setState loop.** All eight App
+effects and the component effects were checked and each is either ref-only or
+guarded; the memory/stall explanation is what the measurement supports. **If
+"Maximum update depth exceeded" survives this fix, there is a real loop and it needs
+a profile** -- do not assume it is gone.
+
+Note `bscanData` itself still reaches **32 MB at 101x15x18 and 83 MB at 64
+sweeps/cell**. That is the data, and `sweeps` has to stay for the coherent/incoherent
+toggle, but it bounds how long a scan can get in one tab.
+
+**PI: `board error: too_long: command exceeds the receive buffer` -- the cfg was
+being silently rejected.** Measured against the real bench config, the `cfg` command
+serialised to **258 bytes against the firmware's 256-byte `RX_BUFFER_SIZE`**, so the
+board dropped it.
+
+This is not cosmetic. `cfg` is what carries the **soft limits** to the board, and on
+a rig with no endstops those are the backstop that is supposed to survive this Pi
+crashing. It also carries the scan speed a raster pushes at `beginRaster` and
+restores at the end -- so a rejected cfg means the traverse runs at whatever speed
+the board happened to hold.
+
+Cause: `x_steps_per_mm` is `1600/(pi*66) = 7.716603301425229`, so every speed and
+acceleration derived from it serialises at full 17-digit double precision --
+`"h_speed": 1157.4904952137842` is 19 characters where 10 would do. **The overflow is
+DATA-DEPENDENT**, which is why it appeared only once X had been calibrated to an
+awkward number: Y is exactly 200 steps/mm and serialises short.
+
+Two fixes, both in `send_board`/`push_config`:
+- **3-decimal rounding** on the six float fields. 3 dp of a steps/s figure is
+  ~0.0004 mm/s, orders below anything the mechanism can express. 258 -> 226 bytes.
+- **Compact JSON separators** (`separators=(',', ':')`), worth another 27 bytes.
+  Verified against the FIRMWARE'S OWN PARSER compiled natively from
+  `rover/protocol_core.h`: `findValue` terminates a bare value on `,`/`}`/`]`/
+  whitespace, so spaced and compact parse identically -- every field of a cfg and a
+  move checked both ways.
+
+Result: real config **201 bytes (55 spare)**, and the worst case `CONFIG_BOUNDS`
+allows **231 bytes (25 spare)** -- rounding alone did NOT cover that worst case
+(258), which is why both changes were needed. `BOARD_RX_LIMIT = 256` now mirrors the
+firmware and `send_board` logs and surfaces an oversized command by name rather than
+leaving a bare `too_long` in the board log to be correlated by hand. It still sends:
+the board's refusal is the authority, and silently dropping would be worse.
+
+Raising `RX_BUFFER_SIZE` in the firmware would add margin but needs a reflash; the
+Pi-side fix deploys now and the guard makes a future overflow loud.
+
+### What the harness checks, and what it cannot
+
+31 checks: a clean 11x3 raster (33 cells, every cell within 2 mm of its column
+centre, scan speed applied and restored); start refused while moving and accepted
+once at rest; stop mid-row then resume (same anchor, no duplicate cells, grid ends
+full); the counter fallback with no token support; a silent link aborting while
+still harvesting the partial row; a run-up that leaves the rail refused; stepped
+mode still snaking `0,1 1,1 2,1 3,1 3,0 2,0 1,0 0,0`; every row change purely
+vertical with one row_start and one traverse per row; and an anchor from a
+different geometry refused.
+
+The gantry is a KINEMATIC model of a perfect machine -- no missed steps, no slip,
+no WiFi jitter beyond a fixed link delay, and the sweep stream never drops. It
+validates protocol and control flow only. `pi/rover/rover_sim.py` remains the way to
+exercise the real server end to end. **Not yet run on the rig.**
 
 ## Imaging Bench Panel — Offline Effect Comparison (2026-08-23)
 
@@ -1222,6 +2124,283 @@ entire background sits within 2–6 cm of range, and 3 GHz of bandwidth gives ~5
 resolution. The "gated" metric therefore tracks the full-band metric closely. Separating a
 target from the face needs more bandwidth or aperture, not better background subtraction.
 
+## BG model continuous capture: wave the module, bin by standoff (2026-09-07)
+
+Manual BG-model capture used to be park / press Capture / hold still for 40 sweeps /
+move / repeat. That protocol existed because a sweep was ~550 ms, so any motion during
+one smeared it across frequency. At **36 Hz a sweep is 27.5 ms**, so the constraint has
+inverted: the positions can be swept continuously and hand-placement -- which was capping
+median gap at ~5 mm, and density is the dominant accuracy lever at ~12 dB of LOO
+suppression per doubling of gap -- stops being the bottleneck.
+
+**Continuous Capture** toggle in the BG Model panel's Capture section, manual mode only.
+Start it, sweep the module slowly across the span, stop it. Each sweep is filed under the
+standoff it was actually taken at into a fixed bin, and **each occupied bin becomes exactly
+one "capture" in the existing `{samples, stats}` shape** -- so coverage analysis, export
+v2, `buildInterpModel`, `evaluateLoo` and the trainer are all untouched and cannot tell a
+continuous position from a hand-placed one. `lib/bgContinuous.js` (pure),
+`createContinuousAccum`; App state is `bgContinuousRef` / `bgContinuousActive` /
+`bgContinuousStats`.
+
+### Standoff is INTERPOLATED from the lidar track, and this is the whole accuracy story
+
+The TF-LC02 measures at 11-17 Hz against 36 Hz sweeps, so most sweeps contain no new
+measurement and `App.jsx` carries the last one forward (`LIDAR_CARRY_MS`, 1 s) so the live
+display does not strobe. Stapling that carried reading to a MOVING sweep is a pure lag,
+and therefore a **direction-dependent bias** -- the sign flips when the pass reverses, so
+an out-and-back wave lays the same physical standoff down in two places, which is exactly
+what a coherent background model cannot absorb.
+
+Measured on a simulated 60 s out-and-back pass at 25 mm/s (14 Hz lidar with 0.4 mm noise,
+36 Hz sweeps, scored against known truth):
+
+| standoff from | rms error | out-and-back bias | sweeps kept |
+|---|---|---|---|
+| carried reading, unfiltered | 0.851 mm | **1.100 mm** | 100% |
+| fresh-reading filter (`lidar_n > 0`) | 0.445 mm | 0.016 mm | **38%** |
+| **interpolated (shipped)** | **0.322 mm** | 0.041 mm | **99%** |
+
+**The fresh-reading filter is not a bad answer and it is worth understanding why, because
+it is not obvious:** a measurement that landed inside the sweep's own window is on average
+at that sweep's midpoint, so requiring one gives an UNBIASED standoff, not merely a
+bounded-lag one. What it costs is that only ~38% of sweeps have one, plus +/- half a sweep
+period of jitter on the survivors. Interpolating between the measurement before the sweep
+and the one after is unbiased as well, keeps ~99% of sweeps, and is quieter on top because
+it averages two measurements where the filter takes one. On the same simulation the
+resulting model's LOO suppression went **39.8 -> 46.2 dB**.
+
+The first version of this panel shipped the fresh-reading filter. Both are correct; the
+interpolation is 2.6x the looks per bin and 28% less standoff error for the same run.
+
+**What is deliberately NOT corrected: the sensor's own publication lag** -- the fixed
+offset between the middle of its integration window and the value appearing on the wire.
+That is a constant time offset, so it is again a direction-dependent position bias, and it
+has never been measured. Rather than guess it, every accepted sweep records
+`lidar_v_mm_s` (SIGNED), so an out-and-back run contains both directions at the same
+standoff and the lag can be solved for offline from an export: find the tau that makes the
+outbound and return knots agree.
+
+### Why the Pi now polls the lidar at 200 Hz, and why that is NOT "more measurements"
+
+Asked 2026-09-07: why not raise `LIDAR_POLL_HZ` from 20 to 40 to get more data? **You
+cannot -- 11-17 Hz is the sensor's own measurement cadence.** Already measured directly:
+polling at 584 Hz gives a **median run of 34 identical consecutive polls** (584/34 = 17 Hz
+of real measurements), and Phase 1.1 measured **17.2 Hz at 165 mm, 11.5 Hz at 262 mm,
+11.5 Hz at 340 mm**. That it gets SLOWER with distance is the tell: adaptive integration
+time, not a settable frame clock. There is no register to write and no way to ask for more
+photons.
+
+What a fast poll DOES buy is a tight **timestamp**, which is what the interpolation needs.
+At 20 Hz we learned a measurement existed up to 50 ms late (1.25 mm at 25 mm/s); at 200 Hz
+it is 5 ms. So `LIDAR_POLL_HZ = 200`, and it is free -- measured 2026-08-27 at 584 Hz:
+broadcast 48.35 vs 48.79 Hz, IMU rate slightly BETTER at 33.83 vs 32.66 Hz.
+
+**The change that makes that safe is that `lidar_seq` now counts MEASUREMENTS, not reads.**
+It advances only when the value CHANGES (or when a stable value ages past
+`LIDAR_STABLE_REPUBLISH_S = 0.25`). Publishing 200 reads/s of a 14 Hz value would have made
+`App.jsx`'s `lidar_n` count duplicates and `lidar_std` measure the spread of a repeated
+number -- the "repeats deflate the spread" fiction the old 20 Hz cap existed to avoid. The
+new counter is also more honest than the old one WAS at 20 Hz, where 20-40% of reads were
+already repeats.
+
+Value-change detection is unreliable on a static target (1 mm quantisation against
+0.66-0.78 mm raw sigma, so ~40% of consecutive measurements land on the same integer) --
+hence the republish timeout, chosen well above the slowest observed internal period (~87 ms)
+so it can never fire between two genuinely-new measurements. Where it fires, the true
+spread over the window really is ~zero, so the repeat is not a lie.
+
+### The two filters that remain
+
+1. **NOT BRACKETED.** No interpolant exists if the sweep's time is not spanned by two
+   measurements within `MAX_BRACKET_GAP_S = 0.25`. The lidar going quiet is real (bursts of
+   invalid returns at a poor target angle are documented at 30-40% of reads on this bench),
+   and a straight line across the hole would invent a trajectory. Dropped, never
+   extrapolated -- including the last sweep or two of every run, which have no measurement
+   after them.
+2. **TOO FAST.** Frequency steps are sequential, so standoff changing DURING a sweep is a
+   phase ramp across the band -- a smear interpolation cannot fix either, because the sweep
+   genuinely does not describe one position. 40 mm/s at 27.5 ms is 1.1 mm. **Speed is a
+   least-squares slope over a 350 ms window of the track, not a consecutive difference** --
+   0.4 mm of lidar noise across a 70 ms gap is ~6 mm/s of phantom speed on its own.
+   Verified: a static rig with realistic noise gives zero motion rejects at a 40 mm/s limit.
+   `0` disables the gate.
+
+### Wave speed sets PER-PASS granularity; passes then fill the gaps
+
+Within one pass a measurement lands every `v * lidar_period`. Measured: a single 12 mm/s
+pass leaves a **1 mm** hole, a single 40 mm/s pass leaves **13 mm**. But over many passes
+it fills anyway -- the lidar cadence and the pass timing are incommensurate, so each pass
+samples different phases, and a 60 s run at 40 mm/s closes to a 1 mm hole just like the
+slow one. **A fast wave is not broken, it just needs more passes.** Watch Hole, not Span;
+Span only says how far the pass reached.
+
+### Numbers and the knob that is not obvious
+
+Simulated 60 s pass, 25 mm/s over 120 mm: **2184 sweeps -> 2152 kept (99%) -> 121 bins at
+1 mm, largest hole 1 mm**, median bracket 71 ms, against ~30 hand-placed positions at
+~5 mm. Build 7 ms, `evaluateLoo` 179 ms, model JSON 0.50 MB (n^2*S, so watch it if bin
+width ever goes far below 1 mm over a wide span).
+
+**Bin width floors at 0.5 mm because `bgModelInterp.js` `MERGE_MM` is 0.5** -- finer bins
+cannot make a finer model, they just split the same looks across knots the interpolator
+then re-merges with fewer sweeps each. Note the knot count can also come out **below** the
+bin count: a knot sits at the MEAN of its bin's samples, not at the bin centre, so two
+adjacent bins can land inside 0.5 mm of each other and get merged. Harmless.
+
+**The trade against static capture is looks per knot, and it is worth taking.** A static
+position gets 40 sweeps; a bin in the run above gets ~18. That costs `10*log10(40/18)` =
+3.5 dB off a measurement-noise term worth only ~5 dB in the first place (the 2026-08-28
+regime decomposition: single-sweep noise 5.16 dB, standoff noise 0.37 dB), while buying 2+
+doublings of density at ~12 dB each. If a run comes out thin, pass again -- do not raise
+the cap expecting it to fill bins that were never visited.
+
+### Wiring notes
+
+- **Two websockets, one clock.** The lidar track arrives on 9001 and the sweeps on 9003,
+  and they are matched on the Pi's `time.time()` -- `lidar_ts` from `stream.py` and
+  `sfcw_result.timestamp` from `sfcw_engine.py` are the same clock. Do not switch either
+  to `time.monotonic()` without fixing the other.
+- **The sweep's own timestamp is stamped at its END**, so the interpolation asks for the
+  standoff at `timestamp - period/2`, with the period a running median of adjacent sweep
+  intervals (median, not mean, so one stalled frame does not move it -- same choice
+  `Viewport.jsx`'s `useSweepRate` makes). 14 ms at 36 Hz, i.e. 0.35 mm at 25 mm/s -- the
+  same order as the lidar's own noise, so worth removing rather than ignoring.
+- **A run's first sweeps must NOT fall through to the legacy path.** The track is empty
+  until the first measurement lands, ~14 sweeps at 36 Hz, and filing those by their carried
+  standoff is the exact error this module exists to remove. Sweeps are held pending, and
+  the legacy path latches only after `LEGACY_DECIDE_S = 1.5` of sweeps with no measurement
+  at all (or at flush), which is a Pi that does not publish `lidar_ts`. The panel says so
+  when it happens.
+- The accumulator is a **ref**, and the panel is fed by a 250 ms interval, because a
+  per-sweep `setState` would re-render the sidebar 36 times a second to move a counter.
+  Same reason `sfcwDynamicScale` and the C-scan layout are refs.
+- **The run is harvested on ANY end** -- the toggle, the session stopping, a sweep error
+  (all three collapse to `sfcwRunning` going false) -- not only on the toggle. A minute of
+  waving is expensive to redo and a dropped session is exactly when losing it would hurt.
+- Continuous captures carry a `batch` id and **Undo Last drops the whole run**, since
+  undoing a 120-bin harvest one bin at a time is not a control anyone would use.
+- Continuous and the static per-position capture are mutually exclusive, both in the UI
+  and guarded in `handleBgModelAction`.
+- Each stored sample keeps `lidar_standoff_live_mm` (what the live path would have said)
+  beside the interpolated `lidar_standoff_mm`, plus `lidar_v_mm_s` and `lidar_bracket_s`.
+- `analyzeCoverage` is memoized in the panel and the per-position row list is capped at 80
+  rows: the panel re-renders at the LIDAR rate (the live standoff readout), and a
+  continuous run turns 30 rows into a few hundred.
+- Rover mode is unchanged; continuous is manual-only (the rover already places positions
+  precisely, which is the problem continuous exists to solve).
+
+### The per-bin dB number, and why some bins read 330 dB or negative (2026-09-07)
+
+The number beside each position in the Coverage list is `snrDbAveraged` from
+`bgCaptureStats.computeCaptureStats`: the coherent (complex) mean of that bin's sweeps
+against the scatter about it, plus `10*log10(n)` for the averaging. Roughly 30 dB at n=2
+rising to 44 dB at n=40 on a healthy bin. Two ways it went wrong, both found from a live
+run and both now fixed.
+
+**330 dB was a bin with exactly ONE sweep.** With n=1 the variance about the mean is
+exactly zero -- the sample IS the mean -- so the score is 0/0 and the `|| 1e-30` guard
+turned it into `10*log10(sigPow/1e-30)` = **317-330 dB** depending on `|h_cal|`. Coherence
+came out exactly 1.0 with it, so the panel painted those bins GREEN. The least trustworthy
+position in the set was displaying as the best one, and `BgModelDisplay`'s SNR axis scaled
+itself to 330 dB, flattening every real bar into the bottom eighth of the chart. Static
+capture never produced an n=1 position, so this could not happen before continuous capture;
+now it happens wherever the pass was moving fastest. `computeCaptureStats` returns **null**
+for `snrDbPerSweep` / `snrDbAveraged` / `coherence` when `n < 2` -- undefined, not
+infinite. Both consumers already handled a null SNR; the chart now paints an unscoreable
+position neutral grey, and the panel shows `-` plus the sweep count. **The sweep count
+(`xN`) is now displayed next to every position**, which is the number that explains the
+score.
+
+**Negative dB was a thin bin containing a CORRUPTED sweep.** The radar throws the odd
+garbled sweep -- 0.46% idle and 2.05% under client load on the 2026-09-06 measurements,
+plus the NIOS path's ~1.4% fallbacks -- so a 60 s run at 36 Hz (~2200 sweeps) contains
+tens of them. The static protocol diluted one across 40 good sweeps; a continuous bin
+holding 2 or 3 does not. Measured with one garbage sweep injected:
+
+| bin size | 2 | 3 | 5 | 10 | 18 | 40 |
+|---|---|---|---|---|---|---|
+| score with one corrupted sweep | **-0.1 dB** | 3.7 | 10.6 | 16.8 | 21.9 | 29.1 |
+
+so the damage is worst exactly where continuous capture is thinnest, and the bin's
+coherent mean becomes a corrupted KNOT -- which is what the leave-one-out scoring reports
+as a weakest knot, and what Akima was chosen to stop propagating into its neighbours.
+
+`bgContinuous.toCaptures()` now screens each bin: every sweep is scored by its **median**
+complex correlation against the others and dropped below `BIN_AGREE_MIN = 0.90`.
+
+- **Median against the others, not correlation against their mean** -- a mean is dragged
+  by the very outlier being looked for, a median is not.
+- **0.90 sits in a very wide empty gap.** Sweeps of the same scene inside one 1 mm bin
+  correlate >0.99 (the wall term rotates only ~12 deg per mm at 5 GHz, single-sweep SNR is
+  ~21 dB), while a garbled sweep has random phase per step and correlates ~1/sqrt(51) =
+  0.14. Verified that genuine within-bin standoff spread is never screened.
+- **n < 3 is left alone.** With two sweeps that disagree there is no way to say which is
+  wrong, so both are kept and the bin's own (negative) score is left to report it rather
+  than the code guessing.
+- **A bin where nothing agrees with anything is kept whole.** That is not one outlier, and
+  silently deleting the position would put a hole in the model instead of a visibly bad
+  knot.
+
+Measured on a simulated 60 s run with 1.5% corruption injected: **34 of 34 corrupted
+sweeps caught, 0 negative bins, worst bin 37.8 dB against a median of 39.3.** The count is
+reported in the harvest line.
+
+### Wave speed: 40 mm/s was too conservative, the default is now 100
+
+The first default came from a smear budget of ~1 mm per sweep, picked before the cost of
+smear had been worked out. Working it through: a sweep steps frequency sequentially, so
+motion during it puts both a quadratic phase term (defocus) and a linear one (an apparent
+range shift) on the echo. Defocus is negligible -- it does not reach the classical pi/4
+until ~6.7 mm of motion -- so the binding term is the range shift, which is
+direction-dependent like every other lag in this system.
+
+Measured by synthesising a sweep with a per-step standoff and finding the static standoff
+whose spectrum best matches it:
+
+| speed | 20 | 40 | 60 | 100 | 150 | 250 | 400 mm/s |
+|---|---|---|---|---|---|---|---|
+| motion during one sweep | 0.55 | 1.10 | 1.65 | 2.75 | 4.12 | 6.87 | 10.99 mm |
+| **apparent standoff error** | 0.08 | **0.15** | 0.23 | **0.38** | 0.56 | 0.93 | 1.48 mm |
+| match to the static background | 40.6 | 34.6 | 31.0 | 26.6 | 23.1 | 18.8 | 14.8 dB |
+
+The lidar interpolation's own residual is 0.32 mm, so **anything under ~100 mm/s is not
+the limiting term**; 150+ starts to be, and the "match" column is a ceiling on what a
+model built from moving sweeps can achieve (bench LOO is 20-26 dB, so 100 mm/s does not
+bind and 250 would). Default raised 40 -> 100 mm/s.
+
+**The sweep-MIDPOINT labelling is what makes that affordable.** Labelled by the Pi's
+end-of-sweep stamp instead, the same table reads 0.40 mm at 40 mm/s and 1.00 mm at 100 --
+2.7x worse. The two corrections compound: interpolating the lidar track fixes where the
+sweep was, and the midpoint fixes when.
+
+The localStorage key is versioned (`bgmodel_cont_max_speed_v2`) so browsers that already
+ran the panel pick up the new default rather than keeping a value chosen on a wrong basis.
+
+**Speed still sets PER-PASS granularity** and that is unchanged: a measurement lands every
+`v * lidar_period`, so one 100 mm/s pass spaces them ~7 mm apart and cannot fill 1 mm bins.
+Further passes do, because the lidar cadence and the pass timing are incommensurate. Watch
+Hole; a fast wave is not broken, it just needs more passes.
+
+
+### Verification
+
+`lib/bgContinuous.js` is pure and was exercised head-first from node (53 checks: the
+interpolant against hand-computed values, both no-extrapolation directions, refusal to
+interpolate across a quiet lidar, the sweep-midpoint correction, the motion gate at 200 vs
+20 mm/s and its signed velocity, a static rig with 0.4 mm lidar noise giving zero false
+motion rejects, binning and the cap, negative standoffs, capture ordering, hole detection
+distinct from span, the legacy latch and that a run's start is NOT given to it, the
+bin-width floor, the three-arm accuracy comparison above, per-pass vs multi-pass hole
+filling, and a full 60 s simulated pass built through `buildInterpModel` + `evaluateLoo`).
+There is still no test runner in this repo, so these were throwaway scripts. `vite build`
+passes and `stream.py` parses.
+
+**Not yet run on hardware.** Three things to check on the bench: that the 200 Hz poll and
+measurement-counting `lidar_seq` behave as expected in the live stream (watch the panel's
+Lidar readout -- median bracket should sit at 60-90 ms), that "no bracket" rejects stay
+near zero, and that a hand pass can be held under 40 mm/s. If the motion reject count is
+large, slow down before raising the limit: it is a smear budget, not a preference.
+
 ## Background subtraction: standoff instrumentation and the false-target hunt (2026-08-28)
 
 Investigating false targets (spurious returns where there is nothing) from the Akima
@@ -1266,6 +2445,15 @@ claim that the earlier 164 mm noise characterization was "measured at the wrong 
   (48.79 → 48.35 Hz), IMU update rate unchanged/slightly better (**32.66 → 33.83 Hz**).
 - Packet now carries `lidar_seq` (increments per *successful read*) and `lidar_ts`. At
   20 Hz the seq sequence seen by a client is contiguous — every reading reaches a packet.
+
+**SUPERSEDED 2026-09-07 on both counts: `LIDAR_POLL_HZ` is now 200, and `lidar_seq`
+increments per distinct MEASUREMENT rather than per read.** The reasoning above is still
+correct as far as it goes — polling faster genuinely cannot produce more measurements — but
+it treated the poll rate as buying only data, when it also buys the measurement's
+TIMESTAMP, which is what continuous BG capture interpolates against. Publishing every read
+at 200 Hz would have reintroduced exactly the `lidar_n`/`lidar_std` fiction this section
+describes, which is why the counter had to change with it. See "BG model continuous
+capture" below.
 
 `App.jsx`:
 - `lidarAccumRef` dedupes by `lidar_seq` before averaging. Measured against live packets:
@@ -2934,6 +4122,89 @@ real data reaching the second window and not just an empty grid.
 There is still no test runner in this repo, so all of these were throwaway
 scripts. `vite build` passes.
 
+## C-scan panel: smoothed plan view, Live Sweep pane removed (2026-09-08)
+
+Three UI changes to the C-Scan panel.
+
+**1. A Smooth/Blocky toggle in the Display section** (`cscanSmooth` in `App.jsx`,
+persisted to `localStorage.cscan_smooth`, passed to both `CscanDisplay`
+instances including the projector portal). It is a DISPLAY transform only -- no
+cell value changes and nothing downstream reads it, which is why it is
+deliberately NOT in `bscanParams`: it must not ride along in an export as though
+it were a property of the capture.
+
+`drawSmoothField()` builds an ImageData at GRID resolution (one source pixel per
+cell), then lets `drawImage` upscale it with `imageSmoothingEnabled`. Two
+properties make it honest, and both were checked head-first against the shipped
+call: **cell centres survive the resample exactly** (source pixel `i+0.5` maps to
+`originX + (i+0.5)*cellW`, which is `cellRect`'s own centre), and **a value
+reaches exactly one pitch and no further** -- bilinear only ever mixes two
+adjacent source pixels, so a feature can neither move nor grow beyond the
+sampling the operator chose. The outer half-cell ring is the edge cell's own
+value held flat (drawImage clamps at the source edge), not an extrapolation.
+The title carries `· SMOOTH` because the pixels between centres are interpolated
+rather than measured.
+
+Cost is `hCount*vCount` per frame, not a pixel of the pane -- 1515 for a 101x15
+raster.
+
+**Cells that are not a value are still drawn as sharp squares on top**:
+uncaptured, gated-out, and the red-cross background-failed cells. Those are
+statements about a cell, not measurements to blend between. Holes are first
+given the mean of their KNOWN neighbours in the source image so the ramp INTO
+them is not dragged toward a colour nothing measured. **That fill is ONE pass,
+deliberately** -- only a hole directly beside a real cell can touch a visible
+pixel (the half of the span inside the hole's own cell is overdrawn), and an
+iterative flood would fabricate more AND cost passes over the whole grid on
+every frame of a mostly-empty raster.
+
+**1b. A colour-map dropdown (jet / viridis / inferno)** in the same section
+(`cscanColormap`, `localStorage.cscan_colormap`, default **jet** so every stored
+screenshot and habit still reads). It redraws on the next frame -- nothing is
+recomputed.
+
+It drives **both panes and the projector**, not just the plan view: they are
+scaled off ONE population of bins precisely so that a colour means the same dB
+in each, and colouring them differently would break exactly that. So
+`CscanDisplay` and `BscanDisplay` both dropped their local `jet` copies and now
+import `COLORMAPS` from `lib/imagingEffects.js` -- one implementation, the same
+rule CFAR, `windowFn` and the SAFT kernel follow. **The swap is bit-identical**:
+the library's `jet` matched both local copies over 100k samples plus NaN /
++-Infinity / -0. (`SfcwDisplay.jsx` still carries its own 9-knot ramp versions of
+viridis/inferno for the waterfall -- pre-existing, untouched here.)
+
+**The uncaptured-cell colour had to change, and the reason generalises.** The
+sentinel fills are chosen to be colours "no colormap produces", which held while
+jet was the only map: jet's bottom is saturated blue. **inferno's bottom is
+near-black**, so `EMPTY_FILL` (#0d0d0d) sat **15 RGB units** from a legitimately
+low-valued cell -- an uncaptured cell reading as data, on a percentile-clipped
+scale that genuinely reaches the bottom of the map. Measured across 2001 samples
+of each map, no dark fill fixes it (every candidate under ~#333 stays inside 45)
+and #333 itself collides with `GATED_OUT_FILL`. **So the OUTLINE is now the
+discriminator**: `EMPTY_STROKE` #1f1f1f -> **#4a4a4a** at 1 px, a mid grey >= 56
+units from all three maps, and structurally different from the gated-out cell's
+solid grey fill. `INVALID_FILL` is 39 from inferno but carries a bright #ff4d6d
+cross (67), so it was left alone. **Check this before adding a fourth map.**
+
+**2. The Live Sweep pane is gone from the C-Scan viewport.** The plan view now
+holds the whole area until a row is opened. That pane's controls bar was the
+ONLY place `procParams` could be set (see "The Live Sweep controls bar now
+drives the C-scan", 2026-08-31), so **Window / Kaiser beta / Avg / coh-inc moved
+into the panel's Display section as real controls** rather than the read-only
+tiles that used to mirror them; they still lock on `procLocked`
+(`sfcwRunning || roverScan.active`) for the same reason. `Viewport` no longer
+takes `bscanProcParams` / `onBscanProcParamsChange` / `bscanProcLocked` /
+`cscanLiveResult`; `App.jsx` passes them to the Sidebar instead.
+`cscanLiveProcessed` survives -- only its `.diag` is consumed now, by the panel's
+Background readout.
+
+**3. The explanatory prose blocks were removed** from Depth Slice (gate
+markers), Focus, Display, the Window/Avg block, Projection, Scaling, Background
+and Super Fit. Status and warning text is untouched -- only the paragraphs
+explaining what a control does. The Super Fit "needs a full grid, N of M cells"
+line went with them; the Scan Grid section's `Captured` tile already shows that
+count.
+
 ## C-scan plan-view focusing, per row (2026-09-06)
 
 A **Focus (SAFT)** section on the C-scan panel -- a toggle and an aperture
@@ -4095,13 +5366,23 @@ the current `sfcw_engine.py`. Confirmed working on the GUI by the operator, incl
 target-in / target-out case that broke an earlier draft (see "the resolver that had to
 go" below). **The image is committed at `fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf`**
 (sha256 `3449d1af...`, provenance + load instructions in `fpga/images/README.md`).
-**It is RAM-loaded only (`bladeRF-cli -l fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf`)
-and reverts on power cycle -- SPI flash still holds the OLD image; flashing (`-L`) is the
-operator's call.** After a
-power cycle, reload it or the engine prints one line ("NIOS autonomous sweep unavailable
-on this FPGA image") and runs the standard sweep for the session: the capability latch
-(`_nios_unavailable`) detects the dead sample counter at the first EXEC, so a stock image
-degrades to exactly the old behaviour rather than churning. `docs/nios_sweep.md` (copied
+**FLASHED TO SPI 2026-09-11, so it now survives a power cycle and needs no host
+action.** It was RAM-loaded only (`-l`) until then, which cost a silent 2x regression
+every power cycle -- see "The 18 Hz regression" below. `bladeRF-cli -L
+fpga/images/hostedxA9_niosIIf_sweep_ts_v1.rbf` is what flashed it; the stock 0.16.0
+image is no longer on the board, so reverting means re-downloading it from Nuand.
+
+**THE DIAGNOSTIC INVERTED WHEN IT WAS FLASHED, and this is the trap.** `bladeRF-cli -e
+info` reporting *"configured from SPI flash"* used to mean the STOCK image and was the
+signature of the fault; it now means the II/f image loaded correctly and is the HEALTHY
+state. *"configured by USB host"* means someone `-l`-loaded something over the top.
+**The string is no longer diagnostic on its own** -- the only reliable check is
+behavioural: run a sweep and read `sweep_core` on `sfcw_result` (`nios` = working,
+`standard` = the latch tripped), or just look at the rate. If the sample counter is ever
+dead again the engine prints one line ("NIOS autonomous sweep unavailable on this FPGA
+image") and runs the standard sweep for the session: the capability latch
+(`_nios_unavailable`) detects it at the first EXEC, so a stock image degrades to exactly
+the old behaviour rather than churning. `docs/nios_sweep.md` (copied
 from `fpga_branch`, plus a 2026-09-07 II/f addendum) holds the protocol and firmware side.
 
 Measured through the full stack (`start.py` + one websocket client), 51 steps, settle 0:
@@ -4272,3 +5553,207 @@ never guess).
   corrupted several blocks during this session and cost real debugging time; repeated
   start/stop cycling also still degrades the device (recover by restarting `start.py`
   after a 15-20 s gap, or `usbreset` if it wedges).
+
+### The 18 Hz regression: the FPGA image silently reverted (2026-09-11)
+
+Reported as "the sweeps are running at 18fps, from the 37 we had already achieved".
+Nothing had slowed down -- **the NIOS autonomous sweep was not running at all**, and
+18 Hz is simply what the II/f image does host-driven. The bench had been power-cycled
+while the LiDAR was rewired back to the TF-LC02, the image was RAM-loaded only, so the
+FPGA reverted to the stock SPI image and the capability latch tripped at the first EXEC.
+Fixed by flashing the image to SPI (`-L`), verified 35.9 Hz with 0.75-1.00% fallbacks.
+
+**18 Hz is a DIAGNOSIS, not just a number, and the rate table above is the lookup.**
+The three regimes are far enough apart to identify the cause from the rate alone:
+~37 Hz = NIOS autonomous; **~18 Hz = II/f image present but NIOS not running**;
+~15 Hz = the old II/e image. So ~18 Hz specifically means the sweep firmware is
+unreachable while the II/f image is loaded -- look at the FPGA image and the latch,
+never at `settle_count` or the host path.
+
+**Confirm it with `sweep_core` on `sfcw_result`, which names the cause directly**
+(`nios` / `fallback` / `standard`) -- that field exists precisely so this does not have
+to be inferred from a rate. A 100% `standard` block is the latch; a 100% `fallback`
+block is the span gate refusing every sweep, which is a different fault with the same
+rate.
+
+### There were TWO 18 Hz faults, and they masked each other (2026-09-11)
+
+After the FPGA was reflashed and the wire measured **35.9 Hz**, the browser still
+read 18 -- because the SFCW pane header was reporting the DISPLAY rate while
+claiming to report the radar's, and the two numbers collide almost exactly.
+
+`Viewport.jsx`'s `useSweepRate` derived the rate from the `sfcwResult` STATE, but
+`App.jsx` only sets that inside the ~20 Hz live-display throttle added on
+2026-09-10 (the slow-client fix). A fixed 50 ms gate against a 27.9 ms sweep
+passes **exactly every other sweep**, so the header read the doubled period:
+
+| real sweep | what the header USED to say | what it says now |
+|---|---|---|
+| 27.9 ms (35.87 Hz, NIOS, II/f) | **17.93 Hz** | 35.87 Hz |
+| 55.5 ms (18.02 Hz, stock image) | **18.02 Hz** | 18.02 Hz |
+| 65.5 ms (15.27 Hz, old II/e) | 15.27 Hz | 15.27 Hz |
+
+**17.93 against 18.02 is not a distinguishable difference on a readout**, so the
+header showed ~18 Hz whether the radar was healthy or the FPGA had reverted --
+and it had shown ~18 ever since the throttle landed, which is why the rate looked
+like it "dropped from 37" long after the throttle actually took it there. Fixing
+the FPGA moved the wire from 18 to 36 and moved the readout not at all.
+
+**Fixed by deriving the header from the measurement `App.jsx` already takes above
+the throttle** (`sweepPeriodMs`, median of adjacent Pi timestamps over 12 sweeps),
+which the C-scan panel was already using correctly for its traverse-sampling
+arithmetic. `useSweepRate` is deleted; do not reintroduce a rate derived from
+`sfcwResult`, and note that the throttle means **any** state gated behind it is
+unsafe to measure timing from.
+
+The general lesson is the one this file keeps relearning: **an instrument fed from
+a throttled, decimated, or averaged copy of the data reports on the copy.** Same
+class as `lidar_seq` counting reads rather than measurements, and as the C-scan
+recomputing its own range profiles while the panel beside it showed the Pi's.
+
+**The failure is quiet by design and that is the real cost here.** Degrading to the
+standard sweep is the right behaviour -- it is a correct, slower sweep, not a broken one
+-- but it announces itself with a single stdout line at startup that nobody is watching,
+and the GUI's rate readout is the only other evidence. A halving of throughput should
+probably be louder than one line; it went unnoticed long enough to be reported as a
+mystery. Note `start.py` still does not touch the FPGA, so the flash is now the only
+thing keeping this from recurring.
+
+## The sweep "stuck in websocket": one slow client froze every client (2026-09-10)
+
+Integrated from the `balls` branch (`cb077ea`). Symptom: the GUI stops receiving
+sweeps entirely and stays stopped, while the Pi is plainly still sweeping -- the engine
+thread, the NIOS capture and the stdout are all healthy. Restarting the browser tab
+recovers it.
+
+**Root cause: `client.send()` has no timeout, and the broadcast was SEQUENTIAL.** All
+five broadcast sites in `sdr_server.py` did
+
+    for client in self.clients:
+        await client.send(msg)
+
+`websockets.send()` awaits until the frame reaches the transport. A client that is not
+draining -- a browser whose main thread is wedged, or a half-open TCP connection with no
+FIN/RST -- fills the writer buffer and **that await never returns.** It blocks
+`_sfcw_broadcast_loop` itself, so `sfcw_queue` (8-deep, drop-oldest) just churns and
+**every other client goes dark with it.** One bad client freezes the whole server's
+output. Note this is the same class of bug as the `put_nowait` one above and lives in the
+same loop, but it is a different mechanism: that one throttled the broadcast to ~10 Hz,
+this one stops it dead.
+
+**Fix: `_send_to_all(msg, timeout=0.5)`**, now the only way anything is broadcast.
+`asyncio.gather` over all clients concurrently, each wrapped in
+`wait_for(..., timeout=0.5)`, and a client that times out is dropped as dead alongside
+`ConnectionClosed`/`OSError`. **`RECONNECT_INTERVAL` in `useWebSocket.js` dropped
+3000 -> 500 ms as a direct consequence** -- the Pi now evicts a slow client, so it has to
+come back quickly. Those two changes are coupled; do not raise one without the other.
+
+**The loop can also DIE, and used to do it silently.** `_sfcw_broadcast_loop` is a bare
+`while True` and nothing awaited its task, so any exception inside it (a malformed dict,
+a JSON failure) killed the task permanently with no output at all -- identical symptom,
+different cause. The message-build and send are now wrapped in `try/except` that logs and
+continues, and both broadcast tasks carry an `add_done_callback` that prints a traceback
+if they die or are cancelled. A `_heartbeat()` reports
+`broadcast/callbacks/drops/clients/qsize` on a 30 s tick, which is what tells the two cases
+apart: **callbacks climbing while broadcast is flat = a stuck send; both flat = the loop
+is dead.** `callbacks` is the load-bearing one -- it increments in `_sfcw_callback` before
+any queue, client or send exists, so it separates "the engine is not producing" from "the
+engine is fine and the send is stuck". Both of those now print their own `***` warning.
+
+**The heartbeat is SILENT when idle, deliberately (2026-09-10).** It first shipped printing
+unconditionally, and on an idle server that is a line every 30 s reading `broadcast=0
+callbacks=0` with a client count that flaps on its own -- a tab closed abruptly lingers up
+to ~40 s on `websockets.serve`'s 20/20 keepalive default, so `clients=5/4/5/4` is normal
+and means nothing. That is the exact trap this file already records for the `_sweep_core`
+2-tuple error: a recurring benign line trains the operator to ignore the one line a real
+failure would print. So: **silence means idle; any output means a counter moved or a sweep
+is running.** A running sweep always prints even with flat counters, because "running but
+nothing moving" is the freeze the instrumentation exists to catch. Going idle prints one
+line and then stops, so a quiet server stays distinguishable from a dead one. Client churn
+alone is never worth a line. Counters are reported as deltas plus a rate, not bare
+cumulative totals nobody can difference by eye.
+
+**The client half: the browser WAS the slow client.** At the 36 Hz NIOS sweep rate every
+sweep triggered the full re-render cascade (IFFTs, model inference, waterfall canvas), so
+the main thread could not keep up with its own socket. `App.jsx` now throttles the live
+display to ~20 Hz. **Only the React state driving the display is gated** -- every capture
+path reads the local `msg`/`provenance` and still sees every sweep -- and the throttle is
+bypassed outright while any capture is armed (`bscanCaptureRef`, `sfcwBgCaptureRef`,
+`bscanBgCaptureRef`, `bgModelAccumRef`, `bgModelTestRef`). `setSfcwLidarProvenance` is
+inside the gate deliberately: it feeds only the Sidebar readout, so at 36 Hz it was
+re-rendering the sidebar for nothing.
+
+**Not integrated from that branch, deliberately: the Capon / semblance wiring.** The same
+commit bundles half of an unrelated beamforming feature -- an
+`import { useCaponWorker } from './hooks/useCaponWorker'`, six new `bscanParams` fields, a
+third argument to `computeGridScales`, and `caponValues`/`precomputedValues`/
+`sarSemblanceEnabled` props. **`useCaponWorker.js` does not exist on any branch or in any
+commit in this repo's history**, so `origin/balls` cannot build. The other half-wired
+pieces are no-ops here anyway (`computeGridScales` takes two arguments; the new props have
+no consumer). If that feature is wanted, it needs the worker file from wherever it was
+written, not this commit.
+
+**Residual gap, known and left alone:** only `_sfcw_broadcast_loop` has the `try/except`.
+`_broadcast_loop` (rx/fft) and `_broadcast_status` can still die on an unexpected
+exception -- strictly better than before, since `add_done_callback` now makes it loud
+rather than silent, but they are not yet self-healing.
+
+### The same bug was in `rover_server.py`, and the 500 ms reconnect set it off (2026-09-10)
+
+Immediately after the above shipped: `RuntimeError: Set changed size during iteration`
+in `_fanout`, repeatedly, killing the `board_handler` and so taking the BOARD link down
+with it.
+
+**The repeated `[rover] rover controller connected` lines in that log are NOT the fault --
+they are the Arduino's own reconnect working.** The board noticed its socket was gone and
+rejoined by itself, every time, with no intervention. That firmware behaviour is tracked
+SEPARATELY from this Pi-side fix; do not assume the two ship together. Behaviourally, per
+the operator: a board that dropped off used to require restarting the ROUTER to come back,
+and now it simply reconnects on its own.
+
+Worth keeping as a diagnostic lesson: **the firmware's reconnect MASKS how bad a Pi-side
+bug like this is.** A crash that kills the board link presents as harmless-looking link
+flapping, because the board keeps coming straight back. So a board reconnecting over and
+over is evidence that something keeps DROPPING it -- look at the Pi, not the network, and
+do not read self-recovery as "the link is fine".
+
+`rover_server.py` `_fanout` had the identical `for c in self.clients: await c.send(msg)`,
+and it carried **both** failure modes:
+
+- **Mutate-during-iterate.** `client_handler` does `clients.add()` on connect and
+  `.discard()` in its `finally`, on this same event loop, so every `await` inside the
+  loop is a yield point at which the set changes underneath the iterator. This one is
+  worse than the sdr_server case: `broadcast()` is called from `board_handler` at 20 Hz,
+  so the exception propagates out of the **board** handler, not a client handler. The
+  `except websockets.ConnectionClosed` there does not catch `RuntimeError`, so it fell
+  into the `finally`, which calls `broadcast()` again and raised again -- that is the
+  "During handling of the above exception, another exception occurred" chain in the log.
+- **No timeout, sequential sends.** Same as sdr_server: one client that is not draining
+  blocks the loop and `broadcast()` never returns at all.
+
+**The reconnect change is what made it constant, not what caused it.** The race was
+always there; dropping `RECONNECT_INTERVAL` 3000 -> 500 ms made clients churn 6x more
+often, so a 20 Hz broadcast started landing inside the add/discard window routinely.
+Expect this whenever reconnect timing is tightened.
+
+Fixed the same way as `_send_to_all`: iterate a **snapshot**, `gather` concurrently, each
+send under `wait_for(timeout=0.5)`, drop dead/slow clients. Plus a deliberate **catch-all**
+in the per-client coroutine that `sdr_server._send_to_all` does not have -- here anything
+escaping takes the board link down, so a client whose send raises *anything* is dropped
+(printed, not `_note()`d, because that would re-enter `broadcast_log` -> `_fanout`).
+
+Verified by extracting the SHIPPED `_fanout` from the file with `ast` (not a retyped copy)
+and driving it: 400 broadcasts against a client churning connect/disconnect gives
+**0 RuntimeErrors** post-fix and one per broadcast pre-fix; a stalled client is evicted
+after 0.5 s with the healthy clients still delivered and retained, where **pre-fix
+`_fanout` never returns at all** (confirmed hung past a 3 s watchdog -- so every
+*subsequent* broadcast never happens either, and the raster's `STATUS_STALE_MS` = 4 s
+watchdog would abort the scan); and an unexpected send exception is contained rather than
+escaping. Throwaway scripts, as usual.
+
+**`pi/sensors/stream.py` was checked and is SAFE** -- its
+`gather(*(c.send(msg) for c in clients))` unpacks the generator to completion *before* the
+first await, so the set is never iterated across a yield point. It has no send timeout, so
+the slow-client stall is latent there, but it cannot raise this RuntimeError. It is the
+only other websocket fan-out on the Pi; `sdr_server.py` and `rover_server.py` are now both
+fixed.

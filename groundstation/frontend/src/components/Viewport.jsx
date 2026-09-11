@@ -26,6 +26,7 @@ const ROVER_PHASE_TEXT = {
 export default function Viewport({
   activePanel,
   isConnected,
+  sweepPeriodMs,
   imuData,
   txActive,
   rxActive,
@@ -46,9 +47,6 @@ export default function Viewport({
   bscanBgDisplay,
   bscanBgSubMode,
   cscanSharedScale,
-  bscanProcParams,
-  onBscanProcParamsChange,
-  bscanProcLocked,
   bscanParams,
   bscanCapturing,
   roverScan,
@@ -58,10 +56,11 @@ export default function Viewport({
   bscanScaleScope,
   bscanShowGate,
   cscanProjection,
+  cscanSmooth,
+  cscanColormap,
   bscanScaleLink,
   cscanRowScales,
   cscanGridScales,
-  cscanLiveResult,
   sarResult,
   sarProgress,
   sarScaleMode,
@@ -86,7 +85,6 @@ export default function Viewport({
   roverTrail,
   roverLog,
 }) {
-  const [bscanLiveRange, setBscanLiveRange] = useState({ min: 0, max: 0.3 });
   // Which C-scan cell the B-scan pane is showing the row for; null follows the
   // most recent capture.
   // Null means the C-scan plan view has the whole viewport to itself, which is
@@ -103,7 +101,20 @@ export default function Viewport({
   const cscanRootRef = useRef(null);
   // Called unconditionally, before any of the per-panel early returns -- hooks cannot
   // live inside those branches. Idles to null whenever the SFCW pane is not the one up.
-  const sweepRate = useSweepRate(sfcwResult, activePanel === 'sfcw' && (sfcwRunning || !!sfcwResult));
+  // The sweep rate is measured in App.jsx from EVERY sfcw_result, before the
+  // ~20 Hz live-display throttle. It must not be derived from `sfcwResult` here:
+  // that state is only set inside the throttle gate, so this header would report
+  // the DISPLAY rate while claiming to report the radar's. The two alias badly --
+  // a 50 ms gate against a 27.9 ms sweep passes exactly every other one, so a
+  // healthy 35.9 Hz radar read 17.9 Hz, which is indistinguishable from the
+  // ~18 Hz a board that has reverted to the stock FPGA image actually runs at
+  // (see CLAUDE.md, "The 18 Hz regression"). That collision cost a real
+  // debugging session: the FPGA was reloaded, the wire measured at 35.9 Hz, and
+  // the readout did not move. Keep this on the unthrottled measurement.
+  const sweepActive = activePanel === 'sfcw' && (sfcwRunning || !!sfcwResult);
+  const sweepRate = (sweepActive && sweepPeriodMs > 0)
+    ? { ms: sweepPeriodMs, hz: 1000 / sweepPeriodMs }
+    : null;
 
   if (!activePanel) {
     return (
@@ -378,8 +389,6 @@ export default function Viewport({
   }
 
   if (activePanel === 'cscan') {
-    const showLiveSweep = sfcwRunning || sfcwResult;
-
     // The cell driving the B-scan pane. Only an explicit click opens it -- there
     // is deliberately no fall-back to the last capture, because the plan view is
     // the panel's main image and a row detail that opened itself would take a
@@ -424,44 +433,6 @@ export default function Viewport({
 
     return (
       <div ref={cscanRootRef} className="flex-1 flex flex-col h-screen overflow-hidden bg-black">
-        {/* Live sweep range profile (top) — shown during a C-scan session */}
-        {showLiveSweep && (
-          <div className="relative flex flex-col border-b border-white/5" style={{ flex: '0 0 32%' }}>
-            <PaneHeader icon={Radar} label="Live Sweep" active={sfcwRunning} color="orange" />
-            <div className="flex-1 min-h-0 relative overflow-hidden">
-              {/* The controls on this bar drive the WHOLE C-scan pipeline, not
-                  just this pane: the window it draws with is the window every
-                  stored cell's profile is recomputed with, and Avg is the number
-                  of sweeps taken at each grid cell. R^n, FLOOR, CFAR and the Y
-                  session/frame selector are hidden -- none of them feed the grid,
-                  so they could only disagree with the image below.
-
-                  The trace is THIS panel's background applied to the live sweep
-                  (cscanLiveResult), not the SFCW panel's -- the two panels hold
-                  separate references and models, and this one has to match the
-                  grid it sits above. */}
-              <SfcwDisplay
-                sfcwResult={cscanLiveResult}
-                sfcwProgress={sfcwProgress}
-                sfcwRunning={sfcwRunning}
-                rangeScale={bscanLiveRange}
-                hideWaterfall
-                defaultScaleMode="linear"
-                procParams={bscanProcParams}
-                onProcParamsChange={onBscanProcParamsChange}
-                procLocked={bscanProcLocked}
-                hideRangeComp
-                hideFloor
-                hideCfar
-                hideYMode
-                onRangeScaleToggle={() => setBscanLiveRange(prev =>
-                  prev.max <= 0.5 ? { min: 0, max: 3 } : { min: 0, max: 0.3 }
-                )}
-              />
-            </div>
-          </div>
-        )}
-
         {/* The plan view is the panel's image and holds the whole area until a
             cell is clicked; the row's B-scan then opens UNDER it, rotated 90
             degrees anticlockwise so its position axis runs the same way as the
@@ -515,6 +486,8 @@ export default function Viewport({
                   (prev && prev.ix === c.ix && prev.iy === c.iy) ? null : c)}
                 scanMode={bscanParams.scanMode}
                 projection={cscanProjection}
+                smooth={cscanSmooth}
+                colormap={cscanColormap}
                 onLayout={publishCscanLayout}
                 rootRef={cscanRootRef}
               />
@@ -546,6 +519,7 @@ export default function Viewport({
                 showGate={bscanShowGate}
                 subMode={bscanBgSubMode}
                 orientation="vertical"
+                colormap={cscanColormap}
                 alignRef={cscanLayoutRef}
               />
               {rowData.length === 0 && (
@@ -629,34 +603,6 @@ export default function Viewport({
 // Live sweep cadence, measured from the Pi's own timestamps rather than from render
 // timing, so it reports what the radar is actually doing and not how fast React redrew.
 // Median of the adjacent differences, so one dropped or stalled frame does not move it.
-const SWEEP_RATE_WINDOW = 12;
-
-function useSweepRate(result, active) {
-  const buf = useRef([]);
-  const lastTs = useRef(null);
-  const [rate, setRate] = useState(null);
-
-  useEffect(() => {
-    if (!active) { buf.current = []; lastTs.current = null; setRate(null); }
-  }, [active]);
-
-  useEffect(() => {
-    const t = result && result.timestamp;
-    if (!t || t === lastTs.current) return;
-    lastTs.current = t;
-    buf.current.push(t);
-    if (buf.current.length > SWEEP_RATE_WINDOW) buf.current.shift();
-    if (buf.current.length < 3) return;
-    const d = [];
-    for (let i = 1; i < buf.current.length; i++) d.push(buf.current[i] - buf.current[i - 1]);
-    d.sort((a, b) => a - b);
-    const med = d[d.length >> 1];
-    if (med > 0) setRate({ ms: med * 1000, hz: 1 / med });
-  }, [result]);
-
-  return rate;
-}
-
 function PaneHeader({ icon: Icon, label, active, color, meta, action }) {
   const colorMap = {
     orange: { accent: '#D1855C', to: '#E5A986' },

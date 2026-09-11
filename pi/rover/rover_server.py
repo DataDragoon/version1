@@ -76,6 +76,14 @@ BOARD_QUEUE_ROOM = 3
 # groundstation axis -> firmware axis
 BOARD_AXIS = {'x': 'h', 'y': 'v'}
 
+# The firmware's receive buffer, `RX_BUFFER_SIZE` in rover/config.h. A command
+# whose JSON reaches this length is REJECTED outright with
+# `err too_long: command exceeds the receive buffer` -- and because nothing on
+# this side was checking, the rejection was silent apart from one line in the
+# rover log. Mirrored here so an oversized command is caught and named rather
+# than discovered as a config that mysteriously never took effect.
+BOARD_RX_LIMIT = 256
+
 LOG_LINES = 80
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rover_state.json')
 
@@ -172,6 +180,39 @@ class Rover:
         self.board_fw = None
         self.board_pos_valid = False
         self.last_status_at = None
+
+        # Definitive move completion. The board sends exactly ONE `done` per
+        # dispatched move, when every axis it commanded has stopped -- so this
+        # counter advancing is the only unambiguous "the move is finished"
+        # signal there is. Everything else a client can see is a heuristic:
+        # `moving` is false in the window between acknowledging a move and
+        # dispatching it from the queue (the same window that makes ideal_mm
+        # unresyncable), and position alone cannot tell a move that has not
+        # started from one that has finished.
+        #
+        # Monotonic for the life of this process. A client snapshots it when it
+        # issues a move and waits for it to advance, which is immune to that
+        # window and needs no timer.
+        self.moves_done = 0
+        self.last_done_seq = None
+        self.last_done_reason = None
+
+        # Exact, per-move completion. `moves_done` advancing is unambiguous
+        # about SOMETHING having finished, but a client that snapshots the
+        # counter when it issues a move can snapshot a status frame that
+        # predates a `done` for somebody else's move -- an operator nudge, a
+        # stop, a jog ending -- and then read that stale advance as its own move
+        # completing instantly. That collapses arrival detection back onto
+        # position alone, which is exactly the ack-before-dispatch window the
+        # counter exists to close.
+        #
+        # So a client may attach an opaque `token` to a move; it is carried
+        # through the outbox, mapped onto the board sequence the move is
+        # actually sent with, and echoed here when THAT move's `done` arrives.
+        # Waiting for `last_done_token` to equal your own is immune to every
+        # other mover on the link, and needs no timer.
+        self.last_done_token = None
+        self._move_tokens = {}          # board seq -> caller's token
 
         # Odometer since the last declared position: total commanded travel, in
         # mm, which is the exposure to wheel slip and missed steps. This is the
@@ -345,20 +386,66 @@ class Rover:
             'position_conflict': self.position_conflict,
             'board_pos_valid': self.board_pos_valid,
             'last_status_at': self.last_status_at,
+            'moves_done': self.moves_done,
+            'last_done_seq': self.last_done_seq,
+            'last_done_reason': self.last_done_reason,
+            'last_done_token': self.last_done_token,
             'last_error': self._last_error,
             'config': dict(self.config),
         }
 
-    async def _fanout(self, msg):
-        if not self.clients:
+    async def _fanout(self, msg, timeout=0.5):
+        """Send to every groundstation client CONCURRENTLY, dropping dead/slow ones.
+
+        Two separate bugs live in the obvious `for c in self.clients: await
+        c.send(msg)`, and this rig hits both.
+
+        1. `client_handler` does `clients.add()` on connect and `.discard()` in
+           its `finally`, on this same event loop -- so every `await` inside the
+           loop is a yield point at which the set can be mutated underneath the
+           iterator. That is `RuntimeError: Set changed size during iteration`,
+           and because `broadcast()` is called from `board_handler` at 20 Hz it
+           kills the BOARD link, not just one client. It became constant once
+           the groundstation's reconnect dropped to 500 ms (useWebSocket.js).
+           Iterating a snapshot is what fixes it; the set itself is only
+           rebound, never mutated in place, after every send has finished.
+
+        2. `send()` has no timeout and the sends were sequential, so one client
+           that is not draining -- a wedged browser, or a half-open TCP with no
+           FIN/RST -- blocks the whole loop and every other client with it. Same
+           failure as `_send_to_all` in sdr_server.py; see CLAUDE.md.
+
+        A client that cannot take a frame within `timeout` is dropped and left to
+        reconnect. Note the rover raster's silent-link watchdog aborts a scan
+        after STATUS_STALE_MS (4 s) without a status frame, so stalling here is
+        not survivable -- dropping the slow client is the cheaper failure.
+        """
+        clients = set(self.clients)
+        if not clients:
             return
-        dead = set()
-        for c in self.clients:
+
+        async def _try(c):
             try:
-                await c.send(msg)
-            except websockets.ConnectionClosed:
-                dead.add(c)
-        self.clients -= dead
+                await asyncio.wait_for(c.send(msg), timeout=timeout)
+            except (websockets.ConnectionClosed, asyncio.TimeoutError, OSError):
+                return c
+            except Exception as exc:
+                # Deliberately a catch-all. `broadcast()` runs from
+                # `board_handler` at 20 Hz, and anything raised here propagates
+                # out of that handler and takes the BOARD link down -- one
+                # groundstation client killing the rover connection is exactly
+                # the failure this function exists to prevent. A client whose
+                # send raises anything at all is not usable, so drop it; printed
+                # rather than logged via _note() because that would re-enter
+                # broadcast_log -> _fanout.
+                print(f"[rover] dropping client on unexpected send error: {exc!r}")
+                return c
+            return None
+
+        results = await asyncio.gather(*[_try(c) for c in clients])
+        dead = {c for c in results if c is not None}
+        if dead:
+            self.clients -= dead
 
     async def broadcast(self):
         await self._fanout(json.dumps({'type': 'rover_status', **self.status()}))
@@ -383,7 +470,25 @@ class Rover:
         # their own seq. Sequence numbers were jumping by ~380 per move.
         if 'seq' not in cmd:
             cmd['seq'] = self.next_seq()
-        payload = json.dumps(cmd)
+        # COMPACT separators: no space after ':' or ','. Worth 27 bytes on a cfg
+        # (228 -> 201) against a 256-byte board buffer, which is the difference
+        # between fitting and not at the extremes of CONFIG_BOUNDS. Verified
+        # against the FIRMWARE'S OWN PARSER (rover/protocol_core.h compiled
+        # natively): `findValue` terminates a bare value on ',', '}', ']' or
+        # whitespace and skips whitespace before it, so spaced and compact parse
+        # identically -- every field of a cfg and a move checked both ways.
+        payload = json.dumps(cmd, separators=(',', ':'))
+        # The board drops anything at or past its receive buffer and answers with
+        # `err too_long`. Catch it HERE so the offending command is named, rather
+        # than leaving a one-line board error to be correlated by hand against
+        # whatever setting stopped taking effect. Sent anyway -- the board's own
+        # refusal is the authority, and truncating or silently dropping a command
+        # would be a worse failure than a logged rejection.
+        if len(payload) >= BOARD_RX_LIMIT:
+            self._last_error = (
+                f"command '{cmd.get('c')}' is {len(payload)} bytes, at or over the "
+                f"board's {BOARD_RX_LIMIT}-byte receive buffer -- it will be REJECTED")
+            self._note(self._last_error)
         try:
             await self.board.send(payload)
         except Exception as e:
@@ -404,15 +509,37 @@ class Rover:
         """
         x_lo, x_hi = self.limit_steps('x')
         y_lo, y_hi = self.limit_steps('y')
+        # ROUNDED TO 3 DECIMALS, and that is load-bearing, not tidiness.
+        #
+        # `x_steps_per_mm` is 1600/(pi*66) = 7.716603301425229, so every speed and
+        # acceleration derived from it serialises as a full 17-digit double:
+        # `"h_speed": 1157.4904952137842` is 19 characters where 10 would do. Three
+        # such fields pushed the cfg command to **258 bytes against the firmware's
+        # 256-byte receive buffer**, and the board answered
+        # `err too_long: command exceeds the receive buffer` -- so the config was
+        # silently never applied.
+        #
+        # That is not cosmetic. `cfg` is what carries the SOFT LIMITS to the board,
+        # and on a rig with no endstops the board-side limits are the backstop that
+        # is supposed to survive this Pi crashing. It also carries the scan speed a
+        # raster pushes at `beginRaster` and restores at the end, so a rejected cfg
+        # means the traverse runs at whatever speed the board happened to hold.
+        #
+        # 3 dp of a steps/s figure is ~0.0004 mm/s -- orders below anything the
+        # mechanism can express. Measured: 258 -> 226 bytes, 30 bytes of headroom.
+        # Note the overflow is DATA-DEPENDENT (the Y axis is exactly 200 steps/mm
+        # and serialises short), which is why it appeared only once X had been
+        # calibrated to an awkward number.
+        r3 = lambda v: round(v, 3)
         await self.send_board(
             c='cfg',
-            h_speed=self.config['x_max_speed'] * self.spmm('x'),
-            h_jog=self.config['x_jog_speed'] * self.spmm('x'),
-            h_accel=self.config['x_accel'] * self.spmm('x'),
+            h_speed=r3(self.config['x_max_speed'] * self.spmm('x')),
+            h_jog=r3(self.config['x_jog_speed'] * self.spmm('x')),
+            h_accel=r3(self.config['x_accel'] * self.spmm('x')),
             h_lo=x_lo, h_hi=x_hi,
-            v_speed=self.config['y_max_speed'] * self.spmm('y'),
-            v_jog=self.config['y_jog_speed'] * self.spmm('y'),
-            v_accel=self.config['y_accel'] * self.spmm('y'),
+            v_speed=r3(self.config['y_max_speed'] * self.spmm('y')),
+            v_jog=r3(self.config['y_jog_speed'] * self.spmm('y')),
+            v_accel=r3(self.config['y_accel'] * self.spmm('y')),
             v_lo=y_lo, v_hi=y_hi,
             limits=bool(self.config['limits_enabled']),
             idle_ms=int(self.config['idle_disable_s'] * 1000),
@@ -551,6 +678,18 @@ class Rover:
                     await self._ingest_hello(msg)
                 elif kind == 'done':
                     reason = STOP_REASON.get(int(msg.get('reason', 0)), '?')
+                    # Recorded BEFORE the ideal-position resync below, so the
+                    # broadcast that follows carries both together.
+                    self.moves_done += 1
+                    self.last_done_seq = msg.get('seq')
+                    self.last_done_reason = reason
+                    # None for a move nobody tagged, which is the honest answer:
+                    # it says "that done was not yours" to every waiting client.
+                    try:
+                        done_seq = int(msg.get('seq', -1))
+                    except (TypeError, ValueError):
+                        done_seq = -1
+                    self.last_done_token = self._move_tokens.pop(done_seq, None)
                     entry = self._note(
                         f"board done: seq={msg.get('seq')} reason={reason}")
                     await self.broadcast_log(entry)
@@ -647,9 +786,16 @@ class Rover:
             if m['y'] is not None:
                 cmd['v'] = self.to_steps('y', m['y'])
             self._board_queue += 1
-            await self.send_board(**cmd)
+            seq = await self.send_board(**cmd)
+            if m.get('token') is not None:
+                # Bounded: the board's queue is 4 deep and a token is only ever
+                # resolved by its own `done`, but a caller that abandons moves
+                # (a jog, an E-stop) leaves entries nothing will ever pop.
+                if len(self._move_tokens) > 64:
+                    self._move_tokens.clear()
+                self._move_tokens[seq] = m['token']
 
-    async def move_to_mm(self, x_mm=None, y_mm=None):
+    async def move_to_mm(self, x_mm=None, y_mm=None, token=None):
         """Absolute move, always sent as an absolute step target.
 
         Absolute targets are what keep quantisation from accumulating: the error
@@ -693,7 +839,7 @@ class Rover:
             self.ideal_mm['x'] = x_mm
         if y_mm is not None:
             self.ideal_mm['y'] = y_mm
-        self._outbox.append({'x': x_mm, 'y': y_mm})
+        self._outbox.append({'x': x_mm, 'y': y_mm, 'token': token})
         await self.pump()
 
     async def move_rel_mm(self, dx_mm=0.0, dy_mm=0.0):
@@ -858,7 +1004,8 @@ async def dispatch(rover, ws, cmd):
         elif action == 'rover_move_abs':
             await rover.move_to_mm(
                 x_mm=float(cmd['x_mm']) if 'x_mm' in cmd else None,
-                y_mm=float(cmd['y_mm']) if 'y_mm' in cmd else None)
+                y_mm=float(cmd['y_mm']) if 'y_mm' in cmd else None,
+                token=cmd.get('token'))
         elif action == 'rover_calibrate':
             await rover.calibrate(cmd.get('axis'),
                                   float(cmd.get('commanded_mm', 0)),

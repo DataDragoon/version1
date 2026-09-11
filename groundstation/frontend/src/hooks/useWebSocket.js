@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
-const RECONNECT_INTERVAL = 3000;
+const RECONNECT_INTERVAL = 500;
 
 export function useWebSocket(url, onMessage) {
   const [status, setStatus] = useState('disconnected');
@@ -29,6 +29,7 @@ export function useWebSocket(url, onMessage) {
 
     ws.onopen = () => {
       if (wsRef.current !== ws) { ws.close(); return; }
+      console.log(`[ws] connected to ${target}`);
       setStatus('connected');
     };
 
@@ -39,9 +40,10 @@ export function useWebSocket(url, onMessage) {
       } catch {}
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       if (wsRef.current === ws) {
         wsRef.current = null;
+        console.warn(`[ws] disconnected from ${target} (code=${ev.code})`);
         setStatus('disconnected');
         clearTimeout(reconnectTimer.current);
         reconnectTimer.current = setTimeout(connect, RECONNECT_INTERVAL);

@@ -4,6 +4,8 @@ import asyncio
 import json
 import signal
 import sys
+import time as _time
+import traceback as _tb
 import numpy as np
 import websockets
 
@@ -31,6 +33,15 @@ class SDRServer:
         # from the driver's RX thread -- and asyncio.Queue is NOT thread-safe.
         # See _sfcw_callback for what that cost.
         self._loop = None
+        # --- freeze investigation instrumentation (2026-09-10) ---
+        self._sfcw_drops = 0
+        self._sfcw_broadcast_count = 0
+        self._sfcw_callback_count = 0
+        self._sweep_heartbeat_t = 0.0
+        # Previous heartbeat's counters, so a heartbeat can report what MOVED
+        # rather than a cumulative total nobody can difference by eye.
+        self._hb_prev = (0, 0, 0)
+        self._hb_quiet = False
 
     async def start(self):
         try:
@@ -47,6 +58,16 @@ class SDRServer:
         self._loop = asyncio.get_running_loop()
         self._broadcast_task = asyncio.create_task(self._broadcast_loop())
         self._sfcw_broadcast_task = asyncio.create_task(self._sfcw_broadcast_loop())
+
+        def _on_task_done(name, task):
+            if task.cancelled():
+                print(f"[sdr] *** {name} task CANCELLED ***")
+            elif task.exception():
+                exc = task.exception()
+                print(f"[sdr] *** {name} task DIED: {exc!r} ***")
+                _tb.print_exception(type(exc), exc, exc.__traceback__)
+        self._broadcast_task.add_done_callback(lambda t: _on_task_done('rx_broadcast', t))
+        self._sfcw_broadcast_task.add_done_callback(lambda t: _on_task_done('sfcw_broadcast', t))
 
         # Shut the device down properly on SIGTERM/SIGINT. Without this the
         # process died with TX and RX still enabled and USB transfers in flight,
@@ -270,12 +291,13 @@ class SDRServer:
         params['running'] = self.sfcw.running
         return params
 
-    @staticmethod
-    def _offer(queue, item):
+    def _offer(self, queue, item):
         """put_nowait with drop-oldest. MUST run on the event loop thread."""
         try:
             queue.put_nowait(item)
         except asyncio.QueueFull:
+            if queue is self.sfcw_queue:
+                self._sfcw_drops += 1
             try:
                 queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -320,80 +342,150 @@ class SDRServer:
             pass
 
     def _sfcw_callback(self, data):
+        self._sfcw_callback_count += 1
         self._post(self.sfcw_queue, data)
 
+    def _heartbeat(self):
+        """One line every 30 s, but ONLY when something is happening.
+
+        Silence means idle. Any output means a counter moved or a sweep is
+        running. A line that prints unconditionally is worse than no line: it
+        trains the operator to ignore it, which is exactly how the
+        `_sweep_core` 2-tuple error sat unnoticed for days (see CLAUDE.md).
+        Client churn alone is deliberately NOT worth a line -- a tab closed
+        abruptly lingers up to ~40 s on websockets' 20/20 keepalive, so an idle
+        server's client count flaps on its own and says nothing about health.
+
+        A RUNNING sweep always prints, even with flat counters, because a sweep
+        that is running while nothing moves is precisely the freeze this
+        instrumentation exists to catch and it must never be silent. The two
+        warnings below encode the diagnostic split: `callbacks` increments
+        before any queue, client or send is involved, so it separates "the
+        engine is not producing" from "the engine is fine and the send is
+        stuck".
+        """
+        now = _time.monotonic()
+        dt = now - self._sweep_heartbeat_t
+        if dt < 30:
+            return
+        self._sweep_heartbeat_t = now
+
+        cur = (self._sfcw_broadcast_count, self._sfcw_callback_count, self._sfcw_drops)
+        d = [c - p for c, p in zip(cur, self._hb_prev)]
+        self._hb_prev = cur
+        running = bool(getattr(self.sfcw, 'running', False))
+
+        if not any(d) and not running:
+            # Said once, so a server that goes quiet stays distinguishable from
+            # one that died.
+            if not self._hb_quiet:
+                self._hb_quiet = True
+                print(f"[sdr] heartbeat: idle, no sweep running "
+                      f"(clients={len(self.clients)}) -- silent until something moves")
+            return
+
+        self._hb_quiet = False
+        warn = ''
+        if running and d[1] == 0:
+            warn = '  *** running but NO callbacks -- engine is not producing ***'
+        elif d[1] and not d[0]:
+            warn = '  *** callbacks arriving but NO broadcasts -- send is stuck ***'
+
+        print(f"[sdr] heartbeat: broadcast={cur[0]} (+{d[0]}, {d[0] / dt:.1f}/s)"
+              f" callbacks={cur[1]} (+{d[1]})"
+              f" drops={cur[2]} (+{d[2]})"
+              f" clients={len(self.clients)}"
+              f" qsize={self.sfcw_queue.qsize()}"
+              f" running={running}{warn}")
+
     async def _sfcw_broadcast_loop(self):
+        self._sweep_heartbeat_t = _time.monotonic()
         while True:
             try:
                 data = await asyncio.wait_for(self.sfcw_queue.get(), timeout=0.1)
             except asyncio.TimeoutError:
+                self._heartbeat()
                 await asyncio.sleep(0.01)
                 continue
 
             if not self.clients:
+                self._heartbeat()
                 continue
 
-            if isinstance(data, dict) and 'error' in data:
-                msg = json.dumps({'type': 'sfcw_error', 'message': data['error']})
-            elif isinstance(data, dict) and data.get('type') == 'coherence_result':
-                msg = json.dumps(data)
-            elif isinstance(data, dict) and data.get('type') == 'progress':
-                msg = json.dumps({'type': 'sfcw_progress', 'step': data['step'], 'total': data['total'], 'freq_mhz': round(data['freq_mhz'], 2)})
-            elif isinstance(data, dict) and data.get('type') == 'range_profile':
-                result_msg = {
-                    'type': 'sfcw_result',
-                    # np.round(...).tolist(), NOT [round(x, n) for x in ...].
-                    # Byte-identical output, 2.778 -> 0.023 ms/sweep (122x). The
-                    # comprehensions were pure Python over ~512 elements and so held
-                    # the GIL for ~2.8 ms in one block -- about 7 RX buffer periods --
-                    # stalling _rx_loop_dual exactly while the next sweep was stepping.
-                    # That backlog is what corrupted a step: the sweep then drained
-                    # pre-retune buffers holding the PREVIOUS frequency's IQ. Measured
-                    # 2026-09-05: settle=1 is 0/299 sweeps contention-free but 18/399
-                    # through the server, so this cost ~42 ms of sweep time in the
-                    # settle margin needed to survive it. Keep this vectorised.
-                    'distances': np.round(data['distances'], 4).tolist(),
-                    'magnitudes': np.round(data['magnitudes'], 2).tolist(),
-                    'h_cal_real': data.get('h_cal_real', []),
-                    'h_cal_imag': data.get('h_cal_imag', []),
-                    'range_resolution': round(data['range_resolution'], 4),
-                    'unambiguous_range': round(data['unambiguous_range'], 4),
-                    'displayed_range_max': round(data['displayed_range_max'], 4),
-                    'num_steps': data['num_steps'],
-                    'step_size': data.get('step_size', 0),
-                    'range_offset': data.get('range_offset', 0),
-                    'timestamp': data['timestamp'],
-                }
-                if 'phase_coherence' in data:
-                    result_msg['phase_coherence'] = data['phase_coherence']
-                if 'sweep_core' in data:
-                    result_msg['sweep_core'] = data['sweep_core']
-                if 'nios_diag' in data:
-                    result_msg['nios_diag'] = data['nios_diag']
-                msg = json.dumps(result_msg)
-            else:
-                continue
+            try:
+                if isinstance(data, dict) and 'error' in data:
+                    msg = json.dumps({'type': 'sfcw_error', 'message': data['error']})
+                elif isinstance(data, dict) and data.get('type') == 'coherence_result':
+                    msg = json.dumps(data)
+                elif isinstance(data, dict) and data.get('type') == 'progress':
+                    msg = json.dumps({'type': 'sfcw_progress', 'step': data['step'], 'total': data['total'], 'freq_mhz': round(data['freq_mhz'], 2)})
+                elif isinstance(data, dict) and data.get('type') == 'range_profile':
+                    result_msg = {
+                        'type': 'sfcw_result',
+                        # np.round(...).tolist(), NOT [round(x, n) for x in ...].
+                        # Byte-identical output, 2.778 -> 0.023 ms/sweep (122x). The
+                        # comprehensions were pure Python over ~512 elements and so held
+                        # the GIL for ~2.8 ms in one block -- about 7 RX buffer periods --
+                        # stalling _rx_loop_dual exactly while the next sweep was stepping.
+                        # That backlog is what corrupted a step: the sweep then drained
+                        # pre-retune buffers holding the PREVIOUS frequency's IQ. Measured
+                        # 2026-09-05: settle=1 is 0/299 sweeps contention-free but 18/399
+                        # through the server, so this cost ~42 ms of sweep time in the
+                        # settle margin needed to survive it. Keep this vectorised.
+                        'distances': np.round(data['distances'], 4).tolist(),
+                        'magnitudes': np.round(data['magnitudes'], 2).tolist(),
+                        'h_cal_real': data.get('h_cal_real', []),
+                        'h_cal_imag': data.get('h_cal_imag', []),
+                        'range_resolution': round(data['range_resolution'], 4),
+                        'unambiguous_range': round(data['unambiguous_range'], 4),
+                        'displayed_range_max': round(data['displayed_range_max'], 4),
+                        'num_steps': data['num_steps'],
+                        'step_size': data.get('step_size', 0),
+                        'range_offset': data.get('range_offset', 0),
+                        'timestamp': data['timestamp'],
+                    }
+                    if 'phase_coherence' in data:
+                        result_msg['phase_coherence'] = data['phase_coherence']
+                    if 'sweep_core' in data:
+                        result_msg['sweep_core'] = data['sweep_core']
+                    if 'nios_diag' in data:
+                        result_msg['nios_diag'] = data['nios_diag']
+                    msg = json.dumps(result_msg)
+                else:
+                    self._heartbeat()
+                    continue
 
-            dead = set()
-            for client in self.clients:
-                try:
-                    await client.send(msg)
-                except websockets.ConnectionClosed:
-                    dead.add(client)
+                await self._send_to_all(msg)
+                self._sfcw_broadcast_count += 1
+
+                if not self.sfcw.running:
+                    await self._broadcast_sfcw_status()
+
+            except Exception as exc:
+                print(f"[sdr] *** BROADCAST LOOP EXCEPTION: {exc!r} ***")
+                _tb.print_exc()
+
+            self._heartbeat()
+
+    async def _send_to_all(self, msg, timeout=0.5):
+        """Send to all clients CONCURRENTLY. Drop dead/slow ones."""
+        clients = set(self.clients)
+        if not clients:
+            return
+        async def _try(c):
+            try:
+                await asyncio.wait_for(c.send(msg), timeout=timeout)
+            except (websockets.ConnectionClosed, asyncio.TimeoutError, OSError):
+                return c
+            return None
+        results = await asyncio.gather(*[_try(c) for c in clients])
+        dead = {c for c in results if c is not None}
+        if dead:
             self.clients -= dead
-
-            if not self.sfcw.running:
-                await self._broadcast_sfcw_status()
 
     async def _broadcast_sfcw_status(self):
         msg = json.dumps({'type': 'sfcw_status', **self._get_sfcw_status()})
-        dead = set()
-        for client in self.clients:
-            try:
-                await client.send(msg)
-            except websockets.ConnectionClosed:
-                dead.add(client)
-        self.clients -= dead
+        await self._send_to_all(msg)
 
     def _rx_callback(self, rx1_iq, rx2_iq):
         # Same foreign-thread handoff as _sfcw_callback -- this one runs on the
@@ -454,26 +546,14 @@ class SDRServer:
                 'freq_span': self.driver.sample_rate,
             })
 
-            dead = set()
-            for client in self.clients:
-                try:
-                    await client.send(rx_msg)
-                    await client.send(fft_msg)
-                except websockets.ConnectionClosed:
-                    dead.add(client)
-            self.clients -= dead
+            await self._send_to_all(rx_msg)
+            await self._send_to_all(fft_msg)
 
             await asyncio.sleep(interval)
 
     async def _broadcast_status(self):
         msg = json.dumps({'type': 'status', **self.driver.get_status()})
-        dead = set()
-        for client in self.clients:
-            try:
-                await client.send(msg)
-            except websockets.ConnectionClosed:
-                dead.add(client)
-        self.clients -= dead
+        await self._send_to_all(msg)
 
 
 if __name__ == '__main__':

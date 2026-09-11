@@ -1,7 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { cn } from '@/lib/utils';
 import { Section, InfoTile } from './Sidebar';
-import { orderedCellForIndex, gridStats, gridRoverExtent, BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
+import { orderedCellForIndex, gridStats, gridRoverExtent, gridRoverExtentContinuous,
+  traverseOverrun, axisMoveSeconds, accelDistanceSeconds, firstIncompleteRoverRow,
+  BG_STATUS, BG_STATUS_TEXT } from '@/lib/cscanGrid';
+import { samplingFor, NOMINAL_SWEEP_MS } from '@/lib/roverTrack';
+import { MIN_MOVE_MS } from '@/hooks/useRoverScan';
 import { listDisplays } from './ProjectorWindow';
 
 const LIDAR_AVG_WINDOW = 20;
@@ -13,6 +17,9 @@ const PHASE_TEXT = {
   moving: 'Moving to the next cell',
   settling: 'Settling',
   capturing: 'Sweeping',
+  row_start: 'Driving to the start of the row',
+  row_settle: 'Settling before the row',
+  traversing: 'Scanning the row',
 };
 
 export default function CscanPanel({
@@ -22,16 +29,19 @@ export default function CscanPanel({
   onCaptureBg, onLoadBgModel, onClearBg,
   bgSubMode, onBgSubModeChange,
   superFit, onCaptureSuperFit, onClearSuperFit,
-  sharedScale, bgDiag, procParams, captureProgress,
+  sharedScale, bgDiag, procParams, onProcParamsChange, procLocked, captureProgress,
   scaleScope, onScaleScopeChange, rowScales, showGate, onShowGateChange,
   scaleLink, onScaleLinkChange, gridScales, liveDiag,
   projection, onProjectionChange, projector, onProjectorChange,
-  roverConnected, roverStatus, sendRover, roverScan,
+  smooth, onSmoothChange, colormap, onColormapChange,
+  roverConnected, roverStatus, sendRover, roverScan, roverRowStats, sweepPeriodMs,
+  originAnchor,
 }) {
   const {
     hStep, hCount, vStep, vCount, gateStart, gateEnd, metric,
     focusEnabled, focusAperture,
     scanMode, roverOriginRightMm, roverOriginBelowMm, roverSettleMs,
+    roverTraverse, roverSpeedMmS, roverLatencyMs, roverRunupExtraMs,
   } = params;
 
   const update = (key, value) => {
@@ -144,14 +154,61 @@ export default function CscanPanel({
   // operator says the head is standing relative to it. Shown before the scan
   // starts so a wrong entry is visible against the soft limits, not discovered
   // by driving into the end of a rail that has no endstop.
+  // The row the next session will (re)start on: the first that is not FULL.
+  const resumeRow = roverMode ? firstIncompleteRoverRow(scanData, params) : 0;
+
   const originPreview = (roverMode && roverStatus)
     ? {
         x: roverStatus.x_mm - (Number(roverOriginRightMm) || 0),
         y: roverStatus.y_mm + (Number(roverOriginBelowMm) || 0),
       }
     : null;
-  const extent = originPreview ? gridRoverExtent(params, originPreview) : null;
   const cfg = roverStatus?.config;
+  // Continuous is the default traverse; 'stepped' is the original
+  // stop-at-every-cell raster, kept for ruling the continuous path out.
+  const continuous = roverTraverse !== 'stepped';
+  // A continuous raster reaches past the grid at both ends of every row, so the
+  // run-up is part of what has to fit inside the soft limits.
+  // The pitch is part of the overrun: cells are keyed by rounding position to
+  // the nearest column, so a run-up shorter than half a pitch lands INSIDE the
+  // first column instead of outside the grid.
+  const overrunMm = continuous
+    ? traverseOverrun(roverSpeedMmS, cfg?.x_accel || 500, hStep * 10)
+    : 0;
+  const extent = originPreview
+    ? (continuous
+        ? gridRoverExtentContinuous(params, originPreview, overrunMm)
+        : gridRoverExtent(params, originPreview))
+    : null;
+
+  // What this speed and pitch will actually sample at. Sweep spacing is
+  // v * T_sweep and nothing can make it finer, so a pitch below it leaves cells
+  // permanently empty -- shown here rather than discovered as a field of holes.
+  const sampling = samplingFor(roverSpeedMmS, hStep * 10, sweepPeriodMs);
+  const starved = sampling.perCell < 1.2;
+  const rowSeconds = (hStep * 10 * Math.max(0, hCount - 1) + 2 * overrunMm)
+    / Math.max(1, roverSpeedMmS);
+  // The row change is purely VERTICAL -- a snake ends a row at the same x its
+  // successor starts at -- and vertical is the slow axis (25 mm/s against 150,
+  // and 100 mm/s^2 against 500), so on a tall fine-pitch grid it is not a
+  // rounding error. The arrival gate is a floor on it: the board acks a move
+  // before dispatching it, so a move shorter than MIN_MOVE_MS still costs that.
+  // Settling the row gets for free, in motion, before the first cell.
+  const runupSeconds = accelDistanceSeconds(overrunMm, roverSpeedMmS, cfg?.x_accel || 500);
+  // Arrival is now reported exactly by the board (moves_done), so a row change
+  // costs its own move plus roughly one status frame of reporting latency --
+  // no timer. MIN_MOVE_MS only floors it on a Pi too old to report completion.
+  const exactArrival = typeof roverStatus?.moves_done === 'number';
+  const rowChangeSeconds = vCount > 1
+    ? (exactArrival
+        ? axisMoveSeconds(vStep * 10, cfg?.y_max_speed || 25, cfg?.y_accel || 100) + 0.09
+        : Math.max(MIN_MOVE_MS / 1000,
+            axisMoveSeconds(vStep * 10, cfg?.y_max_speed || 25, cfg?.y_accel || 100)))
+      + (roverRunupExtraMs || 0) / 1000
+    : 0;
+  const gridSeconds = rowSeconds * Math.max(1, vCount)
+    + rowChangeSeconds * Math.max(0, vCount - 1);
+  const fmtT = (t) => (t < 100 ? t.toFixed(1) + ' s' : (t / 60).toFixed(1) + ' min');
   const fitsLimits = !(extent && cfg && cfg.limits_enabled) || (
     extent.xMin >= cfg.x_min_mm && extent.xMax <= cfg.x_max_mm
     && extent.yMin >= cfg.y_min_mm && extent.yMax <= cfg.y_max_mm
@@ -360,14 +417,168 @@ export default function CscanPanel({
                 max={100000}
               />
             </div>
-            <EditableField
-              label="Settle before sweep"
-              value={roverSettleMs}
-              unit="ms"
-              onChange={(v) => update('roverSettleMs', Math.round(v))}
-              min={0}
-              max={10000}
-            />
+            {/* Once a raster has been armed on this grid its origin is FIXED and
+                every later session reuses it. The offsets above describe where
+                the head was standing when they were measured, so re-deriving
+                them on a resume -- with the head parked wherever the last row
+                was abandoned -- would anchor the rest of the grid somewhere
+                the operator never measured. Shown so the operator can see which
+                of the two is in force. */}
+            {originAnchor ? (
+              <div className="px-2 py-1.5 rounded-lg bg-[#6B9BD2]/8 border border-[#6B9BD2]/20 text-[9px] text-white/55 leading-relaxed">
+                <span className="text-[#6B9BD2] font-medium">Origin anchored</span>
+                {' '}at ({originAnchor.x.toFixed(1)}, {originAnchor.y.toFixed(1)}) mm.
+                This scan keeps that anchor for every session on it, so the
+                offsets above are ignored until New Scan — a resume lands on the
+                same grid wherever the head happens to be parked.
+                {resumeRow > 0 && ` Next session resumes on row ${resumeRow + 1} of ${vCount}.`}
+              </div>
+            ) : (
+              <div className="px-2 py-1.5 rounded-lg bg-[#0a0a0a]/60 border border-white/5 text-[9px] text-white/40 leading-relaxed">
+                The rover must be at rest when the session starts — the origin is
+                measured from where the head is standing, and it is fixed for the
+                rest of this scan.
+              </div>
+            )}
+            {/* How a row is walked. Continuous drives the whole row in one
+                move and bins the sweeps by the position they were taken at;
+                stepped stops at every cell. At a 27.5 ms sweep the per-cell
+                overhead of stopping (a 500 ms arrival gate, a settle, and one
+                discarded in-flight sweep) is ~93% of the time spent, so
+                continuous is both faster and better averaged. */}
+            <div className="px-1 pt-2 text-[9px] font-medium uppercase tracking-wider text-[#555555]">
+              Row traverse
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              {[
+                { id: 'continuous', label: 'Continuous' },
+                { id: 'stepped', label: 'Stepped' },
+              ].map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => !scanning && update('roverTraverse', m.id)}
+                  disabled={scanning}
+                  className={cn(
+                    'px-2 py-1.5 rounded-lg border text-[10px] transition-colors',
+                    'disabled:cursor-not-allowed disabled:opacity-40',
+                    (m.id === 'continuous' ? continuous : !continuous)
+                      ? 'bg-[#6B9BD2]/10 border-[#6B9BD2]/40 text-[#6B9BD2]'
+                      : 'bg-[#0a0a0a]/60 border-white/5 text-white/40 hover:border-white/15',
+                  )}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+
+            {continuous ? (
+              <>
+                <div className="grid grid-cols-2 gap-2">
+                  {/* The only capture knob in continuous mode: speed sets the
+                      sweep spacing, and therefore how many sweeps each cell
+                      gets, because pitch / speed / averaging are one resource.
+                      Pushed to the rail as x_max_speed for the raster and
+                      restored afterwards. */}
+                  <EditableField
+                    label="Scan speed"
+                    value={roverSpeedMmS}
+                    unit="mm/s"
+                    onChange={(v) => update('roverSpeedMmS', Math.max(1, Math.round(v)))}
+                    min={1}
+                    max={150}
+                  />
+                  {/* Zero by default: the run-up below is settling that has
+                      already been paid for, in motion and outside the grid. */}
+                  <EditableField
+                    label="Extra settle"
+                    value={roverRunupExtraMs}
+                    unit="ms"
+                    onChange={(v) => update('roverRunupExtraMs', Math.max(0, Math.round(v)))}
+                    min={0}
+                    max={10000}
+                  />
+                </div>
+
+                <div className="grid grid-cols-3 gap-2">
+                  <InfoTile label="Sweep spacing" value={`${sampling.spacingMm.toFixed(2)} mm`} />
+                  <InfoTile label="Sweeps / cell" value={sampling.perCell.toFixed(1)} />
+                  <InfoTile
+                    label="Coherent gain"
+                    value={sampling.perCell >= 1 ? `${(10 * Math.log10(sampling.perCell)).toFixed(1)} dB` : '—'}
+                  />
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  <InfoTile label="Run-up" value={`${(runupSeconds * 1000).toFixed(0)} ms`} />
+                  {/* Purely vertical, and vertical is the slow axis. On a tall
+                      grid with a fine row pitch this is a real share of the
+                      total, so it is shown rather than buried in it. */}
+                  <InfoTile
+                    label="Row change"
+                    value={vCount > 1 ? fmtT(rowChangeSeconds) : '—'}
+                  />
+                  <InfoTile label="Grid total" value={fmtT(gridSeconds)} />
+                </div>
+                <div className="px-2 text-[9px] leading-relaxed text-white/40">
+                  Row {fmtT(rowSeconds)}. The run-up is {(runupSeconds * 1000).toFixed(0)} ms of
+                  travel outside the grid before the first cell — settling that is already paid
+                  for, which is why Extra settle is 0.
+                  {exactArrival
+                    ? ' Row changes wait for the board to report the move finished, not for a timer.'
+                    : ' This Pi does not report move completion, so each move also pays a 500 ms arrival gate — update pi/rover/rover_server.py.'}
+                </div>
+                {vCount > 1 && rowChangeSeconds * (vCount - 1) > 0.25 * gridSeconds && (
+                  <div className="px-2 text-[9px] leading-relaxed text-white/40">
+                    Stepping down between rows is
+                    {' '}{(100 * rowChangeSeconds * (vCount - 1) / gridSeconds).toFixed(0)}% of the
+                    scan — the vertical axis maxes at {(cfg?.y_max_speed || 25).toFixed(0)} mm/s against
+                    {' '}{roverSpeedMmS} mm/s along the row, and a {(vStep * 10).toFixed(0)} mm step is
+                    {' '}{vStep * 10 < 2 * (cfg?.y_max_speed || 25) ** 2 / (cfg?.y_accel || 100)
+                      ? 'too short to even reach that speed' : 'mostly spent at it'}.
+                    A coarser row pitch costs proportionally less here than a slower traverse does.
+                  </div>
+                )}
+
+                {/* A pitch finer than the sweep spacing cannot be filled by
+                    scanning for longer -- those sweeps were never taken. */}
+                {starved && (
+                  <div className="px-2 py-1.5 rounded-lg border border-amber-500/30 bg-amber-500/5 text-[9px] leading-relaxed text-amber-400/80">
+                    At {roverSpeedMmS} mm/s a sweep lands every {sampling.spacingMm.toFixed(2)} mm,
+                    which is {sampling.perCell < 1 ? 'coarser than' : 'barely finer than'} the
+                    {' '}{(hStep * 10).toFixed(1)} mm cell pitch — cells will be left empty however long
+                    the scan runs. Slow to {Math.max(1, Math.floor(hStep * 10 / ((sweepPeriodMs || NOMINAL_SWEEP_MS) / 1000) / 2))} mm/s
+                    {' '}for two sweeps a cell, or widen the pitch.
+                  </div>
+                )}
+
+                {/* One scalar absorbs every constant latency in both chains.
+                    Measure it from one out-and-back pass over a row: the
+                    spatial lag between the two directions is 2*v*tau. */}
+                <EditableField
+                  label="Timing offset"
+                  value={roverLatencyMs}
+                  unit="ms"
+                  onChange={(v) => update('roverLatencyMs', Math.round(v))}
+                  min={-500}
+                  max={500}
+                />
+                <div className="px-2 text-[9px] text-white/40 leading-relaxed">
+                  Sweeps and rover positions are both stamped on the Pi's clock; this is the
+                  residual between them. It is a bias, not noise — its sign follows the
+                  direction of travel, so in a snake it bends alternate rows oppositely by
+                  {' '}{(2 * roverSpeedMmS * Math.abs(roverLatencyMs) / 1000).toFixed(2)} mm.
+                  Measure it by scanning one row out and back and correlating the two.
+                </div>
+              </>
+            ) : (
+              <EditableField
+                label="Settle before sweep"
+                value={roverSettleMs}
+                unit="ms"
+                onChange={(v) => update('roverSettleMs', Math.round(v))}
+                min={0}
+                max={10000}
+              />
+            )}
 
             {originPreview && (
               <div className="grid grid-cols-2 gap-2">
@@ -387,6 +598,7 @@ export default function CscanPanel({
               )}>
                 Rover travels X {extent.xMin.toFixed(0)} → {extent.xMax.toFixed(0)} mm,
                 {' '}Y {extent.yMax.toFixed(0)} → {extent.yMin.toFixed(0)} mm.
+                {continuous && ` Includes ${overrunMm.toFixed(0)} mm of run-up at each end of every row, so the ramps fall outside the grid.`}
                 {!fitsLimits && ' That is outside the soft limits — there are no endstops, so the scan is refused rather than clamped.'}
               </div>
             )}
@@ -441,7 +653,9 @@ export default function CscanPanel({
                     ? (scanning
                         ? (armed
                             ? PHASE_TEXT.ready
-                            : `${PHASE_TEXT[roverScan.phase] || 'Scanning'} — cell ${roverScan.index + 1}/${roverScan.total}`)
+                            : `${PHASE_TEXT[roverScan.phase] || 'Scanning'} — ${roverScan.traverse === 'continuous'
+                                ? `row ${(roverScan.row ? roverScan.row.index : 0) + 1}/${roverScan.rowsTotal}`
+                                : `cell ${roverScan.index + 1}/${roverScan.total}`}`)
                         : 'Sweeping — stop latches the E-stop')
                     : 'Sweeping continuously...')
                 : !sdrConnected ? 'SDR not connected'
@@ -571,6 +785,22 @@ export default function CscanPanel({
                   : gridFull ? `All ${stats.total} cells captured`
                   : `${captured} of ${stats.total} cells — start the scan to fill the rest`}
               </span>
+              {/* Which cells of the row have actually been filled, live. Watch
+                  the largest HOLE rather than the fill count: it is the run of
+                  consecutive empty columns that decides whether a row is
+                  usable, the same reason the BG-model continuous capture
+                  watches Hole rather than Span. */}
+              {continuous && scanning && roverRowStats && (
+                <span className={cn(
+                  'text-[10px] leading-relaxed',
+                  roverRowStats.maxHoleRun > 1 ? 'text-amber-400/80' : 'text-white/40',
+                )}>
+                  Row {roverRowStats.filled}/{roverRowStats.total} cells
+                  {' · '}{roverRowStats.perCell.toFixed(1)} sweeps/cell
+                  {roverRowStats.maxHoleRun > 0 && ` · hole ${roverRowStats.maxHoleRun}`}
+                  {roverRowStats.dropped > 0 && ` · ${roverRowStats.dropped} over cap`}
+                </span>
+              )}
             </div>
           </div>
         ) : (
@@ -777,11 +1007,6 @@ export default function CscanPanel({
         >
           {showGate ? '● Gate markers on B-scan' : 'Gate markers hidden'}
         </button>
-        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          {showGate
-            ? 'Two cyan lines on the B-scan mark the gate edges and everything outside them is dimmed — what stays bright is exactly the bins each plan-view cell is built from. Drag the sliders and watch it move.'
-            : 'Markers hidden. The gate still decides every plan-view cell value — this toggle only stops drawing it.'}
-        </div>
       </Section>
 
       {/* Plan-view focusing. Same synthetic-aperture kernel the 2D Map uses
@@ -823,13 +1048,6 @@ export default function CscanPanel({
             </div>
           </>
         )}
-        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          {hCount < 3
-            ? 'Needs at least 3 columns — focusing sums a row’s neighbours.'
-            : focusEnabled
-              ? 'Each cell is back-projected from its own row: every neighbour within the aperture is read at the geometric range to each gated depth and summed, tapered by an obliquity weight. Rows never contribute to each other — the vertical axis decorrelates far faster than the horizontal one on this rig, so traces a row apart do not describe the same wall. Neighbours are addressed by grid column, so a gap left by an undo keeps its spacing. Colour limits switch to the focused values, because a summed aperture is no longer a bin of any profile — the B-scan pane below is NOT focused and both panes say so.'
-              : 'Off, each cell is just its own range profile reduced over the gate. On, each row is focused along itself, which sharpens a target that spans several columns and suppresses returns that do not line up on a hyperbola.'}
-        </div>
       </Section>
 
       <Section label="Display">
@@ -847,39 +1065,115 @@ export default function CscanPanel({
             {displayMode === 'color' ? 'Color' : 'Profile'}
           </button>
         </div>
-        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          The B-scan pane draws the whole record — {depthLimitCm} cm at the current
-          step size, gate or no gate. The Depth Slice gate chooses what the plan
-          view colours by; on the right it only shades the excluded bins, and
-          the data under the shading is still drawn and still readable.
+
+        {/* Colour map. Drives BOTH panes and the projector, because they are
+            scaled off one population of bins so that a colour means the same dB
+            in each -- colouring them differently would break exactly that.
+            Redraws on the next frame; nothing is recomputed. */}
+        <div className="flex flex-col gap-1">
+          <span className="px-1 text-[9px] font-medium uppercase tracking-wider text-[#555555]">Colour map</span>
+          <select
+            value={colormap || 'jet'}
+            onChange={(e) => onColormapChange && onColormapChange(e.target.value)}
+            className="w-full px-2 py-1.5 rounded-lg text-[10px] bg-white/5 border border-white/10 text-white/70 outline-none"
+          >
+            <option value="jet" className="bg-[#0a0a0a]">jet</option>
+            <option value="viridis" className="bg-[#0a0a0a]">viridis</option>
+            <option value="inferno" className="bg-[#0a0a0a]">inferno</option>
+          </select>
         </div>
 
-        {/* Mirrors the Live Sweep pane's controls bar, which is where they are
-            set. Window and averaging MODE re-derive the whole grid on change;
-            Avg is how many sweeps each cell takes and only applies to captures
-            made after it is set. The bar locks while a session runs. */}
+        {/* Smoothing. A DISPLAY transform only: the plan view is resampled
+            bilinearly between cell CENTRES, so a cell's value reaches exactly as
+            far as its neighbour's centre and no further. Nothing is invented
+            past the grid either -- the outer half-cell ring holds the edge
+            cell's own value. Cells that are not a value (uncaptured, gated out,
+            background-failed) are still drawn as their own sharp squares. */}
+        <button
+          onClick={() => onSmoothChange && onSmoothChange(!smooth)}
+          className={cn(
+            'w-full px-3 py-2 rounded-lg text-xs font-medium transition-all border',
+            smooth
+              ? 'bg-[#6B9BD2]/10 border-[#6B9BD2]/40 text-[#6B9BD2]'
+              : 'bg-white/5 border-white/10 text-white/50 hover:text-white/80',
+          )}
+        >
+          {smooth ? '● Smooth cells' : 'Blocky cells'}
+        </button>
+
+        {/* Window and averaging. Window and the averaging MODE re-derive every
+            stored cell on change (each cell keeps all its sweeps, so coh/inc
+            stays a live choice); Avg is how many sweeps each cell TAKES and so
+            only applies to cells captured after it is set. Both lock while a
+            session runs -- different cells of one grid must be processed
+            identically. */}
         {procParams && (
           <>
             <div className="grid grid-cols-2 gap-2">
-              <InfoTile
-                label="Window"
-                value={procParams.windowType === 'kaiser'
-                  ? `Kaiser β${procParams.kaiserBeta}`
-                  : procParams.windowType === 'hanning' ? 'Hanning' : 'Rect'}
-              />
-              <InfoTile
-                label="Avg / cell"
-                value={procParams.avgCount > 1
-                  ? `${procParams.avgCount}× ${procParams.avgMode === 'coherent' ? 'coh' : 'inc'}`
-                  : 'Off'}
-              />
+              <div className="flex flex-col gap-1">
+                <span className="px-1 text-[9px] font-medium uppercase tracking-wider text-[#555555]">Window</span>
+                <select
+                  value={procParams.windowType}
+                  disabled={procLocked}
+                  onChange={(e) => onProcParamsChange({ ...procParams, windowType: e.target.value })}
+                  className={cn(
+                    'w-full px-2 py-1.5 rounded-lg text-[10px] bg-white/5 border border-white/10 outline-none',
+                    procLocked ? 'text-white/20 cursor-not-allowed' : 'text-white/70',
+                  )}
+                >
+                  <option value="rectangular">Rectangular</option>
+                  <option value="kaiser">Kaiser</option>
+                  <option value="hanning">Hanning</option>
+                </select>
+              </div>
+              <div className="flex flex-col gap-1">
+                <span className="px-1 text-[9px] font-medium uppercase tracking-wider text-[#555555]">Avg / cell</span>
+                <div className="flex gap-1">
+                  <select
+                    value={procParams.avgCount}
+                    disabled={procLocked}
+                    onChange={(e) => onProcParamsChange({ ...procParams, avgCount: Number(e.target.value) })}
+                    className={cn(
+                      'flex-1 min-w-0 px-2 py-1.5 rounded-lg text-[10px] bg-white/5 border border-white/10 outline-none',
+                      procLocked ? 'text-white/20 cursor-not-allowed' : 'text-white/70',
+                    )}
+                  >
+                    {[1, 2, 4, 8, 16, 32].map(v => (
+                      <option key={v} value={v}>{v === 1 ? 'Off' : `${v}×`}</option>
+                    ))}
+                  </select>
+                  <button
+                    onClick={() => onProcParamsChange({
+                      ...procParams,
+                      avgMode: procParams.avgMode === 'coherent' ? 'incoherent' : 'coherent',
+                    })}
+                    disabled={procLocked || procParams.avgCount === 1}
+                    className={cn(
+                      'px-2 py-1.5 rounded-lg text-[9px] uppercase tracking-wider font-medium border transition-all',
+                      (procLocked || procParams.avgCount === 1)
+                        ? 'bg-white/5 border-white/10 text-white/20 cursor-not-allowed'
+                        : procParams.avgMode === 'coherent'
+                          ? 'bg-[#4ecdc4]/20 border-[#4ecdc4]/30 text-[#4ecdc4]'
+                          : 'bg-white/5 border-white/10 text-white/40',
+                    )}
+                  >
+                    {procParams.avgMode === 'coherent' ? 'Coh' : 'Inc'}
+                  </button>
+                </div>
+              </div>
             </div>
-            <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-              Set on the Live Sweep pane's controls bar, and locked while a session
-              runs. Window and coh/inc re-derive every stored cell immediately —
-              each cell keeps all its sweeps, so the averaging mode stays a live
-              choice. Avg only affects cells captured after it is changed.
-            </div>
+            {procParams.windowType === 'kaiser' && (
+              <SliderRow
+                label="Kaiser β"
+                value={procParams.kaiserBeta}
+                unit=""
+                min={2}
+                max={14}
+                step={0.5}
+                accent="cyan"
+                onChange={(v) => onProcParamsChange({ ...procParams, kaiserBeta: v })}
+              />
+            )}
           </>
         )}
       </Section>
@@ -1012,11 +1306,8 @@ export default function CscanPanel({
             >
               ● Close projector window
             </button>
-            <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-              Showing on <span className="text-white/70">{projector.target ? projector.target.label : 'a free window'}</span>.
-              Click inside that window for full screen. Scale and Left/Top above
-              drive it live — they are measured from ITS top-left corner, so tune
-              them here while watching the wall.
+            <div className="px-2 text-[9px] text-white/40">
+              Showing on <span className="text-white/70">{projector.target ? projector.target.label : 'a free window'}</span>
             </div>
           </>
         ) : displays ? (
@@ -1069,21 +1360,6 @@ export default function CscanPanel({
           </div>
         )}
 
-        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          To scale draws the plan view at exactly this many screen pixels per
-          centimetre and puts its top-left corner exactly there, so the image is
-          the swept rectangle times one constant at a fixed spot — trim both
-          against the projector's own zoom and aim until the grid lands on the
-          real wall, then leave them alone. Fitted scaling cannot be aligned: it
-          re-derives itself from the pane size, so opening a row's B-scan or
-          resizing the window silently moves everything. Left/Top are measured
-          from the viewport corner rather than from this pane, so the same pane
-          changes leave the projected grid where it is. The B-scan pane places
-          its columns from the same layout, so it stays registered under the
-          grid either way. A grid that falls outside the pane is CLIPPED, not
-          re-fitted — re-fitting would be exactly the silent re-scaling this
-          avoids, so move it back rather than expecting it to shrink.
-        </div>
       </Section>
 
       {/* Colour scaling — dynamic tracks the data, manual pins both ends live */}
@@ -1209,17 +1485,6 @@ export default function CscanPanel({
             />
           </div>
         )}
-        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          {!scaleRange.dynamic
-            ? 'Colour limits pinned — both the C-scan and B-scan panes update live.'
-            : unlinked
-              ? (scaleScope === 'row'
-                ? 'Each grid row is scaled to its own gated cell values, and the B-scan keeps the bin-domain scale. Contrast where you need it; no colour agrees with any other pane or row.'
-                : 'The grid is scaled to its own gated cell values, so it follows the Depth Slice gate. The B-scan keeps the bin-domain scale, so the two colour bars no longer agree.')
-              : scaleScope === 'row'
-                ? 'Each grid row gets its own limits, from every bin of that row (1st–99.9th percentile). Contrast within a row, but a colour no longer means the same dB in different rows — the colour bar shows the selected row and is marked PER ROW.'
-                : 'One scale for both panes, from every bin of every valid cell in the grid (1st–99.9th percentile, so a single interference null cannot flatten the image). A colour means the same dB in the plan view and in the B-scan.'}
-        </div>
         {gridGlobal && gridGlobal.degenerate && scaleRange.dynamic && (
           <div className="px-2 py-1.5 rounded-lg bg-[#f59e0b]/5 border border-[#f59e0b]/30 text-[9px] text-[#f59e0b] leading-relaxed">
             Every bin has the same value — there is nothing to scale. Expected right
@@ -1397,15 +1662,6 @@ export default function CscanPanel({
                     : liveDiag.source === 'model' ? 'model' : 'reference'}, ${liveDiag.mode}).`}
           </div>
         )}
-        <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-          {superFit
-            ? 'Super Fit: each cell is subtracted from the reference captured at that same cell. The Live Sweep trace uses the reference for the cell about to be captured.'
-            : bgModel
-              ? 'Model background, inferred per cell from that cell’s own lidar standoff.'
-              : bgRef
-                ? 'Reference sweep, subtracted exactly as captured. It only holds near the standoff and position it was taken at — recapture if either moves. On a grid whose standoff varies, use Super Fit instead.'
-                : 'Capture a reference sweep, load a model, or Super Fit a reference grid.'}
-        </div>
       </Section>
 
       {/* Super Fit — a whole reference GRID, matched cell for cell.
@@ -1431,11 +1687,6 @@ export default function CscanPanel({
             >
               Super Fit This Grid
             </button>
-            <div className="px-2 text-[9px] text-white/40 leading-relaxed">
-              {gridFull
-                ? 'Stores every cell of the current grid as a per-cell background. Then clear the grid and rescan the same wall from the same origin — each new cell is subtracted from the reference at its own cell.'
-                : `Needs a full grid — ${captured} of ${stats.total} cells captured. Scan or import a complete sweep of the bare wall first.`}
-            </div>
           </>
         ) : (
           <>

@@ -420,6 +420,42 @@ export function orderedCellForIndex(index, hCount, vCount, scanMode) {
     : cellForIndex(index, hCount);
 }
 
+// How full each grid ROW is, indexed by rowFromTop (0 = the row the origin
+// sits on, which is iy = vCount-1). A continuous raster emits a row whole, so
+// this -- not a flat capture count -- is what a resume has to read.
+//
+// Counting DISTINCT columns rather than records: re-scanning a row that was
+// stopped part way through re-emits columns it already holds, and two records
+// for one cell is one cell, not two.
+export function roverRowFill(scanData, params) {
+  const h = Math.max(1, params.hCount);
+  const v = Math.max(1, params.vCount);
+  const seen = Array.from({ length: v }, () => new Set());
+  for (const pos of scanData || []) {
+    if (pos == null || pos.grid_ix == null || pos.grid_iy == null) continue;
+    const row = v - 1 - pos.grid_iy;            // rowFromTop
+    if (row < 0 || row >= v) continue;
+    if (pos.grid_ix < 0 || pos.grid_ix >= h) continue;
+    seen[row].add(pos.grid_ix);
+  }
+  return seen.map(s => s.size);
+}
+
+// The row a continuous raster should (re)start on: the first that is not FULL.
+//
+// Resuming on a count of non-empty rows is what silently abandoned a row that
+// was stopped part way through -- the partial row counted as done and the next
+// session began below it, leaving a half-empty row in the middle of the grid
+// with nothing on screen saying so. Measured on the simulator: stopping mid
+// row 1 of a 3-row grid harvested 6 of 11 cells, and the resume started on
+// row 2.
+export function firstIncompleteRoverRow(scanData, params) {
+  const h = Math.max(1, params.hCount);
+  const fill = roverRowFill(scanData, params);
+  for (let r = 0; r < fill.length; r++) if (fill[r] < h) return r;
+  return fill.length;          // every row is full
+}
+
 // Rover-frame target of a grid cell, in mm.
 //
 // `origin` is where the rover has to stand for the grid's top-left corner, in
@@ -446,6 +482,129 @@ export function gridRoverExtent(params, origin) {
     yMin: origin.y - stats.height * 10,
     yMax: origin.y,
   };
+}
+
+// ── Continuous row traverse ─────────────────────────────────────────────────
+//
+// A continuous raster drives a whole row in ONE move and bins the sweeps that
+// land along the way, instead of stopping at every cell. See lib/roverTrack.js
+// for why that is now the right thing to do and what bounds it.
+
+// How far past each end of a row the traverse runs, in mm.
+//
+// Two things have to fall OUTSIDE the grid, or they corrupt the cells at the
+// ends of every row:
+//
+//  * THE RAMPS. Position between two status frames is interpolated linearly,
+//    which is exact at constant velocity and wrong by half an acceleration
+//    term while accelerating -- 2.07 mm at 500 mm/s^2 over one 91 ms status
+//    gap, which at a 5 mm pitch is most of a cell. `v^2/2a` is the distance
+//    the ramp itself occupies.
+//  * THE LAST STATUS GAP. A sweep is only binned once a status frame arrives
+//    that brackets it in time (the track never extrapolates), so the final
+//    ~91 ms of a traverse resolves after the rover has already stopped. The
+//    margin makes sure that stretch is overrun rather than grid.
+//
+//  * HALF A CELL PITCH. Cells are keyed by `Math.round((x - originX)/pitch)`,
+//    so everything within half a pitch of the first column's centre lands IN
+//    that column -- including the rig standing still at the row's entry point
+//    waiting for the traverse command to reach the board, and the whole ramp.
+//    An overrun shorter than half a pitch therefore does not put the run-up
+//    outside the grid at all, it files it into the end columns. Measured on
+//    the simulator at 20 mm/s over a 50 mm pitch (overrun 10.4 mm against a
+//    25 mm half-pitch): the end cells absorbed stationary and ramping sweeps
+//    and every cell's reported position came out 7 mm short of its centre.
+//
+// Cheap either way: 35.6 mm at 25 mm/s, 40 mm at 100 mm/s on a 50 mm pitch --
+// a few tenths of a second per row against a row that takes tens of seconds.
+export function traverseOverrun(speedMmS, accelMmS2, hStepMm = 0) {
+  const v = Math.max(0, Number(speedMmS) || 0);
+  const a = Math.max(1, Number(accelMmS2) || 500);
+  const pitch = Math.max(0, Number(hStepMm) || 0);
+  const ramp = (v * v) / (2 * a);
+  const margin = Math.max(10, v * 0.2);
+  // The binning clearance is a floor on the whole overrun, not an addition to
+  // it: the ramp may well already be longer than half a pitch.
+  return Math.max(ramp + margin, pitch / 2 + margin);
+}
+
+// Wall-clock seconds for a single-axis move of `distanceMm`, under the
+// trapezoidal profile the firmware ramps with (motion_core.h). Triangular when
+// the move is too short to reach the axis speed, which the VERTICAL axis
+// usually is: at 25 mm/s and 100 mm/s^2 it takes 6.25 mm just to ramp up and
+// back down, so a 5 mm row step never reaches full speed.
+//
+// This matters because the row change is entirely vertical and vertical is the
+// slow axis. A snake ends row N at `lastX + overrun` and starts row N+1 at
+// `firstX + overrun`, which is the SAME point -- so the move between rows has
+// no X component at all, and its cost is this function plus the arrival gate.
+export function axisMoveSeconds(distanceMm, maxSpeedMmS, accelMmS2) {
+  const d = Math.abs(Number(distanceMm) || 0);
+  const v = Math.max(0.1, Number(maxSpeedMmS) || 25);
+  const a = Math.max(1, Number(accelMmS2) || 100);
+  if (d <= 0) return 0;
+  const rampDist = (v * v) / a;          // accelerate up and back down
+  return d >= rampDist
+    ? (2 * v) / a + (d - rampDist) / v
+    : 2 * Math.sqrt(d / a);
+}
+
+// Seconds to cover `distanceMm` from REST, accelerating to `maxSpeedMmS` and
+// staying there -- no deceleration, because this is the run-up into a row, not
+// a move that stops at the far end.
+//
+// This is the settling a continuous row gets FOR FREE. The traverse starts
+// `overrunMm` outside the grid, so the rig spends this long accelerating and
+// running before the first cell is reached: ~0.45 s at 25 mm/s, 0.40 s at 100,
+// 0.50 s at 150. All of it after the vertical step-down has completed, all of
+// it outside the cells. A static settle on top is redundant unless the mast is
+// actually seen to ring, which is why the extra-settle default is 0.
+export function accelDistanceSeconds(distanceMm, maxSpeedMmS, accelMmS2) {
+  const d = Math.max(0, Number(distanceMm) || 0);
+  const v = Math.max(0.1, Number(maxSpeedMmS) || 25);
+  const a = Math.max(1, Number(accelMmS2) || 500);
+  if (d <= 0) return 0;
+  const accelDist = (v * v) / (2 * a);
+  return d >= accelDist ? v / a + (d - accelDist) / v : Math.sqrt((2 * d) / a);
+}
+
+// Geometry of one continuous row traverse, in the rover's frame.
+//
+// `rowFromTop` counts rows in CAPTURE order (0 = the origin's row, the top
+// one), matching roverCellForIndex: even rows run left to right, odd rows run
+// back right to left. Cell coordinates stay in the display frame, so `iy`
+// still counts up from the bottom and everything downstream is unchanged.
+export function rowTraverse(rowFromTop, params, origin, overrunMm = 0) {
+  const h = Math.max(1, params.hCount);
+  const v = Math.max(1, params.vCount);
+  const r = Math.max(0, Math.min(v - 1, rowFromTop | 0));
+  const dir = r % 2 === 0 ? 1 : -1;
+  const iy = v - 1 - r;
+  const stepMm = params.hStep * 10;
+  const xAt = (ix) => origin.x + ix * stepMm;
+  const firstX = xAt(dir > 0 ? 0 : h - 1);
+  const lastX = xAt(dir > 0 ? h - 1 : 0);
+  return {
+    rowFromTop: r,
+    iy,
+    dir,
+    y_mm: origin.y - r * params.vStep * 10,
+    firstX,
+    lastX,
+    entryX: firstX - dir * overrunMm,
+    exitX: lastX + dir * overrunMm,
+  };
+}
+
+// The rectangle a CONTINUOUS raster actually reaches: the grid plus the
+// overrun at both ends of every row. Checked against the soft limits before a
+// move is issued, exactly like gridRoverExtent -- there are no endstops, and
+// `move_to_mm` clamps silently while still reporting the move `completed`, so
+// a traverse hanging over the end of a rail would raster a row that is not the
+// one on screen and pile duplicate sweeps into the cell at the limit.
+export function gridRoverExtentContinuous(params, origin, overrunMm = 0) {
+  const ext = gridRoverExtent(params, origin);
+  return { ...ext, xMin: ext.xMin - overrunMm, xMax: ext.xMax + overrunMm };
 }
 
 // ── Plan-view layout ────────────────────────────────────────────────────────

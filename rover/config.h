@@ -139,12 +139,64 @@
 // starting over. Associating is not the same as being on the network.
 #define DHCP_TIMEOUT_MS 12000
 
-// If the WebSocket stays down this long while WiFi is up, the client is assumed
-// wedged and is torn down and restarted. Without this, a rover_server restart on
-// the Pi -- which happens routinely during development -- can leave the board
-// sitting there with a live WiFi link and a socket that never comes back, and
-// the only remedy is a power cycle.
+// ── Network recovery ladder ─────────────────────────────────────────────────
+// See the long note above serviceNetwork() in rover.ino for why this is a
+// ladder. In short: WiFi.status() is the modem's opinion of itself, it latches
+// at WL_CONNECTED after the AP goes away without a clean deauth, and a firmware
+// that trusts it can never re-associate. Each rung below is only reached when
+// every rung above it has already failed.
+
+// Rung 1. If the WebSocket stays down this long while WiFi claims to be up, the
+// client is assumed wedged and is torn down and restarted. Without this, a
+// rover_server restart on the Pi -- which happens routinely during development
+// -- can leave the board sitting there with a live WiFi link and a socket that
+// never comes back.
 #define WS_RECONNECT_FORCE_MS 10000
+
+// Rung 2. After this many fruitless socket restarts, stop believing the status
+// register and ask the network itself (see NET_USE_PING). ~30 s at the interval
+// above, which is comfortably longer than any legitimate reconnect.
+#define NET_RECYCLE_AFTER_TRIES 3
+
+// Ask the DEFAULT GATEWAY whether the network is real, rather than trusting
+// WiFi.status(). This is what separates "the Pi is switched off" (gateway
+// answers -- an everyday state, do nothing but keep knocking) from "the radio
+// is wedged" (gateway silent while the modem insists it is connected).
+//
+// Set to 0 if WiFi.ping() is unavailable on the installed core. The ladder still
+// works without it, but it can no longer tell those two apart and will recycle
+// the radio -- and eventually reset the board -- whenever the Pi is off.
+#ifndef NET_USE_PING
+#define NET_USE_PING 1
+#endif
+
+// Rung 3. No network at all for this long, with every recycle having failed, and
+// the board resets itself. This is the state the firmware could not previously
+// clear by any means, and is why the operator ended up restarting the ROUTER.
+// The reset is refused unless the rig is parked (not moving, nothing queued, no
+// latched E-stop) and the position is written to flash first, so it costs
+// nothing but the boot time. It can never be triggered merely by the Pi being
+// off, because a gateway that answers counts as a live network.
+#define NET_REBOOT_MS 300000
+
+// Consecutive failed sendTXT calls before the link is treated as dead despite
+// the library still reporting it up. 40 status frames at 20 Hz is 2 s, long
+// enough that a transient full TX buffer cannot trip it.
+#define NET_TX_FAIL_LIMIT 40
+
+// Association retry backoff, and the association timeout used from the main
+// loop. The timeout is bounded because connectWiFi() blocks: motion is
+// unaffected (it is generated in the ISR) but the board is deaf to the
+// groundstation for the duration, so it must not be tens of seconds.
+#define NET_WIFI_RETRY_MS 3000
+#define NET_WIFI_RETRY_MAX_MS 20000
+#define NET_ASSOC_TIMEOUT_MS 10000
+
+// Scan and report on every Nth failed association. A scan takes seconds and
+// disturbs an attempt, so it is not run every time -- but it is the only thing
+// that distinguishes "the AP is not there" from "the AP is refusing us", which
+// is the distinction this fault was missing for months.
+#define NET_SCAN_EVERY 4
 
 // ── Protocol / networking ───────────────────────────────────────────────────
 #define FIRMWARE_VERSION "2.0.0"
