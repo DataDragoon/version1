@@ -106,6 +106,16 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
     if (coherenceResult) setCoherenceRunning(false);
   }, [coherenceResult]);
 
+  // Never stay on "Running..." forever: 100 sweeps take ~2-3 s, and the
+  // server refuses the request outright while a sweep is running (its
+  // 'error' reply is routed into coherenceResult by App.jsx). 30 s is far
+  // beyond any legitimate run.
+  useEffect(() => {
+    if (!coherenceRunning) return undefined;
+    const t = setTimeout(() => setCoherenceRunning(false), 30000);
+    return () => clearTimeout(t);
+  }, [coherenceRunning]);
+
   useEffect(() => {
     if (lidarMm == null) return;
     const buf = lidarBuf.current;
@@ -625,7 +635,12 @@ export default function SfcwPanel({ isConnected, sdrConnected, sfcwRunning, sfcw
         >
           {coherenceRunning ? 'Running (100 sweeps)...' : 'Run Coherence Test'}
         </button>
-        {coherenceResult && (
+        {coherenceResult?.error && (
+          <div className="mt-2 text-[10px] text-[#f59e0b] px-1">
+            {coherenceResult.error}
+          </div>
+        )}
+        {coherenceResult && !coherenceResult.error && (
           <div className="mt-2 space-y-1">
             <div className="grid grid-cols-2 gap-2">
               <InfoTile

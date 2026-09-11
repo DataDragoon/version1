@@ -1315,6 +1315,12 @@ export default function App() {
     } else if (msg.type === 'coherence_result') {
       setCoherenceResult(msg);
       setSfcwRunning(false);
+    } else if (msg.type === 'error' && msg.message) {
+      // sdr_server's refusal of a command (e.g. "Stop sweep before running
+      // coherence test"). Surface it on the coherence panel, which is the
+      // only sender of commands it refuses this way, so its button does not
+      // sit on "Running..." with nothing said.
+      setCoherenceResult({ type: 'coherence_result', error: msg.message });
     }
   }, []);
 
