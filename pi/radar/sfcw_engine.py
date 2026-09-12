@@ -2206,7 +2206,16 @@ class SFCWEngine:
         # header hard-codes 2*DSP_FIFO_WORDS as the transfer length. A sweep of
         # any other length would have the FPGA declare a burst that does not
         # match what the host wants, so refuse rather than mis-read.
-        if num_steps != self.driver.DSP_SWEEP_WORDS:
+        # fewer-steps: on a v14+ image the DSP FIFO gate opens at the sweep
+        # length the stepper was given, so any 2..DSP_SWEEP_WORDS steps work
+        # (26 at a 40 MHz step: half the sweep time, unambiguous range 7.5 ->
+        # 3.75 m). Without the stepper the gate is the FIFO depth, so the
+        # sweep must be exactly DSP_SWEEP_WORDS.
+        if DSP_STEPPER:
+            if num_steps < 2 or num_steps > self.driver.DSP_SWEEP_WORDS:
+                return fallback(f"DSP path takes 2..{self.driver.DSP_SWEEP_WORDS} "
+                                f"steps, this sweep has {num_steps}")
+        elif num_steps != self.driver.DSP_SWEEP_WORDS:
             return fallback(f"DSP path is built for "
                             f"{self.driver.DSP_SWEEP_WORDS} steps, this sweep "
                             f"has {num_steps}")
