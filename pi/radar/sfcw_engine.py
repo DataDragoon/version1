@@ -163,6 +163,20 @@ NIOS_CMD_PRIME = 0x53575052   # "SWPR"
 NIOS_CMD_EXEC  = 0x53574550   # "SWEP"
 NIOS_CMD_STOP  = 0x53575354   # "SWST"
 NIOS_CMD_QUERY = 0x53575147   # "SWQG"
+# fpga-stepper branch: the sweep run by the FPGA's sweep_stepper block.
+# "SWLD" copies the primed profile table into the FPGA (sent once per prime);
+# "SWEF" starts a sweep with arg = dwell in 80 MHz system-clock ticks. The
+# Nios only sets port/SPDT and hands the AD9361 SPI to the FPGA, which
+# preloads the next step's fast-lock profiles during the dwell (~90 us) and
+# recalls them at an exact tick, so the step needs no jitter guard and is not
+# bounded by the Nios's ~300 us retune rail.
+NIOS_CMD_LOAD      = 0x53574C44   # "SWLD"
+NIOS_CMD_EXEC_FPGA = 0x53574546   # "SWEF"
+DSP_STEPPER        = True         # False: the Nios-timed EXEC of v12
+SYS_CLOCK_HZ       = 80_000_000   # sweep_stepper's clock (U_system_pll)
+# Shortest dwell the stepper can preload inside: 36 SPI frames at 20 MHz,
+# ~90 us = ~920 samples at 10.24 MS/s; 1024 keeps a margin.
+DSP_STEPPER_DWELL_FLOOR = 1024
 NIOS_INTERVAL_UNIT = 64       # the dwell is sent divided by this
 # Samples left unused at BOTH ends of each capture window. Alignment lands
 # within a few tens of samples of the step boundary, and a window that starts
@@ -200,7 +214,10 @@ DSP_MIN_DWELL = 1088 + 2400
 # UNDER TEST: benchmark_sweep.py --mode dsp --flush N gives S_repeat vs settle.
 DSP_DEFAULT_FLUSH_SEL = 2
 DSP_DEFAULT_ACCUM_SEL = 2
-DSP_DEFAULT_DWELL     = 3456
+# fpga-stepper: the step boundary is exact, so the dwell is need + a small
+# guard: 512 + 1600 + 128 = 2240 (35 units of 64). 51 x 2240 / 10.24 MS/s =
+# 11.2 ms, ~89 Hz acquisition. (Nios-timed v12: 3456.)
+DSP_DEFAULT_DWELL     = 2240 if DSP_STEPPER else 3456
 # dsp mode has no host-side slicer, so the NIOS_MIN_DWELL 4096 stability
 # argument does not apply; the floor is the Nios's own retune rail.
 DSP_DWELL_FLOOR       = 3072
@@ -654,10 +671,11 @@ class SFCWEngine:
             if 'dsp_dwell' in kwargs:
                 units = max(1, int(kwargs['dsp_dwell']) // NIOS_INTERVAL_UNIT)
                 new_val = units * NIOS_INTERVAL_UNIT
-                if new_val < DSP_DWELL_FLOOR:
-                    print(f"[sfcw] dsp_dwell {new_val} is below the Nios retune "
-                          f"rail ({DSP_DWELL_FLOOR}); clamping")
-                    new_val = DSP_DWELL_FLOOR
+                floor = DSP_STEPPER_DWELL_FLOOR if DSP_STEPPER else DSP_DWELL_FLOOR
+                if new_val < floor:
+                    print(f"[sfcw] dsp_dwell {new_val} is below the floor "
+                          f"({floor}: {'stepper preload' if DSP_STEPPER else 'Nios retune rail'}); clamping")
+                    new_val = floor
                 self.dsp_dwell = new_val
             if 'nios_pipeline' in kwargs:
                 self.nios_pipeline = bool(kwargs['nios_pipeline'])
@@ -1306,6 +1324,15 @@ class SFCWEngine:
             f = int(freqs[i])
             libbladeRF.bladerf_schedule_retune(dev_ptr, rx_ch, 0, f, qt_rx[i])
             libbladeRF.bladerf_schedule_retune(dev_ptr, tx_ch, 0, f, qt_tx[i])
+
+        if DSP_STEPPER and self.sweep_mode == 'dsp':
+            # Copy the primed table into the FPGA stepper. One USB command;
+            # the Nios pushes 34 words per step through the expansion PIO.
+            if self._nios_command(NIOS_CMD_LOAD, 0) != 0:
+                print("[sfcw] stepper table load (SWLD) rejected -- firmware without "
+                      "the fpga-stepper commands?")
+                return False
+            print(f"[sfcw] FPGA stepper table loaded: {num_steps} steps")
 
         self._nios_primed = True
         self._nios_primed_steps = num_steps
@@ -2212,8 +2239,14 @@ class SFCWEngine:
 
             t_before_exec = time.monotonic()
             ts0 = self._nios_timestamp()
-            rc = self._nios_command(NIOS_CMD_EXEC,
-                                    (units << 16) | (num_steps & 0xFFFF))
+            if DSP_STEPPER:
+                # FPGA-timed sweep: dwell in 80 MHz ticks. The step boundary
+                # is exact, the Nios is idle throughout.
+                ticks = int(round(dwell * SYS_CLOCK_HZ / float(self.driver.sample_rate)))
+                rc = self._nios_command(NIOS_CMD_EXEC_FPGA, ticks & 0x0FFFFFFF)
+            else:
+                rc = self._nios_command(NIOS_CMD_EXEC,
+                                        (units << 16) | (num_steps & 0xFFFF))
             if rc != 0 or self._nios_timestamp() <= ts0:
                 self._nios_unavailable = True
                 print("[sfcw] NIOS autonomous sweep unavailable on this FPGA "
