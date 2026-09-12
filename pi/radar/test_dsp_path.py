@@ -141,7 +141,7 @@ def _mag_stats(hs):
             'min': mags[0], 'max': mags[-1]}
 
 
-async def run_mode(ws, mode, seconds, dwell=None, chain=None):
+async def run_mode(ws, mode, seconds, dwell=None):
     print(f"--- {mode}: stopping sweep")
     if not await _stop(ws):
         print("FAIL  could not stop the sweep (status never reported running=False)")
@@ -158,14 +158,6 @@ async def run_mode(ws, mode, seconds, dwell=None, chain=None):
         st = await _drain_until(ws, 'sfcw_status', timeout=5)
         print(f"--- {mode}: nios_dwell requested {dwell}, engine reports "
               f"{st.get('nios_dwell') if st else '?'} samples per step")
-    if chain is not None:
-        await _flush(ws)
-        await ws.send(json.dumps({'cmd': 'sfcw_set_params',
-                                  'dsp_flush_sel': int(chain[0]),
-                                  'dsp_accum_sel': int(chain[1])}))
-        st = await _drain_until(ws, 'sfcw_status', timeout=5)
-        print(f"--- {mode}: chain select flush {chain[0]} accum {chain[1]} "
-              f"(applied at the next sweep; the server console prints the counts)")
     await ws.send(json.dumps({'cmd': 'sfcw_start'}))
     print(f"--- {mode}: started, collecting for {seconds:.0f} s")
     results, errors = await _collect(ws, seconds)
@@ -258,10 +250,7 @@ async def main(args):
                 print(f"      nios |h|: median={rs['median']:.4f} "
                       f"min={rs['min']:.4f} max={rs['max']:.4f}")
 
-        chain = None
-        if args.flush is not None or args.accum is not None:
-            chain = (args.flush or 0, args.accum or 0)
-        r = await run_mode(ws, 'dsp', args.seconds, dwell=args.dwell, chain=chain)
+        r = await run_mode(ws, 'dsp', args.seconds, dwell=args.dwell)
         if r is None:
             return 1
         results, errors = r
@@ -294,12 +283,6 @@ if __name__ == '__main__':
                     help='capture a nios-mode run first and compare |h|')
     ap.add_argument('--leave', default='dsp', choices=['dsp', 'nios', 'standard'],
                     help="sweep mode to leave the engine in (default dsp)")
-    ap.add_argument('--flush', type=int, default=None, choices=range(8),
-                    help="v12 FLUSH_N table index: 0=1088 1=768 2=512 3=384 "
-                         "4=256 5=192 6=128 7=64 samples of settle discard")
-    ap.add_argument('--accum', type=int, default=None, choices=range(8),
-                    help="v12 ACCUM_N table index: 0=2400 1=2000 2=1600 "
-                         "3=1200 4=1000 5=800 6=600 7=400 samples summed")
     ap.add_argument('--dwell', type=int, default=None,
                     help="samples per step for the dsp run (nios_dwell; engine "
                          "rounds to 64 and floors at 4096). The FPGA needs "

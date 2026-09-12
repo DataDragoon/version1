@@ -641,41 +641,6 @@ class BladeRFDriver:
     DSP_WORD_BYTES   = 8         # 32-bit I + 32-bit Q
     DSP_SWEEP_WORDS  = 51        # rx.vhd DSP_FIFO_WORDS -- must match the FPGA
 
-    # v12: control-register bits 24:22 / 27:25 select the chain's per-step
-    # counts from these tables (rx.vhd DSP_FLUSH_TABLE / DSP_ACCUM_TABLE).
-    # Entry 0 is the image's compile-time value. On v11 and earlier the bits
-    # do nothing and read back as 0.
-    DSP_FLUSH_SHIFT  = 22
-    DSP_ACCUM_SHIFT  = 25
-    DSP_FLUSH_TABLE  = (1088, 768, 512, 384, 256, 192, 128, 64)
-    DSP_ACCUM_TABLE  = (2400, 2000, 1600, 1200, 1000, 800, 600, 400)
-
-    def dsp_set_chain(self, flush_sel=0, accum_sel=0):
-        """Select FLUSH_N / ACCUM_N on a v12+ image.
-
-        Returns (flush_n, accum_n, supported). Between sweeps only: the FPGA
-        samples the selection continuously and a change mid-step corrupts
-        that step. Read-modify-write, like dsp_path_enable.
-        """
-        fs = int(flush_sel) & 7
-        ac = int(accum_sel) & 7
-        mask = (7 << self.DSP_FLUSH_SHIFT) | (7 << self.DSP_ACCUM_SHIFT)
-        val = (self._gpio_read() & ~mask) | (fs << self.DSP_FLUSH_SHIFT) | (ac << self.DSP_ACCUM_SHIFT)
-        self._gpio_write(val)
-        back = self._gpio_read()
-        got_fs = (back >> self.DSP_FLUSH_SHIFT) & 7
-        got_ac = (back >> self.DSP_ACCUM_SHIFT) & 7
-        supported = (got_fs == fs and got_ac == ac)
-        if not supported:
-            if fs or ac:
-                print("[bladerf] DSP chain select not supported by this image "
-                      "(wrote flush {} accum {}, read back {} {}): running the "
-                      "compile-time counts {} + {}".format(
-                          fs, ac, got_fs, got_ac,
-                          self.DSP_FLUSH_TABLE[0], self.DSP_ACCUM_TABLE[0]))
-            got_fs = got_ac = 0
-        return self.DSP_FLUSH_TABLE[got_fs], self.DSP_ACCUM_TABLE[got_ac], supported
-
     # bladerf_metadata.flags: take whatever the FIFO has, do not schedule.
     _META_FLAG_RX_NOW = 1 << 31
     # Send as soon as there is room; the timestamp field is then ignored.

@@ -205,11 +205,6 @@ class SDRServer:
                     params['nios_settle'] = int(cmd['nios_settle'])
                 if 'nios_pipeline' in cmd:
                     params['nios_pipeline'] = bool(cmd['nios_pipeline'])
-                # v12 DSP chain counts (table indices 0-7)
-                if 'dsp_flush_sel' in cmd:
-                    params['dsp_flush_sel'] = int(cmd['dsp_flush_sel'])
-                if 'dsp_accum_sel' in cmd:
-                    params['dsp_accum_sel'] = int(cmd['dsp_accum_sel'])
                 self.sfcw.set_params(**params)
                 await self._broadcast_sfcw_status()
 
