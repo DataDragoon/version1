@@ -213,11 +213,17 @@ DSP_MIN_DWELL = 1088 + 2400
 # Sweep 51 x 3456 / 10.24 MS/s = 17.2 ms, ~58 Hz. 512 of settle is the value
 # UNDER TEST: benchmark_sweep.py --mode dsp --flush N gives S_repeat vs settle.
 DSP_DEFAULT_FLUSH_SEL = 2
-DSP_DEFAULT_ACCUM_SEL = 2
+# accum-1200 branch: ACCUM 1600 -> 1200 (table index 3, 12 whole tone
+# cycles). Integration 156 -> 117 us per step: -1.25 dB of per-point SNR
+# (10*log10(1200/1600)), which coherent averaging of two sweeps at the
+# higher rate more than returns. Compare S_repeat / the coherence test
+# against stepper-pipeline (1600) before keeping it.
+DSP_DEFAULT_ACCUM_SEL = 3
 # fpga-stepper: the step boundary is exact, so the dwell is need + a small
-# guard: 512 + 1600 + 128 = 2240 (35 units of 64). 51 x 2240 / 10.24 MS/s =
-# 11.2 ms, ~89 Hz acquisition. (Nios-timed v12: 3456.)
-DSP_DEFAULT_DWELL     = 2240 if DSP_STEPPER else 3456
+# guard: 512 + 1200 + 144 = 1856 (29 units of 64; _sweep_core_dsp still
+# rounds the dwell to 64). 51 x 1856 / 10.24 MS/s = 9.2 ms acquisition,
+# ~97 Hz with the host pipelined. (1600: 2240; Nios-timed v12: 3456.)
+DSP_DEFAULT_DWELL     = 1856 if DSP_STEPPER else 3456
 # dsp mode has no host-side slicer, so the NIOS_MIN_DWELL 4096 stability
 # argument does not apply; the floor is the Nios's own retune rail.
 DSP_DWELL_FLOOR       = 3072
