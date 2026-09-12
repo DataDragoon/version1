@@ -2136,6 +2136,7 @@ class SFCWEngine:
             if not self.driver.rx_running:
                 self.driver.start_rx_dsp()
 
+            t_before_exec = time.monotonic()
             ts0 = self._nios_timestamp()
             rc = self._nios_command(NIOS_CMD_EXEC,
                                     (units << 16) | (num_steps & 0xFFFF))
@@ -2146,10 +2147,13 @@ class SFCWEngine:
                       "standard sweep for this session.")
                 return fallback("EXEC rejected, or the sample counter is not "
                                 "running", reprime=True)
+            t_after_exec = time.monotonic()
 
             # One sweep of acquisition, plus slack for the USB round trip.
             budget = (num_steps * dwell) / float(self.driver.sample_rate) + 1.0
             h_cal = self.driver.dsp_read_sweep(num_steps, timeout_s=budget)
+            if h_cal is not None:
+                self._dsp_timing(t_before_exec, t_after_exec, time.monotonic())
             if h_cal is None:
                 # No burst: the FIFO ended the sweep short of num_steps (a
                 # step's accumulation was cut by the next restart), and the
@@ -2192,6 +2196,44 @@ class SFCWEngine:
 
         self._last_sweep_core = 'dsp'
         return h_cal, dropped, None
+
+    def _dsp_timing(self, t_before_exec, t_after_exec, t_burst):
+        """Where one DSP sweep period goes, summarised every 30 s.
+
+            period    = this EXEC to the previous one (1/rate)
+            exec_cmd  = the EXEC command's USB round trip (2 timestamp reads
+                        + the command)
+            acquire   = EXEC returned -> burst in hand (the FPGA/Nios sweep
+                        + USB delivery)
+            host      = previous burst in hand -> this EXEC issued (decode,
+                        IFFT, broadcast, loop)
+
+        Measured because hiding the host term behind the acquisition
+        (EXEC pipelining, 80e218c, reverted) did not change the rate: the
+        period must then be set elsewhere, and this says where.
+        """
+        st = getattr(self, '_dsp_tm', None)
+        if st is None:
+            st = {'t0': t_before_exec, 'n': 0, 'period': 0.0, 'exec': 0.0,
+                  'acq': 0.0, 'host': 0.0, 'prev_exec': None, 'prev_burst': None}
+            self._dsp_tm = st
+        if st['prev_exec'] is not None:
+            st['n'] += 1
+            st['period'] += t_before_exec - st['prev_exec']
+            st['exec'] += t_after_exec - t_before_exec
+            st['acq'] += t_burst - t_after_exec
+            st['host'] += t_before_exec - st['prev_burst']
+        st['prev_exec'] = t_before_exec
+        st['prev_burst'] = t_burst
+        if t_burst - st['t0'] >= 30.0 and st['n']:
+            n = float(st['n'])
+            print("[sfcw] DSP timing over {} sweeps: period {:.2f} ms ({:.1f}/s) "
+                  "= exec_cmd {:.2f} + acquire {:.2f} + host {:.2f} ms".format(
+                      st['n'], 1e3 * st['period'] / n, n / st['period'],
+                      1e3 * st['exec'] / n, 1e3 * st['acq'] / n,
+                      1e3 * st['host'] / n))
+            st.update({'t0': t_burst, 'n': 0, 'period': 0.0, 'exec': 0.0,
+                       'acq': 0.0, 'host': 0.0})
 
     def _sweep_dispatch(self, freqs, qt_rx, qt_tx, num_buffers, settle_count,
                         progress_cb=None):
