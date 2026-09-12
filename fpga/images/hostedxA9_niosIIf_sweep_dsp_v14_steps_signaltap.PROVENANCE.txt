@@ -1,0 +1,70 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v14_steps_signaltap.rbf
+=================================================================
+
+Status:  EXPERIMENTAL -- branch fewer-steps only. Timing clean (every clock
+         positive on setup and hold at every corner; pll_sclk +0.375, global
+         minimum +0.024). NOT run on hardware at the time of writing.
+         Functionally v13 (the FPGA sweep stepper) PLUS a DSP FIFO gate that
+         opens at the SWEEP LENGTH rather than at the FIFO's depth, so a
+         sweep of 2..51 steps goes out as one burst on the same image. With
+         the stepper disabled or a 51-step sweep it behaves exactly as v13.
+
+Build date:        2026-09-12 16:13 IST  (19 min wall, fitter seed 2)
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-12_16.13.49
+md5    (.rbf):     b19a5a19408286b6e00acc54d78c7eb8 (see .rbf.md5)
+sha256 (.rbf):     eeecaad1863a7c806b3d11d33b7aa03a174893b9dff2b300fedbc769c850dd4a
+md5    (.sof):     bb6a4cbae25e9bd0667f1162b6735202
+Source tree:       bladerf-src branch fewer-steps @ d3f617ee
+                   (= fpga-stepper @ 5698ca16 + one commit). Nios firmware
+                   unchanged from v13. SignalTap input signaltap/dsp_fifo.stp,
+                   unchanged since v9.
+Quartus:           18.1.0.625 Standard, device 5CEBA9F23C8, SEED 2.
+
+WHAT CHANGED vs v13
+-------------------
+    sweep_stepper.vhd   exports num_steps (the length the Nios loaded).
+    rx.vhd              new input dsp_sweep_words (0 = DSP_FIFO_WORDS);
+                        synchronised into the read clock; the gate opens at
+                        2 x that many read-words; and while the gate is open
+                        the FX3 is shown FULL (sample_fifo_rfull <=
+                        dsp_fifo_ready) instead of the FIFO's own flag, so
+                        fx3_gpif's (full & usedw) >= gpif_buf_size rule
+                        fires for a partial-depth sweep.
+    bladerf-hosted.vhd  wires the stepper's num_steps to rx, zeroed unless
+                        control bit 29 (stepper) is set.
+    Host (branch fewer-steps): the dsp core accepts 2..51 steps with the
+                        stepper (was: exactly 51).
+
+Simulation: sim_dsp_words (5 steps into an 8-deep FIFO, length 5 -> one
+burst of the 5 results) PASS; on / off / resync / sel / stepper unchanged
+and PASS.
+
+WHY
+---
+Halving the step count halves the sweep at the same span (same 15 cm
+resolution): 26 steps at a 40 MHz step over 2.0-3.0 GHz -> 26 x 1856
+samples / 10.24 MS/s = 4.7 ms, ~190 Hz with the host pipelined, against
+9.2 ms / 100 Hz at 51 steps. The price is the unambiguous range, c/(2 x
+step): 7.5 m -> 3.75 m. It is a GUI setting (step size), nothing to build.
+
+TIMING (Slow 1100mV 85C, worst slack per clock, ns)
+----------------------------------------------------
+    pll_sclk       +0.375 setup / +0.292 hold     (v13 +0.304)
+    pll_fclk       +0.650 / +2.376
+    U_fx3_pll      +2.486 / +0.274
+    U_system_pll   +2.472 / +0.300
+    fx3_pclk       +4.263 / +0.490
+    tck            +4.666 / +0.433
+    c5_clock2      +8.181 / +0.431
+    Global minimum, all corners / all checks: +0.024 ns. TNS 0 everywhere.
+
+HOW TO USE
+----------
+    Pi, on the fewer-steps checkout, services stopped:
+      bladeRF-cli -l .../fpga/images/hostedxA9_niosIIf_sweep_dsp_v14_steps_signaltap.rbf
+      python3 radar/check_bit6.py
+    start.py, set_sweep_mode.py dsp, then in the GUI set the step to 40 MHz
+    (2.0-3.0 GHz -> 26 steps) and start the sweep. Console:
+      [sfcw] FPGA stepper table loaded: 26 steps
+      [bladerf] DSP burst 5 ms after EXEC
+    At 20 MHz / 51 steps it is v13's 100 Hz configuration.
