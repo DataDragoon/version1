@@ -1,0 +1,89 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v13_stepper_signaltap.rbf
+==================================================================
+
+Status:  EXPERIMENTAL -- branch fpga-stepper only. Timing clean (every clock
+         positive on setup and hold at every corner; pll_sclk +0.304, global
+         minimum +0.061). NOT run on hardware at the time of writing.
+         Functionally v12 PLUS an FPGA-driven sweep stepper. With control
+         bit 29 clear it IS v12 (the Nios-timed sweep still works).
+
+Build date:        2026-09-12 14:25 IST  (18 min wall, fitter seed 2)
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-12_14.25.28
+md5    (.rbf):     607dc26901f4529702279f39dfee6a9f (see .rbf.md5)
+sha256 (.rbf):     b168d1965e6ac89fddc63ac414e48e56ac9dbab6e363a1f23edfee72e40005a4
+md5    (.sof):     ecfb812da3d30873725424a0b2be55cc
+Source tree:       bladerf-src branch fpga-stepper @ 5698ca16
+                   (= v12-chain-select @ 7a37934b + one commit).
+                   Nios firmware rebuilt from the same commit (pkt_retune2.c).
+                   SignalTap input: signaltap/dsp_fifo.stp, unchanged since v9.
+Quartus:           18.1.0.625 Standard, device 5CEBA9F23C8, SEED 2.
+
+WHY THIS IMAGE EXISTS
+---------------------
+On v12 the step is bounded by the Nios: it preloads the next step's two
+fast-lock profiles (36 SPI frames through software, ~270 us) inside the
+dwell and jitters the step boundary by tens of microseconds, so the dwell
+could not go below ~3456 samples (17.2 ms per sweep) whatever the DSP
+chain needed. This image moves the retune sequence into the FPGA:
+
+    sweep_stepper.vhd (80 MHz system clock)
+      - 4 KB profile table, written by the Nios through the expansion PIO
+        (control-register bit 29 hands the PIO to the stepper; the header
+        pins are parked meanwhile; no Qsys change)
+      - its own AD9361 SPI engine, CPOL 1 / CPHA 0 exactly as the Altera
+        core the Nios uses (SCLK idle high, MOSI on the rising edge, sampled
+        on the falling edge, MSB first, CS low for the whole frame), 20 MHz;
+        muxed onto the adi_spi_* pins while a sweep runs (spi_owner)
+      - per step: recall RX + TX (2 frames, ~2.8 us) at an exact tick, one
+        restart toggle into the existing dsp_restart path, then preload of
+        the next step (36 frames, ~90 us) during the dwell
+      - frames are byte-for-byte what devices.c adi_fastlock_load() and
+        adi_fastlock_recall() emit (sweep_stepper_tb checks all 114 of a
+        3-step sweep)
+    bladerf-hosted.vhd: stepper instance, SPI pin mux, PIO in/out mux,
+        restart XOR, bit 29 readback
+    pkt_retune2.c: SWLD ("copy the primed table into the FPGA"), SWEF ("run
+        it, arg = dwell in 80 MHz ticks"; sets port/SPDT first), SWST also
+        stops the stepper, SWQG carries its status.
+
+The step is then FLUSH_N + ACCUM_N + a few samples: with the host branch's
+512 + 1600 and a 128-sample guard, dwell 2240 -> 51 x 2240 / 10.24 MS/s =
+11.2 ms per sweep (~89 Hz acquisition), Nios idle throughout.
+
+WHAT IS NOT PROVEN
+------------------
+    - that the AD9361 accepts frames from this engine as it does from the
+      Nios's. Same parameters, copied from the generated core, but never
+      seen on a scope. If the first sweep produces no burst or wrong
+      values, this is the first suspect; SCLK_DIV 4 -> 8 (10 MHz) is the
+      first thing to try.
+    - the table load through the PIO on hardware (the Nios's PIO writes
+      are ~1 us each; 51 x 34 words = ~2 ms per prime).
+
+TIMING (Slow 1100mV 85C, worst slack per clock, ns)
+----------------------------------------------------
+    pll_sclk       +0.304 setup / +0.277 hold     (v12 +0.298)
+    pll_fclk       +0.747 / +2.368
+    U_fx3_pll      +2.013 / +0.231
+    U_system_pll   +2.716 / +0.290
+    fx3_pclk       +4.604 / +0.491
+    tck            +3.051 / +0.384
+    c5_clock2      +7.661 / +0.457
+    Global minimum, all corners / all checks: +0.061 ns. TNS 0 everywhere.
+
+HOST-SIDE COUNTERPART (version1, branch fpga-stepper)
+-----------------------------------------------------
+    1e2ffe0  DSP_STEPPER = True: SWLD after priming, SWEF per sweep with the
+             dwell in ticks, default dsp_dwell 2240, floor 1024
+
+HOW TO USE
+----------
+    Pi, on the fpga-stepper checkout, services stopped:
+      bladeRF-cli -l .../fpga/images/hostedxA9_niosIIf_sweep_dsp_v13_stepper_signaltap.rbf
+      python3 radar/check_bit6.py
+    then start.py, set_sweep_mode.py dsp; expect on the console
+      [sfcw] FPGA stepper table loaded: 51 steps
+      [sfcw] DSP chain: FLUSH 512 + ACCUM 1600 = 2112 samples/step; dwell 2240 leaves 128 of guard
+      [bladerf] DSP burst 11 ms after EXEC
+    To fall back to the v12 behaviour on the same image: DSP_STEPPER = False
+    in sfcw_engine.py (bit 29 stays clear; the Nios-timed sweep runs).
