@@ -879,7 +879,10 @@ class BladeRFDriver:
             raw = np.frombuffer(bytes(buf), dtype='<i4')
             tail = raw[want_dwords:]
             if tail.size and np.all(tail == tail[0]):
-                self._dsp_burst_log((time.monotonic() - t_start) * 1000.0, raw_seen)
+                print("[bladerf] DSP burst {:.0f} ms after EXEC{}".format(
+                    (time.monotonic() - t_start) * 1000.0,
+                    " ({} raw buffer(s) first)".format(raw_seen)
+                    if raw_seen else ""))
                 payload = raw[:want_dwords]
                 scale = float(1 << self.DSP_FRAC_BITS)
                 return ((payload[0::2].astype(np.float32) / scale)
@@ -900,37 +903,6 @@ class BladeRFDriver:
               "(check_bit6.py tells whether the write lands)".format(
                   raw_seen, self.DSP_PATH_BIT))
         return None
-
-    def _dsp_burst_log(self, wait_ms, raw_seen):
-        """One line per burst for the first few, then a 30 s summary.
-
-        wait_ms is how long dsp_read_sweep waited for the burst. Without
-        EXEC pipelining that is the whole sweep (~20 ms at dwell 4096); with
-        it the host's own work overlaps the sweep, so the wait is shorter.
-        """
-        now = time.monotonic()
-        st = getattr(self, '_dsp_stats', None)
-        if st is None or now - st['t0'] >= 30.0:
-            if st is not None and st['n']:
-                print("[bladerf] DSP: {} bursts in {:.0f} s ({:.1f}/s), wait "
-                      "min/mean/max {:.1f}/{:.1f}/{:.1f} ms{}".format(
-                          st['n'], now - st['t0'], st['n'] / (now - st['t0']),
-                          st['min'], st['sum'] / st['n'], st['max'],
-                          ", {} raw buffer(s) skipped".format(st['raw'])
-                          if st['raw'] else ""))
-            st = {'t0': now, 'n': 0, 'sum': 0.0, 'min': 1e9, 'max': 0.0,
-                  'raw': 0, 'shown': 0 if st is None else 5}
-            self._dsp_stats = st
-        st['n'] += 1
-        st['sum'] += wait_ms
-        st['min'] = min(st['min'], wait_ms)
-        st['max'] = max(st['max'], wait_ms)
-        st['raw'] += raw_seen
-        if st['shown'] < 5:
-            st['shown'] += 1
-            print("[bladerf] DSP burst after {:.1f} ms wait{}".format(
-                wait_ms, " ({} raw buffer(s) first)".format(raw_seen)
-                if raw_seen else ""))
 
     def dsp_resync(self):
         """Realign the FPGA's DSP FIFO with the next sweep, keeping the stream.
