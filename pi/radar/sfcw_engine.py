@@ -224,6 +224,12 @@ DSP_DWELL_FLOOR       = 3072
 # Consecutive missed bursts before the RX stream is torn down and rebuilt
 # instead of just resynced (see _sweep_core_dsp).
 DSP_MISSES_BEFORE_REBUILD = 5
+# Issue EXEC for sweep n+1 as soon as burst n is in hand, so the FPGA sweeps
+# while the host decodes, transforms and broadcasts sweep n. Without it the
+# host's 2-4 ms per sweep sits in series with the 20.4 ms acquisition
+# (42-44 Hz measured); with it the rate is the acquisition rate (~48 Hz).
+# False restores strictly sequential EXEC -> read -> process.
+DSP_PIPELINE_EXEC = True
 # Hard cap on a bulk capture, in RX buffers (~0.25 s at 2048-sample buffers).
 # A pipelined inflight capture between on-demand sweeps (warm B-scan mode)
 # would otherwise grow without bound at ~78 MB/s. The sweep itself completes
@@ -1203,6 +1209,8 @@ class SFCWEngine:
         if self._nios_inflight is not None or self._nios_primed:
             self._nios_discard_inflight()
         self._nios_primed = False
+        # A sweep issued ahead dies with the stream; its burst is never read.
+        self._dsp_exec_pending = False
         self._nios_period_hist = []
         self._diag_dump()
         if self.sweep_mode == 'dsp':
@@ -2202,6 +2210,10 @@ class SFCWEngine:
 
         key = (int(freqs[0]), int(freqs[-1]), num_steps)
         if not self._nios_primed or self._nios_primed_key != key:
+            # A sweep issued ahead (DSP_PIPELINE_EXEC) ran on the OLD
+            # profiles. Take its burst and discard it before re-priming, so
+            # it is never read as the first sweep of the new grid.
+            self._dsp_cancel_pending(num_steps)
             if not self._nios_prime(freqs, qt_rx, qt_tx):
                 return fallback("priming failed", reprime=True)
 
@@ -2229,38 +2241,66 @@ class SFCWEngine:
             if not self.driver.rx_running:
                 self.driver.start_rx_dsp()
                 self._dsp_chain_dirty = True
+                self._dsp_exec_pending = False
             # Chain counts go in here, between sweeps, when the chain is idle.
+            # (Never while a sweep issued ahead is running: the flag is only
+            # set by set_params, and a pending sweep is consumed first.)
             if getattr(self, '_dsp_chain_dirty', True):
+                self._dsp_cancel_pending(num_steps)
                 self._dsp_apply_chain()
                 need = sum(self._dsp_chain_counts())
                 if dwell < need:
                     return fallback(f"dwell {dwell} is below the {need} the "
                                     f"FPGA DSP chain needs (FLUSH_N + ACCUM_N)")
 
-            t_before_exec = time.monotonic()
-            ts0 = self._nios_timestamp()
-            if DSP_STEPPER:
-                # FPGA-timed sweep: dwell in 80 MHz ticks. The step boundary
-                # is exact, the Nios is idle throughout.
-                ticks = int(round(dwell * SYS_CLOCK_HZ / float(self.driver.sample_rate)))
-                rc = self._nios_command(NIOS_CMD_EXEC_FPGA, ticks & 0x0FFFFFFF)
+            exec_word = (units << 16) | (num_steps & 0xFFFF)
+            ticks = int(round(dwell * SYS_CLOCK_HZ / float(self.driver.sample_rate))) & 0x0FFFFFFF
+
+            def issue_exec():
+                # FPGA-timed sweep (stepper): dwell in 80 MHz ticks, the Nios
+                # idle throughout. Otherwise the Nios-timed EXEC of v12.
+                if DSP_STEPPER:
+                    return self._nios_command(NIOS_CMD_EXEC_FPGA, ticks)
+                return self._nios_command(NIOS_CMD_EXEC, exec_word)
+
+            # Sweep n's EXEC was issued at the end of the previous call when
+            # pipelining; otherwise issue it now. The timestamp check (is the
+            # sample counter running at all) is only worth a USB round trip
+            # on a fresh start.
+            if getattr(self, '_dsp_exec_pending', False):
+                t_before_exec, t_after_exec = self._dsp_exec_t
             else:
-                rc = self._nios_command(NIOS_CMD_EXEC,
-                                        (units << 16) | (num_steps & 0xFFFF))
-            if rc != 0 or self._nios_timestamp() <= ts0:
-                self._nios_unavailable = True
-                print("[sfcw] NIOS autonomous sweep unavailable on this FPGA "
-                      "image (sample counter not running) -- using the "
-                      "standard sweep for this session.")
-                return fallback("EXEC rejected, or the sample counter is not "
-                                "running", reprime=True)
-            t_after_exec = time.monotonic()
+                t_before_exec = time.monotonic()
+                ts0 = self._nios_timestamp()
+                rc = issue_exec()
+                if rc != 0 or self._nios_timestamp() <= ts0:
+                    self._nios_unavailable = True
+                    print("[sfcw] NIOS autonomous sweep unavailable on this FPGA "
+                          "image (sample counter not running) -- using the "
+                          "standard sweep for this session.")
+                    return fallback("EXEC rejected, or the sample counter is not "
+                                    "running", reprime=True)
+                t_after_exec = time.monotonic()
+            self._dsp_exec_pending = False
 
             # One sweep of acquisition, plus slack for the USB round trip.
             budget = (num_steps * dwell) / float(self.driver.sample_rate) + 1.0
             h_cal = self.driver.dsp_read_sweep(num_steps, timeout_s=budget)
             if h_cal is not None:
                 self._dsp_timing(t_before_exec, t_after_exec, time.monotonic())
+                if DSP_PIPELINE_EXEC and not self._stop_event.is_set():
+                    # PIPELINE. Burst n is in hand: the DSP FIFO is empty
+                    # again and the stepper is idle, so start sweep n+1 NOW --
+                    # before decoding, the IFFT and the broadcast of sweep n.
+                    # Its burst is read by the next call. A change of grid,
+                    # of chain counts, or a stop consumes it first (see
+                    # _dsp_cancel_pending / _stop_tx_rx). With the stepper an
+                    # SWEF is two PIO writes on the Nios, so the FPGA is
+                    # sweeping again within ~1 ms of the burst.
+                    tb = time.monotonic()
+                    rc = issue_exec()
+                    self._dsp_exec_t = (tb, time.monotonic())
+                    self._dsp_exec_pending = (rc == 0)
             if h_cal is None:
                 # No burst: the FIFO ended the sweep short of num_steps (a
                 # step's accumulation was cut by the next restart), and the
@@ -2287,6 +2327,7 @@ class SFCWEngine:
                                 "FIFO resynced for the next one")
             self._dsp_misses = 0
         except Exception as e:
+            self._dsp_exec_pending = False
             return fallback(f"DSP sweep raised {e!r}")
 
         h_cal = np.asarray(h_cal, dtype=np.complex128)
@@ -2308,16 +2349,15 @@ class SFCWEngine:
         """Where one DSP sweep period goes, summarised every 30 s.
 
             period    = this EXEC to the previous one (1/rate)
-            exec_cmd  = the EXEC command's USB round trip (2 timestamp reads
-                        + the command)
-            acquire   = EXEC returned -> burst in hand (the FPGA/Nios sweep
-                        + USB delivery)
-            host      = previous burst in hand -> this EXEC issued (decode,
-                        IFFT, broadcast, loop)
+            exec_cmd  = the EXEC command's USB round trip
+            acquire   = EXEC returned -> burst in hand
+            host      = previous burst in hand -> this EXEC issued
 
-        Measured because hiding the host term behind the acquisition
-        (EXEC pipelining, 80e218c, reverted) did not change the rate: the
-        period must then be set elsewhere, and this says where.
+        Without pipelining: acquire is the FPGA sweep + USB delivery and
+        host is the decode/IFFT/broadcast between sweeps. With
+        DSP_PIPELINE_EXEC the EXEC goes out right after the previous burst,
+        so host reads ~0 and acquire absorbs the host work that now overlaps
+        the sweep; the period is what to compare.
         """
         st = getattr(self, '_dsp_tm', None)
         if st is None:
@@ -2341,6 +2381,26 @@ class SFCWEngine:
                       1e3 * st['host'] / n))
             st.update({'t0': t_burst, 'n': 0, 'period': 0.0, 'exec': 0.0,
                        'acq': 0.0, 'host': 0.0})
+
+    def _dsp_cancel_pending(self, num_steps):
+        """Consume a sweep that was issued ahead but whose burst is unread.
+
+        Used before re-priming (the pending sweep ran on the old profiles).
+        Reading it -- rather than clearing the FIFO under it -- is the only
+        clean way out: the Nios is mid-sweep, and a resync now would leave
+        the rest of that sweep's words in a freshly cleared FIFO.
+        """
+        if not getattr(self, '_dsp_exec_pending', False):
+            return
+        self._dsp_exec_pending = False
+        if not self.driver.rx_running:
+            return
+        budget = (num_steps * int(getattr(self, 'dsp_dwell', DSP_DEFAULT_DWELL))) / float(self.driver.sample_rate) + 1.0
+        try:
+            if self.driver.dsp_read_sweep(num_steps, timeout_s=budget) is None:
+                self.driver.dsp_resync()
+        except Exception:
+            pass
 
     def _sweep_dispatch(self, freqs, qt_rx, qt_tx, num_buffers, settle_count,
                         progress_cb=None):
