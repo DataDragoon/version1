@@ -1,11 +1,14 @@
 PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v13_stepper_signaltap.rbf
 ==================================================================
 
-Status:  EXPERIMENTAL -- branch fpga-stepper only. Timing clean (every clock
-         positive on setup and hold at every corner; pll_sclk +0.304, global
-         minimum +0.061). NOT run on hardware at the time of writing.
-         Functionally v12 PLUS an FPGA-driven sweep stepper. With control
-         bit 29 clear it IS v12 (the Nios-timed sweep still works).
+Status:  VALIDATED ON HARDWARE 2026-09-12 (branch fpga-stepper): the first
+         sweep ran, every sweep delivered, 73 Hz measured through the full
+         stack with dwell 2240 (11.2 ms FPGA sweep + ~2.5 ms host per sweep).
+         The AD9361 accepted the FPGA's SPI engine at 20 MHz unchanged.
+         Timing clean (every clock positive on setup and hold at every
+         corner; pll_sclk +0.304, global minimum +0.061). Functionally v12
+         PLUS the FPGA-driven sweep stepper; with control bit 29 clear it IS
+         v12 (the Nios-timed sweep still works).
 
 Build date:        2026-09-12 14:25 IST  (18 min wall, fitter seed 2)
 Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-12_14.25.28
@@ -50,15 +53,14 @@ The step is then FLUSH_N + ACCUM_N + a few samples: with the host branch's
 512 + 1600 and a 128-sample guard, dwell 2240 -> 51 x 2240 / 10.24 MS/s =
 11.2 ms per sweep (~89 Hz acquisition), Nios idle throughout.
 
-WHAT IS NOT PROVEN
-------------------
-    - that the AD9361 accepts frames from this engine as it does from the
-      Nios's. Same parameters, copied from the generated core, but never
-      seen on a scope. If the first sweep produces no burst or wrong
-      values, this is the first suspect; SCLK_DIV 4 -> 8 (10 MHz) is the
-      first thing to try.
-    - the table load through the PIO on hardware (the Nios's PIO writes
-      are ~1 us each; 51 x 34 words = ~2 ms per prime).
+PROVEN ON HARDWARE (2026-09-12)
+-------------------------------
+    - the SPI engine's frames are accepted by the AD9361 (sweeps deliver,
+      values sane), the table load through the PIO works, the stepper's
+      restart toggle drives the DSP chain: 73 Hz measured.
+    NOT YET MEASURED: S_repeat / coherence on this image vs v11/v12, and
+    the true settle (FLUSH_N can now be cut further, since the step
+    boundary is exact -- the 512 was chosen for the Nios's jitter).
 
 TIMING (Slow 1100mV 85C, worst slack per clock, ns)
 ----------------------------------------------------
