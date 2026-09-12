@@ -626,6 +626,14 @@ class SFCWEngine:
                         self._nios_discard_inflight()
             if 'nios_settle' in kwargs:
                 self.nios_settle = max(0, int(kwargs['nios_settle']))
+            # v12 DSP chain counts (table indices, see BladeRFDriver.DSP_*_TABLE).
+            # Applied before the next sweep's EXEC, when the chain is idle.
+            if 'dsp_flush_sel' in kwargs:
+                self.dsp_flush_sel = max(0, min(7, int(kwargs['dsp_flush_sel'])))
+                self._dsp_chain_dirty = True
+            if 'dsp_accum_sel' in kwargs:
+                self.dsp_accum_sel = max(0, min(7, int(kwargs['dsp_accum_sel'])))
+                self._dsp_chain_dirty = True
             if 'nios_pipeline' in kwargs:
                 self.nios_pipeline = bool(kwargs['nios_pipeline'])
                 if not self.nios_pipeline and self._nios_inflight is not None:
@@ -655,7 +663,38 @@ class SFCWEngine:
             'nios_dwell': self.nios_dwell,
             'nios_settle': self.nios_settle,
             'nios_primed': self._nios_primed,
+            'dsp_flush_sel': getattr(self, 'dsp_flush_sel', 0),
+            'dsp_accum_sel': getattr(self, 'dsp_accum_sel', 0),
+            # what the FPGA is actually running (after the last apply)
+            'dsp_flush_n': self._dsp_chain_counts()[0],
+            'dsp_accum_n': self._dsp_chain_counts()[1],
         }
+
+    # ---- v12 DSP chain counts -------------------------------------------
+    def _dsp_chain_counts(self):
+        """(flush_n, accum_n) the FPGA is running: the last applied pair, or
+        what the current selection would give on a v12 image."""
+        applied = getattr(self, '_dsp_chain_applied', None)
+        if applied is not None:
+            return applied
+        d = self.driver
+        return (d.DSP_FLUSH_TABLE[getattr(self, 'dsp_flush_sel', 0)],
+                d.DSP_ACCUM_TABLE[getattr(self, 'dsp_accum_sel', 0)])
+
+    def _dsp_apply_chain(self):
+        """Push the selection to the FPGA (between sweeps) and remember what
+        it reports back. On v11 and earlier this records the compile-time
+        counts, so the dwell check below stays truthful."""
+        fs = getattr(self, 'dsp_flush_sel', 0)
+        ac = getattr(self, 'dsp_accum_sel', 0)
+        flush_n, accum_n, supported = self.driver.dsp_set_chain(fs, ac)
+        self._dsp_chain_applied = (flush_n, accum_n)
+        self._dsp_chain_dirty = False
+        print(f"[sfcw] DSP chain: FLUSH {flush_n} + ACCUM {accum_n} = "
+              f"{flush_n + accum_n} samples/step"
+              f"{'' if supported else ' (image has no runtime select)'}; "
+              f"dwell {self.nios_dwell} leaves {self.nios_dwell - flush_n - accum_n} "
+              f"of guard")
 
     # Sweeps in a coherence test. Was 3 -- two adjacent pairs, which says
     # nothing about a 1-in-20 miss or slow drift. 100 sweeps is ~2 s in dsp
@@ -2119,13 +2158,14 @@ class SFCWEngine:
             return fallback(f"dwell {dwell} out of range")
         dwell = units * NIOS_INTERVAL_UNIT
 
-        # The FPGA's own DSP_FLUSH_N + DSP_ACCUM_N (1088 + 2900 = 3988) must fit
-        # inside one step, or seq_adder's restart discards a part-accumulated
-        # window and the step returns garbage. That bound lives in rx.vhd, so
-        # the host can only check the dwell it is asking for.
-        if dwell < DSP_MIN_DWELL:
-            return fallback(f"dwell {dwell} is below the {DSP_MIN_DWELL} the "
-                            f"FPGA DSP chain needs (FLUSH_N + ACCUM_N)")
+        # The FPGA's FLUSH_N + ACCUM_N must fit inside one step, or
+        # seq_adder's restart discards a part-accumulated window and the step
+        # returns nothing. v12 makes both runtime-selectable; the check uses
+        # what the FPGA last reported (compile-time values on older images).
+        need = sum(self._dsp_chain_counts())
+        if dwell < need:
+            return fallback(f"dwell {dwell} is below the {need} the FPGA DSP "
+                            f"chain needs (FLUSH_N + ACCUM_N)")
 
         try:
             # Open the RX stream as late as possible -- see the note in
@@ -2135,6 +2175,14 @@ class SFCWEngine:
             # timeouts.
             if not self.driver.rx_running:
                 self.driver.start_rx_dsp()
+                self._dsp_chain_dirty = True
+            # Chain counts go in here, between sweeps, when the chain is idle.
+            if getattr(self, '_dsp_chain_dirty', True):
+                self._dsp_apply_chain()
+                need = sum(self._dsp_chain_counts())
+                if dwell < need:
+                    return fallback(f"dwell {dwell} is below the {need} the "
+                                    f"FPGA DSP chain needs (FLUSH_N + ACCUM_N)")
 
             t_before_exec = time.monotonic()
             ts0 = self._nios_timestamp()
