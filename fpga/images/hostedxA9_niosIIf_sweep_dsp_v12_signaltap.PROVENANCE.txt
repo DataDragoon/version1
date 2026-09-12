@@ -1,0 +1,106 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v12_signaltap.rbf
+==========================================================
+
+Status:  EXPERIMENTAL -- branch v12-chain-select only. Timing clean (every
+         clock positive on setup and hold at every corner; pll_sclk +0.298).
+         Functionally v11 PLUS runtime selection of the DSP chain's per-step
+         counts. With the selects at 0 it IS v11. NOT validated on hardware
+         at the time of writing; the host branch defaults it to a
+         configuration (FLUSH 512, ACCUM 1600, dwell 3456) whose settle
+         value has not been measured.
+
+Build date:        2026-09-12 13:16 IST  (18 min wall, fitter seed 2)
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-12_13.16.45
+md5    (.rbf):     06928c60dcd23c9edaf32ffa3e5868ed (see .rbf.md5)
+sha256 (.rbf):     c6666b793b68202269026be635e48d3a4af5421228d4a33199eecb24e83aedb8
+md5    (.sof):     629937567c1cdb5b0d7fbd4df9b81e2b
+Source tree:       bladerf-src branch v12-chain-select @ 7a37934b
+                   (= sfcw-fpga-dsp @ 2f553554, the v11 RTL, + two commits).
+                   SignalTap input: signaltap/dsp_fifo.stp, unchanged since
+                   v9, archived beside this file as the .stp.
+Quartus:           18.1.0.625 Standard, device 5CEBA9F23C8, SEED 2.
+
+FILES IN THIS RELEASE
+---------------------
+    .rbf    the bitstream, for bladeRF-cli -l
+    .sof    REQUIRED for SignalTap. Keep paired.
+    .stp    the SignalTap configuration the .sof was compiled against.
+
+WHAT CHANGED vs v11
+-------------------
+Control-register bits 24:22 (dsp_flush_sel) and 27:25 (dsp_accum_sel)
+select the DSP chain's per-step counts at runtime, and read back:
+
+    sel   FLUSH_N (settle discard)   ACCUM_N (samples summed)
+     0        1088 = the generic          2400 = the generic
+     1         768                        2000
+     2         512                        1600
+     3         384                        1200
+     4         256                        1000
+     5         192                         800
+     6         128                         600
+     7          64                         400
+
+    seq_adder.vhd       flush_count / accum_count input ports; the generics
+                        stay as defaults and size the counter; a registered
+                        "last index" per phase replaces the constant compare.
+    rx.vhd              DSP_FLUSH_TABLE / DSP_ACCUM_TABLE, dsp_pick() (entry
+                        0 = the generic, others clamped to it), one
+                        synchroniser per select bit into rx_clock, one
+                        registered lookup feeding both accumulators.
+    bladerf-hosted.vhd  wires nios_gpo_slv(27:22) to rx; readback of the same
+                        bits in gpi_readback (as v10 did for bit 6).
+
+Per-step need = FLUSH_N + ACCUM_N. The dwell must exceed it by the Nios
+restart jitter; v11 ran 3488 at dwell 4096 (608 of guard) without a miss.
+Change the selects only between sweeps (the FPGA samples them continuously;
+a change mid-step corrupts that step). The host applies them before EXEC.
+
+Simulation (ModelSim 2020.1, rx_dsp_onoff_tb):
+    sim_dsp_sel.do     generics 1088/2400, selects 2/2 -> results after
+                       2112 samples/step, 5 ratios within 3 LSB       PASS
+    sim_dsp_on / off / resync                                         PASS
+    (the testbench's reference model now mixes by the tone before summing;
+     the old raw sum was exactly zero over 16 whole cycles.)
+
+TIMING (Slow 1100mV 85C, worst slack per clock, ns)
+----------------------------------------------------
+    pll_sclk       +0.298 setup / +0.282 hold     (v11 +0.275)
+    pll_fclk       +0.824 / +2.377
+    U_fx3_pll      +2.210 / +0.277
+    U_system_pll   +2.466 / +0.287
+    fx3_pclk       +4.349 / +0.490
+    tck            +2.015 / +0.214
+    c5_clock2      +8.851 / +0.436
+    Global minimum, all corners / all checks: +0.022 ns. TNS 0 everywhere.
+
+HOST-SIDE COUNTERPART (version1, branch v12-chain-select)
+---------------------------------------------------------
+    baa26d5  driver.dsp_set_chain(), engine params dsp_flush_sel /
+             dsp_accum_sel, test_dsp_path --flush/--accum,
+             benchmark_sweep --mode dsp --flush/--accum
+    c2b462f  dsp mode defaults: selects 2/2, dsp_dwell 3456 (floor 3072,
+             the Nios II/f retune rail) -> 17.2 ms sweep, ~58 Hz
+
+WHAT TO MEASURE FIRST
+---------------------
+    FLUSH 512 is an assumption. On this image, with the services up and the
+    sweep stopped:
+        python3 radar/benchmark_sweep.py --mode dsp --dwell 3456 --flush 0 --accum 2 --sweeps 1200 --label f1088
+        python3 radar/benchmark_sweep.py --mode dsp --dwell 3456 --flush 1 --accum 2 --sweeps 1200 --label f768
+        python3 radar/benchmark_sweep.py --mode dsp --dwell 3456 --flush 2 --accum 2 --sweeps 1200 --label f512
+        python3 radar/benchmark_sweep.py --mode dsp --dwell 3456 --flush 3 --accum 2 --sweeps 1200 --label f384
+    S_repeat vs flush says where the AD9361 has settled. Pick the smallest
+    flush whose S_repeat matches f1088 within the control spread, and put it
+    in DSP_DEFAULT_FLUSH_SEL. Then the same for --dwell 3456 vs 3200 vs 3072
+    (the Nios rail) to find the fastest stable step.
+
+HOW TO USE
+----------
+    Pi, services stopped, on the v12-chain-select checkout:
+      bladeRF-cli -l .../fpga/images/hostedxA9_niosIIf_sweep_dsp_v12_signaltap.rbf
+      python3 radar/check_bit6.py        -> HOST, bit 6 reads back
+    then start.py, set_sweep_mode.py dsp, and look for
+      [sfcw] DSP chain: FLUSH 512 + ACCUM 1600 = 2112 samples/step; dwell 3456 leaves 1344 of guard
+    on the console. On v11 the same line ends "(image has no runtime select)"
+    and reports 1088 + 2400.
