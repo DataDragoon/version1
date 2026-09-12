@@ -154,10 +154,11 @@ async def run_mode(ws, mode, seconds, dwell=None, chain=None):
         return None
     if dwell is not None:
         await _flush(ws)
-        await ws.send(json.dumps({'cmd': 'sfcw_set_params', 'nios_dwell': int(dwell)}))
+        key = 'dsp_dwell' if mode == 'dsp' else 'nios_dwell'
+        await ws.send(json.dumps({'cmd': 'sfcw_set_params', key: int(dwell)}))
         st = await _drain_until(ws, 'sfcw_status', timeout=5)
-        print(f"--- {mode}: nios_dwell requested {dwell}, engine reports "
-              f"{st.get('nios_dwell') if st else '?'} samples per step")
+        print(f"--- {mode}: {key} requested {dwell}, engine reports "
+              f"{st.get(key) if st else '?'} samples per step")
     if chain is not None:
         await _flush(ws)
         await ws.send(json.dumps({'cmd': 'sfcw_set_params',

@@ -192,6 +192,18 @@ NIOS_MIN_DWELL = 4096
 # can physically meet, not a safe dwell: the Nios restart jitters by tens of
 # microseconds, so the dwell must leave hundreds of samples above it.
 DSP_MIN_DWELL = 1088 + 2400
+# v12 defaults for dsp mode (this branch). FLUSH 512 + ACCUM 1600 = 2112
+# samples/step (table indices 2, 2), dwell 3456: the shortest dwell the Nios
+# II/f held stably in the 2026-09-07 measurement (it rails at ~3030 samples
+# per retune; 3456 = 54 units of 64). Guard = 3456 - 2112 = 1344 samples.
+# Sweep 51 x 3456 / 10.24 MS/s = 17.2 ms, ~58 Hz. 512 of settle is the value
+# UNDER TEST: benchmark_sweep.py --mode dsp --flush N gives S_repeat vs settle.
+DSP_DEFAULT_FLUSH_SEL = 2
+DSP_DEFAULT_ACCUM_SEL = 2
+DSP_DEFAULT_DWELL     = 3456
+# dsp mode has no host-side slicer, so the NIOS_MIN_DWELL 4096 stability
+# argument does not apply; the floor is the Nios's own retune rail.
+DSP_DWELL_FLOOR       = 3072
 # Consecutive missed bursts before the RX stream is torn down and rebuilt
 # instead of just resynced (see _sweep_core_dsp).
 DSP_MISSES_BEFORE_REBUILD = 5
@@ -440,6 +452,11 @@ class SFCWEngine:
         # fills.
         self.sweep_mode = 'nios'
         self.nios_dwell = 4096        # samples per step, rounded to 64 -- see NIOS_MIN_DWELL
+        # dsp mode has its own dwell and chain counts (v12); see DSP_DEFAULT_*.
+        self.dsp_dwell = DSP_DEFAULT_DWELL
+        self.dsp_flush_sel = DSP_DEFAULT_FLUSH_SEL
+        self.dsp_accum_sel = DSP_DEFAULT_ACCUM_SEL
+        self._dsp_chain_dirty = True
         self.nios_settle = 1024       # samples dropped at the start of a step
         # Overlap the next sweep's EXEC+capture with this sweep's processing.
         # This is where most of the speed lives (48 -> 28.5 ms engine-direct);
@@ -634,6 +651,14 @@ class SFCWEngine:
             if 'dsp_accum_sel' in kwargs:
                 self.dsp_accum_sel = max(0, min(7, int(kwargs['dsp_accum_sel'])))
                 self._dsp_chain_dirty = True
+            if 'dsp_dwell' in kwargs:
+                units = max(1, int(kwargs['dsp_dwell']) // NIOS_INTERVAL_UNIT)
+                new_val = units * NIOS_INTERVAL_UNIT
+                if new_val < DSP_DWELL_FLOOR:
+                    print(f"[sfcw] dsp_dwell {new_val} is below the Nios retune "
+                          f"rail ({DSP_DWELL_FLOOR}); clamping")
+                    new_val = DSP_DWELL_FLOOR
+                self.dsp_dwell = new_val
             if 'nios_pipeline' in kwargs:
                 self.nios_pipeline = bool(kwargs['nios_pipeline'])
                 if not self.nios_pipeline and self._nios_inflight is not None:
@@ -663,6 +688,7 @@ class SFCWEngine:
             'nios_dwell': self.nios_dwell,
             'nios_settle': self.nios_settle,
             'nios_primed': self._nios_primed,
+            'dsp_dwell': getattr(self, 'dsp_dwell', DSP_DEFAULT_DWELL),
             'dsp_flush_sel': getattr(self, 'dsp_flush_sel', 0),
             'dsp_accum_sel': getattr(self, 'dsp_accum_sel', 0),
             # what the FPGA is actually running (after the last apply)
@@ -693,7 +719,7 @@ class SFCWEngine:
         print(f"[sfcw] DSP chain: FLUSH {flush_n} + ACCUM {accum_n} = "
               f"{flush_n + accum_n} samples/step"
               f"{'' if supported else ' (image has no runtime select)'}; "
-              f"dwell {self.nios_dwell} leaves {self.nios_dwell - flush_n - accum_n} "
+              f"dwell {self.dsp_dwell} leaves {self.dsp_dwell - flush_n - accum_n} "
               f"of guard")
 
     # Sweeps in a coherence test. Was 3 -- two adjacent pairs, which says
@@ -2152,7 +2178,7 @@ class SFCWEngine:
             if not self._nios_prime(freqs, qt_rx, qt_tx):
                 return fallback("priming failed", reprime=True)
 
-        dwell = int(self.nios_dwell)
+        dwell = int(getattr(self, 'dsp_dwell', DSP_DEFAULT_DWELL))   # v12: dsp_dwell, not nios_dwell
         units = dwell // NIOS_INTERVAL_UNIT
         if units < 1 or units > 0xFFFF:
             return fallback(f"dwell {dwell} out of range")

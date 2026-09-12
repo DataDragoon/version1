@@ -210,6 +210,8 @@ class SDRServer:
                     params['dsp_flush_sel'] = int(cmd['dsp_flush_sel'])
                 if 'dsp_accum_sel' in cmd:
                     params['dsp_accum_sel'] = int(cmd['dsp_accum_sel'])
+                if 'dsp_dwell' in cmd:
+                    params['dsp_dwell'] = int(cmd['dsp_dwell'])
                 self.sfcw.set_params(**params)
                 await self._broadcast_sfcw_status()
 

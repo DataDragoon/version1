@@ -62,6 +62,7 @@ async def run_block(ws, settle, n, warm, timeout, mode='standard',
                               'sweep_mode': mode, 'nios_dwell': dwell,
                               'nios_settle': nios_settle,
                               'nios_pipeline': pipeline,
+                              'dsp_dwell': dwell,
                               'dsp_flush_sel': flush_sel,
                               'dsp_accum_sel': accum_sel}))
     await asyncio.sleep(0.3)
@@ -154,7 +155,9 @@ if __name__ == '__main__':
                    help='dsp mode, v12 image: ACCUM_N table index (0=2400 ... 7=400)')
     p.add_argument('--mode', choices=('standard', 'nios', 'dsp'), default='standard',
                    help='sweep core: standard (USB retune per step) or nios (FPGA autonomous)')
-    p.add_argument('--dwell', type=int, default=4096, help='nios dwell, samples (default 4096)')
+    p.add_argument('--dwell', type=int, default=4096,
+                   help='samples per step (default 4096); sent as nios_dwell AND dsp_dwell, '
+                        'so in --mode dsp this is the dsp dwell (floor 3072)')
     p.add_argument('--nios-settle', type=int, default=1024, help='nios per-step settle, samples')
     p.add_argument('--no-pipeline', action='store_true', help='disable capture pipelining in nios mode')
     asyncio.run(main(p.parse_args()))
