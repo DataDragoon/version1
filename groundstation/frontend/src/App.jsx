@@ -297,7 +297,9 @@ export default function App() {
   const [sfcwParams, setSfcwParams] = useState({
     startFreq: 2000,
     stopFreq: 5000,
-    stepSize: 60,
+    // fewer-steps: 120 -> 26 steps (half the sweep on a v14+ image); the
+    // Pi's sfcw_engine.py default is the same. Unambiguous range 1.25 m.
+    stepSize: 120,
     numBuffers: 1,
     // 0 is the minimum AND the default, and it is not "settling off": the Pi's
     // settle gate always waits one whole buffer period beyond this so a capture

@@ -338,7 +338,12 @@ class SFCWEngine:
         self.driver = driver
         self.start_freq = 2_000_000_000
         self.stop_freq = 5_000_000_000
-        self.step_size = 60_000_000
+        # fewer-steps: 120 MHz -> 26 steps over 2-5 GHz (was 60 MHz, 51 steps).
+        # Half the sweep time on a v14+ image, same 5 cm resolution (the span
+        # is unchanged), unambiguous range c/(2*step) = 1.25 m instead of
+        # 2.5 m. The groundstation's default (App.jsx sfcwParams.stepSize)
+        # must agree, since the panel pushes its own value.
+        self.step_size = 120_000_000
         # 1, not 4. num_buffers averages that many post-settle captures per step, which
         # only helps against noise that changes WITHIN a step -- and measured 2026-08-29
         # that noise is 0.029% (70.8 dB), while the system limit is the per-retune wobble
