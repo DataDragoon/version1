@@ -2370,6 +2370,16 @@ class SFCWEngine:
             st = {'t0': t_before_exec, 'n': 0, 'period': 0.0, 'exec': 0.0,
                   'acq': 0.0, 'host': 0.0, 'prev_exec': None, 'prev_burst': None}
             self._dsp_tm = st
+        if st['prev_exec'] is not None and t_before_exec - st['prev_exec'] > 1.0:
+            # The accumulator survives a GUI stop/start, so the first sweep of
+            # the next run would count the whole idle gap as one 'host' sample:
+            # 699 sweeps at 10 ms plus one 175 s gap printed as 'period 259.87
+            # ms (3.8/s) ... host 249.83' (2026-09-13). A gap over 1 s is a
+            # restart or a stall, not a sweep period -- say so and start over.
+            print("[sfcw] DSP timing: {:.1f} s gap skipped (sweep restarted or "
+                  "stalled); window reset".format(t_before_exec - st['prev_exec']))
+            st.update({'t0': t_before_exec, 'n': 0, 'period': 0.0, 'exec': 0.0,
+                       'acq': 0.0, 'host': 0.0, 'prev_exec': None, 'prev_burst': None})
         if st['prev_exec'] is not None:
             st['n'] += 1
             st['period'] += t_before_exec - st['prev_exec']
