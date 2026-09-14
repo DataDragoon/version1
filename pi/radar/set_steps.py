@@ -4,7 +4,7 @@
     python3 radar/set_steps.py 61
     python3 radar/set_steps.py 151
 
-Sends {"action": "sfcw_set_params", "num_steps": N} to sdr_server. The
+Sends {"cmd": "sfcw_set_params", "num_steps": N} to sdr_server. The
 engine turns N into the nearest legal step size for the current start and
 stop (every step must be a multiple of 20 or 50 MHz so its quick-tune
 profile exists), so the count you get may differ: over 2-5 GHz the
@@ -38,7 +38,8 @@ async def main(n):
                 await asyncio.wait_for(ws.recv(), timeout=0.3)
         except asyncio.TimeoutError:
             pass
-        await ws.send(json.dumps({"action": "sfcw_set_params", "num_steps": n}))
+        # The key is "cmd": sdr_server dispatches on cmd.get('cmd').
+        await ws.send(json.dumps({"cmd": "sfcw_set_params", "num_steps": n}))
         # The reply is the next sfcw_status; sweep results may be
         # interleaved if a sweep is running, so read until a status shows.
         for _ in range(50):
