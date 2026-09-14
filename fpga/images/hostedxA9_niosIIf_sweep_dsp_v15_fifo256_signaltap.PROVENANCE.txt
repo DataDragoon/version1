@@ -1,0 +1,85 @@
+PROVENANCE: hostedxA9_niosIIf_sweep_dsp_v15_fifo256_signaltap.rbf
+=================================================================
+
+Status:  EXPERIMENTAL -- branch fifo-256. Timing clean (every clock positive
+         on setup and hold at every corner, TNS 0 everywhere; pll_sclk
+         +0.130 setup / +0.271 hold; global minimum +0.028 ns). NOT run on
+         hardware at the time of writing.
+         Functionally v14 (FPGA sweep stepper + gate at the sweep length)
+         with the DSP FIFO grown from 51 to 255 words and the stepper's
+         table from 4 KB to 16 KB, so a sweep of ANY length 2..255 goes out
+         as one burst on this image -- in practice 16..151 steps, the range
+         the AD9361 fast-lock table can hold over 2-5 GHz. With a 51-step
+         sweep it behaves exactly as v13/v14; the time per step is
+         unchanged (this frees the step count, it does not shorten a step).
+
+Build date:        2026-09-14 06:55 IST  (15 min wall, fitter SEED 3)
+Output dir:        bladerf-src/hdl/quartus/hostedxA9-2026-09-14_06.55.52
+md5    (.rbf):     323bc69b38b7fb44a9faa348f7ecf9bb (see .rbf.md5)
+sha256 (.rbf):     25ded2025148728daa38451c5c4377e547f2f33ac20c0edfee2bb432bdba91f6
+md5    (.sof):     76faa79e207dbc74225507bbfdac73cf
+Source tree:       bladerf-src branch fifo-256 @ ba105a3c
+                   (= fewer-steps @ d3f617ee + one commit). Nios firmware
+                   rebuilt (pkt_retune2.c changed). SignalTap input
+                   signaltap/dsp_fifo.stp, unchanged since v9.
+Quartus:           18.1.0.625 Standard, device 5CEBA9F23C8.
+                   Seed 2 (the seed of v11..v14) FAILED here: pll_sclk
+                   -0.257 on stock paths (axi_ad9361 rx_pnmon,
+                   fifo_writer META_DOWNCOUNT), none in the new logic.
+                   Seed 3 closes with margin; that build is this image.
+
+WHAT CHANGED vs v14
+-------------------
+    rx.vhd              DSP_FIFO_WORDS 51 -> 255. The FIFO's RAM is 256
+                        deep (pointer space is a power of two); 255 usable
+                        because dsp_sweep_words, the stepper's num_steps
+                        and the gate threshold are 8-bit. Assert on the
+                        width. 2 x 255 = 510 DWORDs still fits one GPIF
+                        transfer (1024 at High Speed), so the FX3 read is
+                        unchanged: one burst, constant tail after it.
+    sweep_stepper.vhd   TABLE_AW 12 -> 14: 16 KB, 255 steps x 64 bytes.
+                        The op-0 table-write address moves from bits 27:16
+                        to bits 27:8 (14 bits needed); words_written and
+                        status bits 29:16 grow to 14 bits.
+    bladerf-hosted.vhd  TABLE_AW => 14.
+    pkt_retune2.c       STP_MAX_STEPS 64 -> 255; table words are
+                        (addr << 8) | data; LOAD reply masks 14 bits.
+    Host (version50 branch fifo-256): DSP_SWEEP_WORDS 255; the dsp core
+                        accepts 2..255 steps with the stepper.
+
+Resources: 9,236 ALMs (8 %), 349 M10K (29 %) -- the FIFO moved from MLAB
+to M10K and the stepper table grew by 12 KB.
+
+Simulation: sweep_stepper_tb (new protocol, 3 steps, 114 frames byte-exact)
+PASS; rx_dsp_onoff_tb on / off / resync / sel / words PASS; plus
+RX_FIFO_WORDS=255 with a 5-step sweep PASS.
+
+WHY
+---
+On v13 the FIFO gate opens at 51 words, so the sweep must be exactly 51
+steps and the step size is tied to the span (60 MHz over 2-5 GHz). This
+image lets the step count be a runtime choice from the Pi or the GUI:
+
+    step      steps   unambiguous   sweep     rate
+    20 MHz    151     7.5 m         27.8 ms   ~36 Hz
+    40 MHz     76     3.75 m        14.0 ms   ~71 Hz
+    60 MHz     51     2.5 m          9.4 ms   ~100 Hz  (today's setting)
+    120 MHz    26     1.25 m         4.8 ms   ~190 Hz
+    200 MHz    16     0.75 m         2.9 ms   ~280 Hz
+
+Resolution is 5 cm throughout (same span). A 256-deep FIFO also holds
+five 51-step sweeps, which a later image could use to let the stepper
+free-run and remove the 0.64 ms EXEC + USB gap per sweep.
+
+HOW TO USE
+----------
+    Pi, on the version50 fifo-256 checkout, services stopped:
+      bladeRF-cli -l fpga/images/hostedxA9_niosIIf_sweep_dsp_v15_fifo256_signaltap.rbf
+      python3 pi/radar/check_bit6.py
+    start.py (dsp is the default mode), then set any step in the GUI or
+    over the socket. Console:
+      [sfcw] FPGA stepper table loaded: N steps
+      [bladerf] DSP burst ... after EXEC
+    On this image a sweep longer than 255 steps is refused by the engine;
+    one longer than the fast-lock table (151 at 20 MHz) is refused by the
+    grid snap before that.
