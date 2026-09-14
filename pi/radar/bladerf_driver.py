@@ -639,7 +639,12 @@ class BladeRFDriver:
     DSP_PATH_BIT     = 6
     DSP_FRAC_BITS    = 14        # Q14: 16384 == 1.0
     DSP_WORD_BYTES   = 8         # 32-bit I + 32-bit Q
-    DSP_SWEEP_WORDS  = 51        # rx.vhd DSP_FIFO_WORDS -- must match the FPGA
+    # rx.vhd DSP_FIFO_WORDS -- must match the FPGA. The v15 image (fifo-256)
+    # holds 255 results; v10..v14 held 51. This is the MOST a sweep may have:
+    # the gate opens at the stepper's sweep length, so any 2..255 works on
+    # v15 (2..51 on v14, exactly 51 on v13). 2 * 255 = 510 DWORDs still fits
+    # one GPIF transfer (1024 at High Speed), so the read path is unchanged.
+    DSP_SWEEP_WORDS  = 255
 
     # v12: control-register bits 24:22 / 27:25 select the chain's per-step
     # counts from these tables (rx.vhd DSP_FLUSH_TABLE / DSP_ACCUM_TABLE).

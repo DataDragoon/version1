@@ -2202,11 +2202,20 @@ class SFCWEngine:
             # is visible every sweep rather than as a frozen GUI.
             return (np.zeros(num_steps, dtype=np.complex128), num_steps, None)
 
-        # DSP_FIFO_WORDS is a COMPILE-TIME generic in rx.vhd, and the metadata
-        # header hard-codes 2*DSP_FIFO_WORDS as the transfer length. A sweep of
-        # any other length would have the FPGA declare a burst that does not
-        # match what the host wants, so refuse rather than mis-read.
-        if num_steps != self.driver.DSP_SWEEP_WORDS:
+        # DSP_FIFO_WORDS is a COMPILE-TIME generic in rx.vhd: the most results
+        # the DSP FIFO can hold. With the stepper (v14+) the FIFO gate opens
+        # at the sweep length the stepper was given, so any 2..DSP_SWEEP_WORDS
+        # steps go out as one burst -- on the v15 image (fifo-256) that is
+        # 2..255, which covers every grid the fast-lock table can hold (151
+        # at 20 MHz over 2-5 GHz). Without the stepper the gate is the FIFO
+        # depth, so the sweep must be exactly DSP_SWEEP_WORDS. An older image
+        # with a smaller FIFO than DSP_SWEEP_WORDS never opens its gate for a
+        # longer sweep: that shows up as 'no burst' every sweep, not here.
+        if DSP_STEPPER:
+            if num_steps < 2 or num_steps > self.driver.DSP_SWEEP_WORDS:
+                return fallback(f"DSP path takes 2..{self.driver.DSP_SWEEP_WORDS} "
+                                f"steps, this sweep has {num_steps}")
+        elif num_steps != self.driver.DSP_SWEEP_WORDS:
             return fallback(f"DSP path is built for "
                             f"{self.driver.DSP_SWEEP_WORDS} steps, this sweep "
                             f"has {num_steps}")
