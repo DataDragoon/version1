@@ -177,6 +177,10 @@ class SDRServer:
                     params['stop_freq'] = float(cmd['stop_freq_mhz']) * 1e6
                 if 'step_size_mhz' in cmd:
                     params['step_size'] = float(cmd['step_size_mhz']) * 1e6
+                if 'num_steps' in cmd:
+                    # fifo-256: a step count; the engine picks the nearest
+                    # legal step size for the current start/stop.
+                    params['num_steps'] = int(cmd['num_steps'])
                 if 'num_buffers' in cmd:
                     params['num_buffers'] = int(cmd['num_buffers'])
                 if 'settle_count' in cmd:

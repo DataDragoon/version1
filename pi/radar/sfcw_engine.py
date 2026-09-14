@@ -578,6 +578,29 @@ class SFCWEngine:
                 SFCWEngine._snap_to_base(stop, base),
                 int(snapped_step))
 
+    @staticmethod
+    def _step_for_count(start, stop, n):
+        """The legal step size that gives the step count closest to n.
+
+        fifo-256: with the v15 image a sweep may be any length, so the count
+        is worth asking for directly. It is still not free -- every step must
+        be a multiple of one master base (see _snap_sweep) -- so over 2-5 GHz
+        the reachable counts are 151, 76, 61, 51, 31, 26, 21, 16, 13, 11, ...
+        Ask for 32 and this returns 100 MHz (31 steps); ask for 64, 50 MHz
+        (61). Ties go to the larger count, then the finer base.
+        """
+        span = float(stop) - float(start)
+        n = max(2, int(n))
+        best = None
+        for base in QT_MASTER_STEPS:
+            for k in range(1, int(span // base) + 1):
+                step = k * base
+                count = int(span // step) + 1
+                cand = (abs(count - n), -count, base, step)
+                if best is None or cand < best:
+                    best = cand
+        return float(best[3]) if best else float(QT_MASTER_STEP)
+
     def _apply_freq_grid(self):
         """Re-snap all three from the values that were REQUESTED, not from the
         previously snapped ones.
@@ -602,8 +625,25 @@ class SFCWEngine:
             if 'step_size' in kwargs:
                 self._req_step = float(kwargs['step_size'])
                 grid_changed = True
+            want_steps = None
+            if 'num_steps' in kwargs:
+                # fifo-256: a step COUNT, turned into the nearest legal step
+                # size for the (requested) start/stop. Applied after any
+                # start/stop in the same message, and it overrides a
+                # step_size sent alongside it.
+                want_steps = int(kwargs['num_steps'])
+                self._req_step = self._step_for_count(
+                    self._req_start, self._req_stop, want_steps)
+                grid_changed = True
             if grid_changed:
                 self._apply_freq_grid()
+                if want_steps is not None:
+                    got = int((self.stop_freq - self.start_freq) // self.step_size) + 1
+                    print(f"[sfcw] num_steps {want_steps} -> step "
+                          f"{self.step_size / 1e6:g} MHz = {got} steps over "
+                          f"{self.start_freq / 1e6:g}-{self.stop_freq / 1e6:g} MHz"
+                          + ("" if got == want_steps else
+                             f" (nearest count on the quick-tune grid)"))
                 # The NIOS holds a recorded copy of the old grid.
                 self._nios_primed = False
                 if self._nios_inflight is not None:
