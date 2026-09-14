@@ -587,7 +587,10 @@ class SFCWEngine:
         be a multiple of one master base (see _snap_sweep) -- so over 2-5 GHz
         the reachable counts are 151, 76, 61, 51, 31, 26, 21, 16, 13, 11, ...
         Ask for 32 and this returns 100 MHz (31 steps); ask for 64, 50 MHz
-        (61). Ties go to the larger count, then the finer base.
+        (61). Ties go to the larger count, then to the LARGEST step that
+        gives it, so the last step lands as close to stop as the grid allows
+        (asking for 2 gives a 3000 MHz step, 2000 and 5000, not 2000 and
+        3520).
         """
         span = float(stop) - float(start)
         n = max(2, int(n))
@@ -596,10 +599,10 @@ class SFCWEngine:
             for k in range(1, int(span // base) + 1):
                 step = k * base
                 count = int(span // step) + 1
-                cand = (abs(count - n), -count, base, step)
+                cand = (abs(count - n), -count, -step)
                 if best is None or cand < best:
                     best = cand
-        return float(best[3]) if best else float(QT_MASTER_STEP)
+        return float(-best[2]) if best else float(QT_MASTER_STEP)
 
     def _apply_freq_grid(self):
         """Re-snap all three from the values that were REQUESTED, not from the
