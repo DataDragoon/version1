@@ -30,8 +30,16 @@ URL = "ws://127.0.0.1:9003"
 
 async def main(n):
     async with websockets.connect(URL, max_size=1 << 24) as ws:
+        # The server greets every new client with an sfcw_status BEFORE it
+        # has seen any request. Drain that (and anything else queued) first,
+        # or the greeting is mistaken for the reply and shows the old grid.
+        try:
+            while True:
+                await asyncio.wait_for(ws.recv(), timeout=0.3)
+        except asyncio.TimeoutError:
+            pass
         await ws.send(json.dumps({"action": "sfcw_set_params", "num_steps": n}))
-        # The server answers with an sfcw_status; sweep results may be
+        # The reply is the next sfcw_status; sweep results may be
         # interleaved if a sweep is running, so read until a status shows.
         for _ in range(50):
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
